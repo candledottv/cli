@@ -49,12 +49,6 @@ vault is optional.
 Want to try market data first, with no account?
 [Try a market read with Agent Kit](https://github.com/candledottv/agent-kit#try-a-market-read-no-account-required).
 
-[<img src="assets/poster.png" alt="The real candle portfolio table for a Demo data profile, with a practice wallet and fixture balances." width="640">](assets/recording.webm)
-
-[Watch help, the demo portfolio and read-only MCP configuration (about 20 seconds, playback controls). Fixture balances are not real funds.](assets/recording.webm)
-
-<img src="assets/detail.png" alt="Detail of the real CLI portfolio renderer: the demo practice wallet, holdings and total." width="640">
-
 <details>
 <summary>Transcript of the recorded local session (Demo data)</summary>
 
@@ -80,7 +74,7 @@ GROUP  CHAIN   WALLET                                  TOKEN  AMOUNT  PRICE    V
 -----  ------  --------------------------------------  -----  ------  -------  -------
 tee    solana  Demo data: practice wallet (Demo…1111)  SOL    2       $100.00  $200.00
 
-vault           -  no vault at /tmp/multica-task-1905354723/candle-capture-KvPBUf/cli/.config/candle/vault.enc
+vault           -  no vault at ~/.config/candle/vault.enc
 tee       $200.00  1 wallet
 embedded    $0.00  0 wallets
 solana    $200.00  1 wallet
@@ -95,7 +89,7 @@ Profile demo-data · Account unknown · http://127.0.0.1:40571
 {
   "mcpServers": {
     "candle": {
-      "command": "/tmp/multica-task-1905354723/candle-capture-KvPBUf/bin/candle",
+      "command": "/usr/local/bin/candle",
       "args": [
         "mcp",
         "--read-only"
