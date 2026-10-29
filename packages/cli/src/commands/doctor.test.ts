@@ -1,0 +1,637 @@
+/**
+ * `doctor`, driven through `run()`. Every check is scripted against a fake fetch (see
+ * task-3-brief.md's checklist: runtime version, backend, credentials present, API reachable,
+ * device token valid, agent key valid, launch wallet delegated) so the PASS/FAIL/SKIP table and
+ * the nonzero-on-any-FAIL exit code are exercised deterministically.
+ */
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { run } from "../index"
+import type { TerminalStyle } from "../presentation"
+import { homeRepository, updateHomeFor } from "../release"
+import {
+  createCapture,
+  createFakeConfigStore,
+  createFakeStore,
+  createRoutedFetch,
+  createTestDeps,
+  jsonResponse,
+  type RouteHandler,
+} from "../test-support"
+import { CLI_VERSION } from "../version"
+import { renderDoctorReport } from "./doctor"
+
+/** The four routes every doctor row below "API reachable" needs to PASS, keyed by PATH the way
+ * `createRoutedFetch` routes them -- reused as a base by the install/update tests below, which
+ * only ever add or override the release manifest route. */
+const HEALTHY_ROUTES: Record<string, RouteHandler | RouteHandler[]> = {
+  "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+  "/api/v1/agent/keys": () => jsonResponse(200, { success: true, keys: [], tier: "free" }),
+  "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+  "/api/v1/agent/tier": () => jsonResponse(200, { success: true, tier: "free" }),
+  "/api/v1/agent/wallets/embedded": () =>
+    jsonResponse(200, { success: true, wallets: { solana: { address: "abc", delegated: true }, evm: null } }),
+}
+
+/** A device token and API key, matching `HEALTHY_ROUTES`' credentials. */
+function healthyStores() {
+  return { store: createFakeStore({ device_token: "cndl_dvc_x", api_key: "ck_live_x" }) }
+}
+
+const flat = (text: string): string => text.replace(/\s+/g, " ")
+
+/** One doctor row, its wrapped detail joined: from its mark to the next row's mark or the tally. */
+const rowOf = (text: string, label: string): string | undefined =>
+  flat(text).match(new RegExp(`[✓✗–!] ${label} .*?(?= [✓✗–!] [A-Z]| \\d+ passed|$)`))?.[0]
+
+describe("doctor", () => {
+  test("renders a PASS/FAIL/SKIP table and exits 1 when any check FAILs; the FAIL line names its fix", async () => {
+    const { fetch, unmatched } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+      "/api/v1/agent/keys": () =>
+        jsonResponse(401, {
+          success: false,
+          error: { code: "DEVICE_TOKEN_INVALID", message: "Invalid or revoked device token" },
+        }),
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () => jsonResponse(200, { success: true, tier: "free" }),
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, {
+          success: true,
+          account: "FaKwE2xX",
+          wallets: { solana: { address: "abc", delegated: false }, evm: null },
+        }),
+      // No CANDLE_RELEASE_BASE_URL override in this fixture, so the home `candle update` reads
+      // for this version applies (https://github.com/candledottv/agentic below the bridge,
+      // candledottv/cli from it on), and its own path segment is part of the pathname
+      // `createRoutedFetch` routes on -- unlike the other fixtures below, which set
+      // CANDLE_RELEASE_BASE_URL to a bare host and register the manifest at the plain path.
+      [`/${homeRepository(updateHomeFor(CLI_VERSION))}/releases/latest/download/latest.json`]: () =>
+        jsonResponse(200, { version: CLI_VERSION, tag: `cli-v${CLI_VERSION}`, assets: {} }),
+    })
+    const store = createFakeStore({ device_token: "cndl_dvc_x", api_key: "ck_live_x" })
+    const stdout = createCapture()
+    const deps = createTestDeps({ fetch, store, stdout })
+
+    const code = await run(["doctor"], deps)
+
+    expect(code).toBe(1)
+    expect(stdout.text).toContain("✓ ")
+    expect(stdout.text).toContain("✗ ")
+    expect(stdout.text).toContain("candle auth login")
+    expect(unmatched).toHaveLength(0)
+  })
+
+  test("the Plan row names the tier and fee, WARNs when Max lapsed, and never fails doctor", async () => {
+    const notice =
+      "Your Max plan expired on 2026-08-30. Renew to restore 0% trade fees and up to 1,000 linked wallets: https://alpha.candle.tv/agents/pricing"
+    const { fetch } = createRoutedFetch({
+      ...HEALTHY_ROUTES,
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () =>
+        jsonResponse(200, {
+          success: true,
+          tier: "free",
+          feeBps: 100,
+          maxExpired: true,
+          maxExpiredAt: Date.parse("2026-08-30T00:00:00Z"),
+          maxExpiredNotice: notice,
+        }),
+    })
+    const stdout = createCapture()
+    const deps = createTestDeps({ fetch, ...healthyStores(), stdout, env: {} })
+    const code = await run(["doctor"], deps)
+    // WARN is a fact about money, not a broken setup: the exit code stays a setup verdict.
+    expect(code).toBe(0)
+    expect(flat(stdout.text)).toMatch(/! Plan Your Max plan expired on 2026-08-30/)
+    expect(stdout.text).toContain("/agents/pricing")
+  })
+
+  test("an active plan renders PASS with the tier and its fee", async () => {
+    const { fetch } = createRoutedFetch({
+      ...HEALTHY_ROUTES,
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () => jsonResponse(200, { success: true, tier: "max", feeBps: 0, maxExpired: false }),
+    })
+    const stdout = createCapture()
+    const deps = createTestDeps({ fetch, ...healthyStores(), stdout, env: {} })
+    await run(["doctor"], deps)
+    expect(flat(stdout.text)).toMatch(/✓ Plan max \(0% trade fee\)/)
+  })
+
+  test("all checks passing exits 0 with no FAIL rows", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+      "/api/v1/agent/keys": () => jsonResponse(200, { success: true, keys: [], tier: "free" }),
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () => jsonResponse(200, { success: true, tier: "free" }),
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, { success: true, wallets: { solana: { address: "abc", delegated: true }, evm: null } }),
+    })
+    const store = createFakeStore({ device_token: "cndl_dvc_x", api_key: "ck_live_x" })
+    const stdout = createCapture()
+    const deps = createTestDeps({ fetch, store, stdout })
+
+    const code = await run(["doctor"], deps)
+
+    expect(code).toBe(0)
+    expect(stdout.text).not.toMatch(/^ {2}✗ /m)
+  })
+
+  test("missing credentials SKIP the checks that need them rather than FAILing, but credentials-present itself FAILs with no device token at all", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+    })
+    const store = createFakeStore()
+    const stdout = createCapture()
+    const deps = createTestDeps({ fetch, store, stdout })
+
+    const code = await run(["doctor"], deps)
+
+    expect(code).toBe(1)
+    expect(stdout.text).toMatch(/^ {2}– /m)
+    expect(stdout.text).toContain("✗ ")
+  })
+
+  // Fix round 1, item 6: a mutant that FAILs the exit code on ANY SKIP (not just on an actual
+  // FAIL) would pass every test above (they all also contain a genuine FAIL row) but would be
+  // caught here, where SKIPs exist and nothing actually fails.
+  test("SKIPs alone (a device token but no API key yet) never fail the exit code -- only an actual FAIL does", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+      "/api/v1/agent/keys": () => jsonResponse(200, { success: true, keys: [], tier: "free" }),
+    })
+    const store = createFakeStore({ device_token: "cndl_dvc_x" })
+    const stdout = createCapture()
+    const deps = createTestDeps({ fetch, store, stdout })
+
+    const code = await run(["doctor"], deps)
+
+    expect(code).toBe(0)
+    expect(stdout.text).toMatch(/^ {2}– /m)
+    expect(stdout.text).not.toMatch(/^ {2}✗ /m)
+  })
+
+  // The agent-key row probes GET /agent/tier, which is behind requireAgentKey("launch:write").
+  // A valid activity-only key therefore FAILs it, so the row has to say which scope it proves and
+  // the FAIL has to carry a fix, not just "this key lacks the launch:write scope".
+  test("the agent-key row names the scope it proves, and a SCOPE_MISSING 403 FAILs with a fix line", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+      "/api/v1/agent/keys": () => jsonResponse(200, { success: true, keys: [], tier: "free" }),
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () =>
+        jsonResponse(403, {
+          success: false,
+          error: { code: "SCOPE_MISSING", message: "This key lacks the launch:write scope" },
+        }),
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, { success: true, wallets: { solana: { address: "abc", delegated: true }, evm: null } }),
+    })
+    const store = createFakeStore({ device_token: "cndl_dvc_x", api_key: "ck_live_activity_only" })
+    const stdout = createCapture()
+
+    const code = await run(["doctor"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(1)
+    const row = rowOf(stdout.text, "API key valid")
+    expect(row).toBeDefined()
+    expect(row).toMatch(/^✗ /)
+    expect(row).toContain("candle keys create --scopes")
+    expect(row).toContain("candle keys list")
+  })
+
+  test("the runtime-version check FAILs when the injected node version is below the minimum, and PASSes on a real modern version", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+    })
+
+    const stdoutOld = createCapture()
+    const oldCode = await run(["doctor"], createTestDeps({ fetch, stdout: stdoutOld, nodeVersion: "16.20.0" }))
+    expect(oldCode).toBe(1)
+    expect(stdoutOld.text).toContain("Runtime version")
+    expect(stdoutOld.text).toMatch(/^ {2}✗ /m)
+    expect(stdoutOld.text).toContain("16.20.0")
+    expect(stdoutOld.text).toContain("upgrade Node.js")
+
+    const stdoutNew = createCapture()
+    const newCode = await run(["doctor"], createTestDeps({ fetch, stdout: stdoutNew, nodeVersion: "22.1.0" }))
+    // Runtime version alone doesn't determine the overall exit code (no credentials configured
+    // either, which FAILs "Credentials present" independently) -- assert the ROW, not the code.
+    expect(newCode).toBe(1)
+    const runtimeLine = stdoutNew.text.split("\n").find((line) => line.includes("Runtime version"))
+    expect(runtimeLine).toMatch(/^ {2}✓ /)
+  })
+
+  test("reports which account the credentials act as", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+      "/api/v1/agent/keys": () => jsonResponse(200, { success: true, keys: [] }),
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () => jsonResponse(200, { success: true, tier: "free" }),
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, {
+          success: true,
+          account: "FaKwE2xX",
+          wallets: { solana: { address: "abc", delegated: true }, evm: null },
+        }),
+    })
+    const stdout = createCapture()
+    const store = createFakeStore({ device_token: "cndl_dvc_x", api_key: "ck_live_x" })
+    const code = await run(["doctor"], createTestDeps({ fetch, store, stdout }))
+    expect(stdout.text).toContain("Account")
+    expect(stdout.text).toContain("FaKwE2xX")
+    expect(code).toBe(0)
+  })
+})
+
+describe("profiles", () => {
+  test("prints the identity line first, using the profile's cached account", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+      "/api/v1/agent/keys": () => jsonResponse(200, { success: true, keys: [] }),
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () => jsonResponse(200, { success: true, tier: "free" }),
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, { success: true, wallets: { solana: { address: "abc", delegated: true }, evm: null } }),
+    })
+    const store = createFakeStore({ "profile:staging:device_token": "d", "profile:staging:api_key": "k" })
+    const config = createFakeConfigStore({
+      profiles: { staging: { account: "A", scopes: ["launch:write"] } },
+      activeProfile: "staging",
+    })
+    const stdout = createCapture()
+    await run(["doctor"], createTestDeps({ fetch, store, stdout, ...config }))
+    expect(stdout.text.startsWith("Profile staging · Account A · ")).toBe(true)
+    // The agent-key row's scopes come from the same profile, not from the legacy top-level
+    // `scopes` (absent on every login-created profile, which left the row bare).
+    const keyRow = stdout.text.split("\n").find((line) => line.includes("API key valid"))
+    expect(keyRow).toContain("scopes (cached): launch:write")
+  })
+
+  test("the agent-key row prints the profile's scopes sorted, not in stored order", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+      "/api/v1/agent/keys": () => jsonResponse(200, { success: true, keys: [] }),
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () => jsonResponse(200, { success: true, tier: "free" }),
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, { success: true, wallets: { solana: { address: "abc", delegated: true }, evm: null } }),
+    })
+    const store = createFakeStore({ "profile:staging:device_token": "d", "profile:staging:api_key": "k" })
+    const config = createFakeConfigStore({
+      profiles: { staging: { account: "A", scopes: ["swap:write", "launch:write", "account:read"] } },
+      activeProfile: "staging",
+    })
+    const stdout = createCapture()
+    await run(["doctor"], createTestDeps({ fetch, store, stdout, ...config }))
+    expect(stdout.text).toContain("scopes (cached): account:read, launch:write, swap:write")
+  })
+
+  // Fix wave item 1: doctor is where a mismatch is meant to be SEEN, so the row that reports the
+  // live account has to report the profile's record of it too, and the cheap repair, rather than
+  // leaving the operator to notice that the identity line above disagrees with the row below.
+  test("the Account row names the profile's cached account and the repair when the live one differs", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+      "/api/v1/agent/keys": () => jsonResponse(200, { success: true, keys: [] }),
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () => jsonResponse(200, { success: true, tier: "free" }),
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, {
+          success: true,
+          account: "OTHER22",
+          wallets: { solana: { address: "abc", delegated: true }, evm: null },
+        }),
+    })
+    const store = createFakeStore({ "profile:staging:device_token": "d", "profile:staging:api_key": "k" })
+    const config = createFakeConfigStore({ profiles: { staging: { account: "CACHED1" } }, activeProfile: "staging" })
+    const stdout = createCapture()
+    const code = await run(["doctor"], createTestDeps({ fetch, store, stdout, ...config }))
+    // Doctor's exit code is unchanged by this wave: `setup` depends on it.
+    expect(code).toBe(0)
+    const accountRow = rowOf(stdout.text, "Account")
+    expect(accountRow).toContain("OTHER22")
+    expect(accountRow).toContain("CACHED1")
+    expect(accountRow).toContain("candle profile use staging")
+  })
+
+  test("--json carries cachedAccount beside account, and a matching cache adds nothing to the row", async () => {
+    const routes = {
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+      "/api/v1/agent/keys": () => jsonResponse(200, { success: true, keys: [] }),
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () => jsonResponse(200, { success: true, tier: "free" }),
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, {
+          success: true,
+          account: "OTHER22",
+          wallets: { solana: { address: "abc", delegated: true }, evm: null },
+        }),
+    }
+    const store = () => createFakeStore({ "profile:staging:device_token": "d", "profile:staging:api_key": "k" })
+    const jsonOut = createCapture()
+    await run(
+      ["doctor", "--json"],
+      createTestDeps({
+        fetch: createRoutedFetch(routes).fetch,
+        store: store(),
+        stdout: jsonOut,
+        ...createFakeConfigStore({ profiles: { staging: { account: "CACHED1" } }, activeProfile: "staging" }),
+      }),
+    )
+    const parsed = JSON.parse(jsonOut.text) as { account?: string; cachedAccount?: string }
+    expect(parsed.account).toBe("OTHER22")
+    expect(parsed.cachedAccount).toBe("CACHED1")
+
+    const matching = createCapture()
+    await run(
+      ["doctor"],
+      createTestDeps({
+        fetch: createRoutedFetch(routes).fetch,
+        store: store(),
+        stdout: matching,
+        ...createFakeConfigStore({ profiles: { staging: { account: "OTHER22" } }, activeProfile: "staging" }),
+      }),
+    )
+    const accountRow = rowOf(matching.text, "Account")
+    expect(accountRow).toContain("OTHER22")
+    expect(accountRow).not.toContain("recorded")
+    expect(accountRow).not.toContain("candle profile use")
+  })
+
+  // Doctor runs under a credential env override too (resolveApiKey reads it first), so its row
+  // carries the same correction as auth status: the live account then belongs to a key that is not
+  // the profile's stored one, and naming the profile's record as a disagreement would send the
+  // operator to `profile use`, which re-caches from the key that was never acting.
+  test("an env credential override silences the cached-account note on the Account row", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/status": () => jsonResponse(200, { api: "ok" }),
+      "/api/v1/agent/keys": () => jsonResponse(200, { success: true, keys: [] }),
+      "/api/v1/agent/wallets/trading": () => jsonResponse(200, { success: true }),
+      "/api/v1/agent/tier": () => jsonResponse(200, { success: true, tier: "free" }),
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, {
+          success: true,
+          account: "OTHER22",
+          wallets: { solana: { address: "abc", delegated: true }, evm: null },
+        }),
+    })
+    const store = createFakeStore({ "profile:staging:device_token": "d", "profile:staging:api_key": "k" })
+    const config = createFakeConfigStore({ profiles: { staging: { account: "CACHED1" } }, activeProfile: "staging" })
+    const stdout = createCapture()
+    const code = await run(
+      ["doctor"],
+      createTestDeps({ fetch, store, stdout, env: { CANDLE_API_KEY: "ck_live_env" }, ...config }),
+    )
+    expect(code).toBe(0)
+    const row = rowOf(stdout.text, "Account")
+    expect(row).toContain("OTHER22")
+    expect(row).not.toContain("recorded")
+    expect(row).not.toContain("candle profile use")
+  })
+})
+
+describe("doctor install and update rows", () => {
+  test("a binary install with a newer release available", async () => {
+    const routes = {
+      ...HEALTHY_ROUTES,
+      "/releases/latest/download/latest.json": () =>
+        jsonResponse(200, { version: "99.0.0", tag: "cli-v99.0.0", assets: {} }),
+    }
+    const { fetch } = createRoutedFetch(routes)
+    const stdout = createCapture()
+    const deps = createTestDeps({
+      fetch,
+      stdout,
+      execPath: "/home/u/.local/bin/candle",
+      env: { CANDLE_RELEASE_BASE_URL: "https://example.test" },
+      ...healthyStores(),
+    })
+    await run(["doctor"], deps)
+    expect(flat(stdout.text)).toMatch(/✓ Install binary at \/home\/u\/\.local\/bin\/candle/)
+    expect(flat(stdout.text)).toMatch(/✓ Update 99\.0\.0 available: candle update/)
+  })
+
+  test("a Homebrew install points at brew, and offline the update row is SKIP", async () => {
+    const { fetch } = createRoutedFetch(HEALTHY_ROUTES) // no manifest route: the fetch throws
+    const stdout = createCapture()
+    const deps = createTestDeps({
+      fetch,
+      stdout,
+      execPath: "/opt/homebrew/bin/candle",
+      realpath: async () => "/opt/homebrew/Cellar/candle/0.5.0/bin/candle",
+      ...healthyStores(),
+    })
+    await run(["doctor"], deps)
+    expect(flat(stdout.text)).toMatch(/✓ Install Homebrew/)
+    expect(flat(stdout.text)).toMatch(/– Update could not check/)
+  })
+
+  test("--json carries install and update", async () => {
+    const routes = {
+      ...HEALTHY_ROUTES,
+      "/releases/latest/download/latest.json": () =>
+        jsonResponse(200, { version: CLI_VERSION, tag: `cli-v${CLI_VERSION}`, assets: {} }),
+    }
+    const { fetch } = createRoutedFetch(routes)
+    const stdout = createCapture()
+    const deps = createTestDeps({
+      fetch,
+      stdout,
+      execPath: "/usr/local/bin/node",
+      env: { CANDLE_RELEASE_BASE_URL: "https://example.test" },
+      ...healthyStores(),
+    })
+    await run(["doctor", "--json"], deps)
+    const body = JSON.parse(stdout.text)
+    expect(body.install).toEqual({ method: "script", path: "/usr/local/bin/node" })
+    expect(body.update).toEqual({ current: CLI_VERSION, latest: CLI_VERSION, available: false })
+  })
+})
+
+/**
+ * BE-275 D9 (test 12): the "Security key helper" row, directly after Install. PASS with the path,
+ * FAIL when a release build should have one and does not (with the D8 fix, which runs on THIS
+ * binary), SKIP when there is nothing to install or nothing to compare against. A
+ * `CANDLE_FIDO2_HELPER` that names a non-executable is still FAIL, and the fix is that variable:
+ * `--install-helper` installs nothing while it is set. FAIL moves the exit code: a binary that
+ * cannot add the hardware factor it was told it could add is a broken setup, not a remark.
+ */
+describe("BE-275 D9: the security key helper row", () => {
+  const withHelper = {
+    version: "99.0.0",
+    tag: "cli-v99.0.0",
+    assets: {},
+    helpers: { "linux-x64": { name: "candle-fido2-linux-x64", sha256: "ab", size: 1 } },
+  }
+  const manifestRoute = (manifest: unknown) => ({
+    ...HEALTHY_ROUTES,
+    "/releases/latest/download/latest.json": () => jsonResponse(200, manifest),
+  })
+  const env = { CANDLE_RELEASE_BASE_URL: "https://example.test", CANDLE_CONFIG_DIR: "" }
+  beforeEach(async () => {
+    env.CANDLE_CONFIG_DIR = await mkdtemp(join(tmpdir(), "doctor-vault-"))
+    await writeFile(join(env.CANDLE_CONFIG_DIR, "vault.enc"), "fixture: existence only")
+  })
+  afterEach(async () => {
+    await rm(env.CANDLE_CONFIG_DIR, { recursive: true, force: true })
+  })
+
+  test("PASS names the path and where it came from, and the row sits directly after Install", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "candle-doctor-helper-"))
+    const helper = join(dir, "candle-fido2")
+    await writeFile(helper, "#!/bin/sh\nexit 1\n")
+    await chmod(helper, 0o755)
+    const { fetch } = createRoutedFetch(manifestRoute(withHelper))
+    const stdout = createCapture()
+    const deps = createTestDeps({
+      fetch,
+      stdout,
+      execPath: "/home/u/.local/bin/candle",
+      env: { ...env, CANDLE_FIDO2_HELPER: helper },
+      ...healthyStores(),
+    })
+    expect(await run(["doctor"], deps)).toBe(0)
+    expect(flat(stdout.text)).toMatch(new RegExp(`✓ Security key helper ${helper} \\(from CANDLE_FIDO2_HELPER\\)`))
+    expect(stdout.text.indexOf("Security key helper")).toBeGreaterThan(stdout.text.indexOf("Install "))
+    expect(stdout.text.indexOf("Security key helper")).toBeLessThan(stdout.text.indexOf("Update "))
+  })
+
+  test("FAIL on a release binary with no helper beside it, when the release declares one: exit 1 and the D8 fix", async () => {
+    const { fetch } = createRoutedFetch(manifestRoute(withHelper))
+    const stdout = createCapture()
+    const deps = createTestDeps({
+      fetch,
+      stdout,
+      execPath: "/home/u/.local/bin/candle",
+      env,
+      ...healthyStores(),
+    })
+    // Every other row is healthy; this row alone moves the exit code.
+    expect(await run(["doctor"], deps)).toBe(1)
+    expect(flat(stdout.text)).toMatch(
+      /✗ Security key helper no candle-fido2 executable beside \/home\/u\/\.local\/bin\/candle\. Fix: candle vault factor add security-key --install-helper/,
+    )
+  })
+
+  test("FAIL when CANDLE_FIDO2_HELPER names a non-executable: the flag installs nothing, so the fix is the variable", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "candle-doctor-helper-env-"))
+    const helper = join(dir, "not-executable")
+    await writeFile(helper, "not a binary\n")
+    await chmod(helper, 0o644)
+    const { fetch } = createRoutedFetch(manifestRoute(withHelper))
+    const stdout = createCapture()
+    const deps = createTestDeps({
+      fetch,
+      stdout,
+      execPath: "/home/u/.local/bin/candle",
+      env: { ...env, CANDLE_FIDO2_HELPER: helper },
+      ...healthyStores(),
+    })
+    expect(await run(["doctor"], deps)).toBe(1)
+    const escaped = helper.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    expect(flat(stdout.text)).toMatch(
+      new RegExp(
+        `✗ Security key helper CANDLE_FIDO2_HELPER points at ${escaped}, which is not an executable file\\. Fix: correct or unset CANDLE_FIDO2_HELPER`,
+      ),
+    )
+    expect(stdout.text).not.toContain("--install-helper")
+  })
+
+  test("a Homebrew install with no helper is FAIL too, and the fix is brew's", async () => {
+    const { fetch } = createRoutedFetch(manifestRoute(withHelper))
+    const stdout = createCapture()
+    const deps = createTestDeps({
+      fetch,
+      stdout,
+      execPath: "/opt/homebrew/bin/candle",
+      realpath: async () => "/opt/homebrew/Cellar/candle/0.5.0/bin/candle",
+      env,
+      ...healthyStores(),
+    })
+    expect(await run(["doctor"], deps)).toBe(1)
+    expect(flat(stdout.text)).toMatch(/✗ Security key helper .*Fix: brew reinstall candle/)
+  })
+
+  test("SKIP on an npm install: there is no helper to install, and the exit code does not move", async () => {
+    const { fetch } = createRoutedFetch(manifestRoute(withHelper))
+    const stdout = createCapture()
+    const deps = createTestDeps({ fetch, stdout, execPath: "/usr/local/bin/node", env, ...healthyStores() })
+    expect(await run(["doctor"], deps)).toBe(0)
+    expect(flat(stdout.text)).toMatch(/– Security key helper this CLI is running from the npm package.*release build/)
+  })
+
+  test("SKIP when the release declares no helper for this platform (D6), naming the release", async () => {
+    const { fetch } = createRoutedFetch(manifestRoute({ version: "99.0.0", tag: "cli-v99.0.0", assets: {} }))
+    const stdout = createCapture()
+    const deps = createTestDeps({ fetch, stdout, execPath: "/home/u/.local/bin/candle", env, ...healthyStores() })
+    expect(await run(["doctor"], deps)).toBe(0)
+    expect(flat(stdout.text)).toMatch(
+      /– Security key helper .*release 99\.0\.0 ships no candle-fido2-linux-x64 for this platform/,
+    )
+  })
+
+  test("SKIP offline: without the manifest the row cannot say whether this platform ships one", async () => {
+    const { fetch } = createRoutedFetch(HEALTHY_ROUTES) // no manifest route: the fetch throws
+    const stdout = createCapture()
+    const deps = createTestDeps({ fetch, stdout, execPath: "/home/u/.local/bin/candle", env, ...healthyStores() })
+    expect(await run(["doctor"], deps)).toBe(0)
+    expect(flat(stdout.text)).toMatch(/– Security key helper .*could not read the release manifest/)
+  })
+
+  test("--json carries the row like every other", async () => {
+    const { fetch } = createRoutedFetch(manifestRoute(withHelper))
+    const stdout = createCapture()
+    const deps = createTestDeps({ fetch, stdout, execPath: "/home/u/.local/bin/candle", env, ...healthyStores() })
+    expect(await run(["doctor", "--json"], deps)).toBe(1)
+    const body = JSON.parse(stdout.text) as { rows: { check: string; state: string; detail: string }[] }
+    const row = body.rows.find((r) => r.check === "Security key helper")
+    expect(row?.state).toBe("FAIL")
+    expect(row?.detail).toContain("--install-helper")
+  })
+})
+
+describe("doctor report layout", () => {
+  const plain: TerminalStyle = { width: 118, styled: false, color: 0, theme: "light", motion: false }
+  const styled: TerminalStyle = { ...plain, styled: true }
+  const rows = [
+    { check: "Runtime version", state: "PASS" as const, detail: "node 24.3.0" },
+    { check: "Update", state: "SKIP" as const, detail: "could not check" },
+    {
+      check: "Device token beside signer",
+      state: "WARN" as const,
+      detail: "Warning: this machine holds a device token as well as a key signer.",
+    },
+    { check: "API key valid", state: "FAIL" as const, detail: "revoked. Fix: candle auth login" },
+  ]
+
+  test("the device-token warning is its own block under the list, with the fix on its own line", () => {
+    const text = renderDoctorReport(rows, "owner", styled)
+    expect(text).toContain("  ! Device token beside signer\n")
+    const lines = text.split("\n")
+    const notice = lines.findIndex((line) => line.includes("so it can approve its own signer request"))
+    expect(notice).toBeGreaterThan(lines.findIndex((line) => line.includes("API key valid")))
+    expect(lines[notice - 1]).toBe("")
+    expect(flat(text)).toContain("approve from the owner's machine:")
+    expect(text).toContain("\n      candle auth logout --profile <name>\n")
+    // Never inside a table cell or past the prose width.
+    expect(Math.max(...lines.map((line) => line.length))).toBeLessThanOrEqual(100)
+  })
+
+  test("the tally counts each state, and plain mode keeps the same layout with ASCII marks", () => {
+    expect(renderDoctorReport(rows, "owner", styled)).toContain("1 passed · 1 warning · 1 failed · 1 skipped")
+    const text = renderDoctorReport(rows, "owner", plain)
+    expect(text).toContain("  ok Runtime version")
+    expect(text).toContain("  x  API key valid")
+    expect(text).toContain("  -  Update")
+    expect(text).toContain("1 passed - 1 warning - 1 failed - 1 skipped")
+  })
+
+  test("no warning row, no warning block", () => {
+    expect(renderDoctorReport(rows.slice(0, 2), "owner", styled)).not.toContain("approve its own signer request")
+  })
+})

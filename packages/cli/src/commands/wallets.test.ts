@@ -1,0 +1,750 @@
+/**
+ * `wallets`, driven through `run()`: fetches embedded (launch) wallets and linked wallets with
+ * the agent key. Not in task-3-brief.md's required coverage list, but covered here for the same
+ * reason every other command is: it is a real, user-facing command surface.
+ */
+
+import { describe, expect, test } from "bun:test"
+import { run } from "../index"
+import type { SecretStore } from "../secret-store"
+import {
+  createCapture,
+  createFakeConfigStore,
+  createFakeStore,
+  createRoutedFetch,
+  createTestDeps,
+  jsonResponse,
+} from "../test-support"
+
+describe("wallets", () => {
+  test("prints embedded and linked wallets using the agent key", async () => {
+    const { fetch, calls } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, {
+          success: true,
+          wallets: { solana: { address: "So1anaAddr", delegated: true }, evm: null },
+        }),
+      "/api/v1/agent/wallets": () =>
+        jsonResponse(200, {
+          success: true,
+          page: [{ _id: "lw_listed01", address: "0xLinked", chain: "evm", label: "my wallet" }],
+          isDone: true,
+          continueCursor: null,
+        }),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x" })
+    const stdout = createCapture()
+    const code = await run(["wallets"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(0)
+    for (const call of calls) {
+      const headers = call.init.headers as Record<string, string>
+      expect(headers["x-api-key"]).toBe("ck_live_x")
+    }
+    expect(stdout.text).toContain("So1anaAddr")
+    expect(stdout.text).toContain("0xLinked")
+    // The row id renders: it is the handle wallets revoke and the trade API's linkedWalletId take.
+    expect(stdout.text).toContain("lw_listed01")
+  })
+
+  test("requires an API key; without one it fails without making a request", async () => {
+    const { fetch, calls } = createRoutedFetch({})
+    const stderr = createCapture()
+    const code = await run(["wallets"], createTestDeps({ fetch, stderr }))
+    expect(code).toBe(1)
+    expect(calls).toHaveLength(0)
+    expect(stderr.text.toLowerCase()).toContain("keys create")
+  })
+
+  test("the missing-API-key exit honors --json: STDOUT parses (the machine contract), and carries the code", async () => {
+    const { fetch, calls } = createRoutedFetch({})
+    const stdout = createCapture()
+    const stderr = createCapture()
+    const code = await run(["wallets", "--json"], createTestDeps({ fetch, stdout, stderr }))
+    expect(code).toBe(1)
+    expect(calls).toHaveLength(0)
+    expect(stderr.text).toBe("")
+    expect(JSON.parse(stdout.text)).toEqual({
+      ok: false,
+      code: "NO_API_KEY",
+      message: "No API key available.",
+      suggestion: "Run: candle keys create",
+    })
+  })
+
+  // GET /wallets sits behind requireAgentKey("launch:write"), so an activity-only key gets a 403
+  // here. Without the SCOPE_MISSING mapping that printed a statement of fact with no next step.
+  test("a 403 SCOPE_MISSING on the linked-wallets call keeps the scope name and adds the fix commands", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, { success: true, wallets: { solana: { address: "So1", delegated: true }, evm: null } }),
+      "/api/v1/agent/wallets": () =>
+        jsonResponse(403, {
+          success: false,
+          error: { code: "SCOPE_MISSING", message: "This key lacks the launch:write scope" },
+        }),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x" })
+    const stderr = createCapture()
+
+    const code = await run(["wallets"], createTestDeps({ fetch, store, stderr }))
+
+    expect(code).toBe(1)
+    expect(stderr.text).toContain("launch:write")
+    expect(stderr.text).toContain("candle keys create --scopes")
+    expect(stderr.text).toContain("candle keys list")
+  })
+})
+
+/**
+ * The `Signer` column (CLI profiles Phase 3). A linked wallet has two halves in two places: the
+ * row lives on the Candle account, the signer private key lives in THIS machine's store under
+ * `wallet_signer_<id>`. Before this column the three states looked identical on screen, so a
+ * wallet whose signer was imported on another machine read exactly like one that can trade from
+ * here, and the difference only showed up as a signing failure.
+ */
+describe("wallets signer column", () => {
+  const noEmbeddedWallets = () => jsonResponse(200, { success: true, wallets: { solana: null, evm: null } })
+
+  /** `GET /wallets`' own envelope around `rows`, so the fixtures stay row-shaped. */
+  function linkedPage(rows: Array<Record<string, unknown>>) {
+    return () => jsonResponse(200, { success: true, page: rows, isDone: true, continueCursor: null })
+  }
+
+  /** The rendered linked-wallets line for `id`, split into cells. `renderTable` pads every column
+   * except the last and joins with two spaces, so the Signer value is always the final cell. */
+  function cellsFor(text: string, id: string): string[] {
+    const line = text.split("\n").find((candidate) => candidate.trimStart().startsWith(`${id} `))
+    if (line === undefined) throw new Error(`no rendered row for ${id} in:\n${text}`)
+    return line.trim().split(/\s{2,}/)
+  }
+
+  function signerCell(text: string, id: string): string | undefined {
+    return cellsFor(text, id).at(-1)
+  }
+
+  /** A store that answers for the API key but refuses every signer probe, the shape of a locked
+   * keychain or a missing `secret-tool`. */
+  function storeThatCannotReadSigners(seed: Record<string, string>, message: string): SecretStore {
+    const base = createFakeStore(seed)
+    return {
+      get: async (ref: string) => {
+        if (ref.startsWith("wallet_signer_")) throw new Error(message)
+        return base.get(ref)
+      },
+      set: (ref: string, value: string) => base.set(ref, value),
+      delete: (ref: string) => base.delete(ref),
+    }
+  }
+
+  const NONE_HINT_FIRST_LINE =
+    "A wallet marked none has no signer on this machine, so a trade from here cannot sign with it."
+  const NONE_HINT_SECOND_LINE =
+    "Import it here (candle wallets import), or run the trade from the machine that imported it."
+  const STALE_HINT =
+    "A wallet marked stale is revoked but its signer is still stored here. Run: candle wallets revoke <id>"
+
+  test("marks the row whose signer this machine holds stored, the other none, and prints the none hint", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      "/api/v1/agent/wallets": linkedPage([
+        { _id: "lw_here", address: "So1Here", chain: "solana", label: "here" },
+        { _id: "lw_elsewhere", address: "So1Elsewhere", chain: "solana", label: "elsewhere" },
+      ]),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x", wallet_signer_lw_here: "c2lnbmVyLWJvZHk=" })
+    const stdout = createCapture()
+    const stderr = createCapture()
+
+    const code = await run(["wallets"], createTestDeps({ fetch, store, stdout, stderr }))
+
+    expect(code).toBe(0)
+    // Reverting the column drops both of these cells and leaves the two rows indistinguishable.
+    expect(signerCell(stdout.text, "lw_here")).toBe("stored")
+    expect(signerCell(stdout.text, "lw_elsewhere")).toBe("none")
+    expect(stdout.text.replace(/\s+/g, " ")).toContain(NONE_HINT_FIRST_LINE)
+    expect(stdout.text.replace(/\s+/g, " ")).toContain(NONE_HINT_SECOND_LINE)
+    // The hint is about the signer, not an error: nothing failed here.
+    expect(stderr.text).toBe("")
+  })
+
+  test("a revoked row whose signer is still stored reads stale, and the hint names candle wallets revoke", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      "/api/v1/agent/wallets": linkedPage([
+        { _id: "lw_stale", address: "So1Stale", chain: "solana", revokedAt: 1_724_500_000_000 },
+      ]),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x", wallet_signer_lw_stale: "c2lnbmVyLWJvZHk=" })
+    const stdout = createCapture()
+
+    const code = await run(["wallets"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(0)
+    // On revert this reads "no" in the Revoked column and says nothing about the leftover secret.
+    expect(signerCell(stdout.text, "lw_stale")).toBe("stale")
+    expect(stdout.text.replace(/\s+/g, " ")).toContain(STALE_HINT)
+    // Only the state a row is actually in gets a hint.
+    expect(stdout.text).not.toContain(NONE_HINT_FIRST_LINE)
+  })
+
+  test("a revoked row with no signer here reads - and prints no hint at all", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      "/api/v1/agent/wallets": linkedPage([
+        { _id: "lw_gone", address: "So1Gone", chain: "solana", revokedAt: 1_724_500_000_000 },
+      ]),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x" })
+    const stdout = createCapture()
+
+    const code = await run(["wallets"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(0)
+    // There is nothing to say about a revoked wallet with no local secret, so it says nothing.
+    expect(signerCell(stdout.text, "lw_gone")).toBe("–")
+    expect(stdout.text).not.toContain(NONE_HINT_FIRST_LINE)
+    expect(stdout.text).not.toContain(STALE_HINT)
+  })
+
+  test("--json carries a signers map for every row and leaves both API bodies verbatim", async () => {
+    const embeddedBody = {
+      success: true,
+      wallets: { solana: { address: "So1anaAddr", delegated: true }, evm: null },
+    }
+    const linkedBody = {
+      success: true,
+      // walletKind (BE-860) rides through with the rest of each row.
+      page: [
+        { _id: "lw_here", address: "So1Here", chain: "solana", label: "here", walletKind: "imported" },
+        { _id: "lw_elsewhere", address: "So1Elsewhere", chain: "solana", walletKind: "linked" },
+        { _id: "lw_stale", address: "So1Stale", chain: "solana", revokedAt: 1_724_500_000_000, walletKind: "tee" },
+        { _id: "lw_gone", address: "So1Gone", chain: "solana", revokedAt: 1_724_500_000_000, walletKind: "linked" },
+      ],
+      isDone: true,
+      continueCursor: null,
+    }
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": () => jsonResponse(200, embeddedBody),
+      "/api/v1/agent/wallets": () => jsonResponse(200, linkedBody),
+    })
+    const store = createFakeStore({
+      api_key: "ck_live_x",
+      wallet_signer_lw_here: "c2lnbmVyLWJvZHk=",
+      wallet_signer_lw_stale: "c2lnbmVyLWJvZHk=",
+    })
+    const stdout = createCapture()
+    const stderr = createCapture()
+
+    const code = await run(["wallets", "--json"], createTestDeps({ fetch, store, stdout, stderr }))
+
+    expect(code).toBe(0)
+    // The machine contract: stdout is exactly one JSON document, hints and all excluded.
+    expect(stdout.text.trimEnd().split("\n")).toHaveLength(1)
+    const parsed = JSON.parse(stdout.text) as {
+      embedded: unknown
+      linked: unknown
+      signers: Record<string, string>
+    }
+    // The API bodies are what the API sent, byte for byte: the CLI's own answer is a sibling.
+    expect(parsed.embedded).toEqual(embeddedBody)
+    expect(parsed.linked).toEqual(linkedBody)
+    // Every row has an entry; the human table's "-" is "none" here, since the row carries revokedAt.
+    expect(parsed.signers).toEqual({
+      lw_here: "stored",
+      lw_elsewhere: "none",
+      lw_stale: "stale",
+      lw_gone: "none",
+    })
+    expect(stdout.text).not.toContain(NONE_HINT_FIRST_LINE)
+    expect(stdout.text).not.toContain(STALE_HINT)
+    expect(stderr.text).toBe("")
+  })
+
+  test("a store that cannot be read marks every row none, warns ONCE on stderr, and still exits 0", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      "/api/v1/agent/wallets": linkedPage([
+        { _id: "lw_one", address: "So1One", chain: "solana" },
+        { _id: "lw_two", address: "So1Two", chain: "solana" },
+      ]),
+    })
+    const store = storeThatCannotReadSigners({ api_key: "ck_live_x" }, "keychain is locked")
+    const stdout = createCapture()
+    const stderr = createCapture()
+
+    const code = await run(["wallets"], createTestDeps({ fetch, store, stdout, stderr }))
+
+    // An unreadable keychain is not a failed listing: the rows are still worth printing.
+    expect(code).toBe(0)
+    expect(signerCell(stdout.text, "lw_one")).toBe("none")
+    expect(signerCell(stdout.text, "lw_two")).toBe("none")
+    // One warning for the whole listing, not one per row.
+    expect(stderr.text.split("Could not read the signer store:")).toHaveLength(2)
+    expect(stderr.text).toContain("keychain is locked")
+  })
+
+  test("the same unreadable store under --json keeps stdout parseable and puts the warning on stderr", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      "/api/v1/agent/wallets": linkedPage([{ _id: "lw_one", address: "So1One", chain: "solana" }]),
+    })
+    const store = storeThatCannotReadSigners({ api_key: "ck_live_x" }, "keychain is locked")
+    const stdout = createCapture()
+    const stderr = createCapture()
+
+    const code = await run(["wallets", "--json"], createTestDeps({ fetch, store, stdout, stderr }))
+
+    expect(code).toBe(0)
+    expect(stdout.text.trimEnd().split("\n")).toHaveLength(1)
+    expect((JSON.parse(stdout.text) as { signers: Record<string, string> }).signers).toEqual({ lw_one: "none" })
+    expect(stderr.text).toContain("Could not read the signer store: keychain is locked")
+  })
+
+  test("the column is additive: the existing columns keep their values and Signer is appended last", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      "/api/v1/agent/wallets": linkedPage([
+        { _id: "lw_listed01", address: "0xLinked", chain: "evm", label: "my wallet" },
+      ]),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x" })
+    const stdout = createCapture()
+
+    const code = await run(["wallets"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(0)
+    const header = stdout.text.split("\n").find((line) => line.trimStart().startsWith("Id "))
+    // BE-329 added Trusted before Signer; Signer stays last.
+    expect(header?.trim().split(/\s{2,}/)).toEqual([
+      "Id",
+      "Wallet",
+      "Address",
+      "Label",
+      "Kind",
+      "Revoked",
+      "Trusted",
+      "Signer",
+    ])
+    expect(cellsFor(stdout.text, "lw_listed01")).toEqual([
+      "lw_listed01",
+      "evm",
+      "0xLinked",
+      "my wallet",
+      "linked",
+      "no",
+      "no",
+      "none",
+    ])
+  })
+
+  // BE-329: the Trusted column is the server's rule: linked while signed in, or marked by the owner.
+  test("Trusted reads yes for a session link or a trust mark, no for an unmarked key import, - when revoked", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      "/api/v1/agent/wallets": linkedPage([
+        { _id: "lw_sess", address: "SessAddr", chain: "solana", addedVia: "session" },
+        { _id: "lw_mark", address: "MarkAddr", chain: "solana", addedVia: "agent", trustedAt: 5 },
+        { _id: "lw_key", address: "KeyAddr", chain: "solana", addedVia: "agent" },
+        { _id: "lw_gone", address: "GoneAddr", chain: "solana", addedVia: "agent", trustedAt: 5, revokedAt: 9 },
+      ]),
+    })
+    const stdout = createCapture()
+    expect(
+      await run(["wallets"], createTestDeps({ fetch, store: createFakeStore({ api_key: "ck_live_x" }), stdout })),
+    ).toBe(0)
+    expect(cellsFor(stdout.text, "lw_sess")?.[6]).toBe("yes")
+    expect(cellsFor(stdout.text, "lw_mark")?.[6]).toBe("yes")
+    expect(cellsFor(stdout.text, "lw_key")?.[6]).toBe("no")
+    expect(cellsFor(stdout.text, "lw_gone")?.[6]).toBe("–")
+    expect(stdout.text).toContain("candle wallets trust")
+  })
+
+  test("no untrusted hint when every active wallet is trusted", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      "/api/v1/agent/wallets": linkedPage([
+        { _id: "lw_sess", address: "SessAddr", chain: "solana", addedVia: "session" },
+      ]),
+    })
+    const stdout = createCapture()
+    expect(
+      await run(["wallets"], createTestDeps({ fetch, store: createFakeStore({ api_key: "ck_live_x" }), stdout })),
+    ).toBe(0)
+    expect(stdout.text).not.toContain("candle wallets trust")
+  })
+
+  // BE-249: someone refused by `candle swap --wallet` had no command that answered "then which
+  // wallet CAN I use?" -- `/wallets` was already returning `profile` and the listing threw it away.
+  test("a TEE trading wallet is marked as one, and the hint names the command that takes it", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      "/api/v1/agent/wallets": linkedPage([
+        { _id: "lw_tee01", address: "So1Tee", chain: "solana", label: "desk", profile: "ember-tee" },
+        // The pre-2026-09-17 name, still on rows written before the rename.
+        { _id: "lw_tee02", address: "So1TeeOld", chain: "solana", profile: "ember-hot" },
+        // A profile this CLI has never heard of renders as a plain linked wallet, not a TEE one.
+        { _id: "lw_future", address: "So1Future", chain: "solana", profile: "something-new" },
+        { _id: "lw_plain1", address: "So1Plain", chain: "solana" },
+      ]),
+    })
+    const stdout = createCapture()
+
+    const code = await run(
+      ["wallets"],
+      createTestDeps({ fetch, store: createFakeStore({ api_key: "ck_live_x" }), stdout }),
+    )
+
+    expect(code).toBe(0)
+    expect(cellsFor(stdout.text, "lw_tee01")?.[4]).toBe("tee")
+    expect(cellsFor(stdout.text, "lw_tee02")?.[4]).toBe("tee")
+    expect(cellsFor(stdout.text, "lw_future")?.[4]).toBe("linked")
+    expect(cellsFor(stdout.text, "lw_plain1")?.[4]).toBe("linked")
+    expect(stdout.text.replace(/\s+/g, " ")).toContain("candle swap --wallet")
+  })
+
+  test("an all-linked listing says nothing about TEE wallets", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      "/api/v1/agent/wallets": linkedPage([{ _id: "lw_plain1", address: "So1Plain", chain: "solana" }]),
+    })
+    const stdout = createCapture()
+
+    expect(
+      await run(["wallets"], createTestDeps({ fetch, store: createFakeStore({ api_key: "ck_live_x" }), stdout })),
+    ).toBe(0)
+    expect(stdout.text).not.toContain("candle swap --wallet")
+  })
+
+  test("a row without an _id is printed as - and never probed for, in either mode", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": noEmbeddedWallets,
+      // The second row is the shape the type says cannot happen. If it ever does, the probe must
+      // not run under the ref `wallet_signer_undefined`, which on a real keychain would be a
+      // read for a credential nobody ever stored.
+      "/api/v1/agent/wallets": linkedPage([
+        { _id: "lw_here", address: "So1Here", chain: "solana", label: "here" },
+        { address: "So1NoId", chain: "solana", label: "orphan" },
+      ]),
+    })
+    const probed: string[] = []
+    const backing = createFakeStore({ api_key: "ck_live_x", wallet_signer_lw_here: "c2lnbmVyLWJvZHk=" })
+    const store: SecretStore = {
+      get: async (ref: string) => {
+        probed.push(ref)
+        return backing.get(ref)
+      },
+      set: (ref: string, value: string) => backing.set(ref, value),
+      delete: (ref: string) => backing.delete(ref),
+    }
+    const stdout = createCapture()
+
+    const code = await run(["wallets"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(0)
+    expect(signerCell(stdout.text, "lw_here")).toBe("stored")
+    // The id cell is empty, so this row is found by its address rather than by `startsWith`.
+    const orphan = stdout.text.split("\n").find((line) => line.includes("So1NoId"))
+    expect(orphan?.split(/\s{2,}/).at(-1)).toBe("–")
+    // Exactly one signer ref was asked for: the row with an id.
+    expect(probed.filter((ref) => ref.startsWith("wallet_signer_"))).toEqual(["wallet_signer_lw_here"])
+
+    const jsonStdout = createCapture()
+    const jsonCode = await run(["wallets", "--json"], createTestDeps({ fetch, store, stdout: jsonStdout }))
+
+    expect(jsonCode).toBe(0)
+    // Omitted from the map entirely, rather than keyed under "undefined".
+    expect((JSON.parse(jsonStdout.text) as { signers: Record<string, string> }).signers).toEqual({
+      lw_here: "stored",
+    })
+  })
+})
+
+/**
+ * `wallets revoke` is unchanged by Phase 3, but the `stale` hint sends operators straight at it,
+ * so what it does with the local signer is pinned here. `linkedWallets.revoke` is idempotent for
+ * this account's own rows (an already-revoked row comes back unchanged, 2xx), and answers 404
+ * only for a wallet that does not exist or belongs to someone else.
+ */
+const QUARANTINED = {
+  success: true,
+  state: "quarantined",
+  stopAcknowledged: true,
+  remoteAuthority: "verified-denied",
+  evidenceObservedAt: 1_726_000_000_000,
+  complete: true,
+  retryable: false,
+  policyNeutralized: true,
+}
+const PENDING = {
+  success: true,
+  state: "disable-pending",
+  stopAcknowledged: true,
+  remoteAuthority: "unknown",
+  evidenceObservedAt: null,
+  complete: false,
+  retryable: true,
+  reasonCode: "READ_BACK_UNAVAILABLE",
+  policyNeutralized: false,
+}
+
+describe("wallets revoke and the stored signer", () => {
+  test("a verified (200 quarantined) revoke deletes the local signer, which is what makes the stale hint true", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_stale": () => jsonResponse(200, QUARANTINED),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x", wallet_signer_lw_stale: "c2lnbmVyLWJvZHk=" })
+    const stdout = createCapture()
+
+    const code = await run(["wallets", "revoke", "lw_stale"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(0)
+    expect(stdout.text).toContain("quarantined")
+    // The dead end the hint would otherwise point into: a stale row nothing can clear.
+    expect(await store.get("wallet_signer_lw_stale")).toBeNull()
+  })
+
+  // Ember Phase 0 (BE-93, T03/T23): a 202 disable-pending is an ACCEPTED stop whose remote
+  // enforcement is unconfirmed. The command must not print "Revoked", must exit 3, and must leave
+  // the signer where it is until the stop is verified.
+  test("a 202 disable-pending revoke exits 3, says pending, names the reason, and keeps the signer", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_pending": () => jsonResponse(202, PENDING),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x", wallet_signer_lw_pending: "c2lnbmVyLWJvZHk=" })
+    const stdout = createCapture()
+
+    const code = await run(["wallets", "revoke", "lw_pending"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(3)
+    expect(stdout.text).toContain("verification is pending")
+    expect(stdout.text).toContain("READ_BACK_UNAVAILABLE")
+    expect(stdout.text).toContain("TEE signing authority may still be active")
+    expect(stdout.text).not.toContain("Revoked linked wallet")
+    expect(await store.get("wallet_signer_lw_pending")).toBe("c2lnbmVyLWJvZHk=")
+  })
+
+  test("an older API that answers a bare success:true is treated as unverified: exit 3, signer kept", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_legacy": () => jsonResponse(200, { success: true, policyNeutralized: true }),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x", wallet_signer_lw_legacy: "c2lnbmVyLWJvZHk=" })
+    const stdout = createCapture()
+
+    const code = await run(["wallets", "revoke", "lw_legacy"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(3)
+    expect(await store.get("wallet_signer_lw_legacy")).toBe("c2lnbmVyLWJvZHk=")
+  })
+
+  test("--json carries the typed state through and the exit code still follows it", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_pending": () => jsonResponse(202, PENDING),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x" })
+    const stdout = createCapture()
+
+    const code = await run(["wallets", "revoke", "lw_pending", "--json"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(3)
+    const parsed = JSON.parse(stdout.text.trim())
+    expect(parsed.revoked).toBe("lw_pending")
+    expect(parsed.state).toBe("disable-pending")
+    expect(parsed.complete).toBe(false)
+  })
+
+  test("an attribution-only row (remoteAuthority none) is complete on the spot", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_attr": () =>
+        jsonResponse(200, {
+          success: true,
+          state: "quarantined",
+          stopAcknowledged: true,
+          remoteAuthority: "none",
+          evidenceObservedAt: null,
+          complete: true,
+          retryable: false,
+        }),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x" })
+    const stdout = createCapture()
+
+    const code = await run(["wallets", "revoke", "lw_attr"], createTestDeps({ fetch, store, stdout }))
+
+    expect(code).toBe(0)
+    expect(stdout.text).toContain("attribution-only")
+  })
+
+  test("a 404 revoke leaves the signer alone and exits 1: that wallet may be another profile's", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_other": () =>
+        jsonResponse(404, { success: false, error: { code: "NOT_FOUND", message: "Wallet not found" } }),
+    })
+    const store = createFakeStore({ api_key: "ck_live_x", wallet_signer_lw_other: "c2lnbmVyLWJvZHk=" })
+    const stderr = createCapture()
+
+    const code = await run(["wallets", "revoke", "lw_other"], createTestDeps({ fetch, store, stderr }))
+
+    expect(code).toBe(1)
+    expect(await store.get("wallet_signer_lw_other")).toBe("c2lnbmVyLWJvZHk=")
+  })
+})
+
+describe("profiles", () => {
+  test("prints the identity line first, using the profile's cached account", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": () =>
+        jsonResponse(200, { success: true, wallets: { solana: null, evm: null } }),
+      "/api/v1/agent/wallets": () => jsonResponse(200, { success: true, page: [], isDone: true, continueCursor: null }),
+    })
+    const store = createFakeStore({ "profile:staging:api_key": "ck_live_x" })
+    const config = createFakeConfigStore({ profiles: { staging: { account: "A" } }, activeProfile: "staging" })
+    const stdout = createCapture()
+    const code = await run(["wallets"], createTestDeps({ fetch, store, stdout, ...config }))
+    expect(code).toBe(0)
+    expect(stdout.text.startsWith("Profile staging · Account A · ")).toBe(true)
+  })
+})
+
+/**
+ * BE-242. `candle wallet` served the default first page -- 20 rows -- and discarded the
+ * `isDone: false` / `continueCursor: "20"` sitting in the same payload, in BOTH renderings. The
+ * cursor walk existed in this very file, inside `verifyImportLanded`, and never reached the
+ * listing operators actually read. These pin the listing itself, since that is where the defect
+ * was and where a second copy of the loop would put it back.
+ */
+describe("the listing follows the cursor to the end of the list", () => {
+  const embedded = () => jsonResponse(200, { success: true, wallets: { solana: null, evm: null } })
+  const row = (n: number) => ({ _id: `lw_${n}`, address: `Addr${n}`, chain: "solana" })
+  /** Three pages: 100, 100, then 7. The shape a Max-tier account past the ceiling actually has. */
+  const threePages = () => [
+    () =>
+      jsonResponse(200, {
+        success: true,
+        page: Array.from({ length: 100 }, (_, i) => row(i)),
+        isDone: false,
+        continueCursor: "100",
+      }),
+    () =>
+      jsonResponse(200, {
+        success: true,
+        page: Array.from({ length: 100 }, (_, i) => row(100 + i)),
+        isDone: false,
+        continueCursor: "200",
+      }),
+    () =>
+      jsonResponse(200, {
+        success: true,
+        page: Array.from({ length: 7 }, (_, i) => row(200 + i)),
+        isDone: true,
+        continueCursor: null,
+      }),
+  ]
+
+  test("the table prints every row across every page, and heads it with the count", async () => {
+    const { fetch, calls } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": embedded,
+      "/api/v1/agent/wallets": threePages(),
+    })
+    const stdout = createCapture()
+    const code = await run(["wallets"], createTestDeps({ fetch, store: createFakeStore({ api_key: "ck_x" }), stdout }))
+
+    expect(code).toBe(0)
+    expect(stdout.text).toContain("Linked wallets (207)")
+    // The first row, one from page two, and the LAST row -- the one the old single-page read
+    // could never reach.
+    expect(stdout.text).toContain("Addr0")
+    expect(stdout.text).toContain("Addr150")
+    expect(stdout.text).toContain("Addr206")
+
+    // It asked for 100 at a time and carried each cursor it was handed, rather than taking the
+    // default 20 once.
+    const listCalls = calls.filter((c) => new URL(c.url).pathname === "/api/v1/agent/wallets")
+    expect(listCalls).toHaveLength(3)
+    expect(listCalls.map((c) => new URL(c.url).searchParams.get("limit"))).toEqual(["100", "100", "100"])
+    expect(listCalls.map((c) => new URL(c.url).searchParams.get("cursor"))).toEqual([null, "100", "200"])
+  })
+
+  test("--json carries every row, says isDone, and states the count and truncation flatly", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": embedded,
+      "/api/v1/agent/wallets": threePages(),
+    })
+    const stdout = createCapture()
+    const code = await run(
+      ["wallets", "--json"],
+      createTestDeps({ fetch, store: createFakeStore({ api_key: "ck_x" }), stdout }),
+    )
+
+    expect(code).toBe(0)
+    const parsed = JSON.parse(stdout.text) as {
+      linked: { page: { _id: string }[]; isDone: boolean; continueCursor: string | null; success?: boolean }
+      walletCount: number
+      truncated: boolean
+    }
+    // The contract chosen in item 2: `page` is the WHOLE list, not its first page, so the table
+    // and the JSON cannot disagree about what "your wallets" means. The shape is the one callers
+    // already parse, so an existing consumer gets more rows rather than a different document.
+    expect(parsed.linked.page).toHaveLength(207)
+    expect(parsed.linked.page[206]?._id).toBe("lw_206")
+    expect(parsed.linked.isDone).toBe(true)
+    expect(parsed.linked.continueCursor).toBe(null)
+    expect(parsed.walletCount).toBe(207)
+    expect(parsed.truncated).toBe(false)
+    // The server's own envelope survives around the replaced fields.
+    expect(parsed.linked.success).toBe(true)
+  })
+
+  test("a page cap reached says so on stderr and in the JSON, rather than truncating silently", async () => {
+    // A server that never says it is done. The walk is bounded, and item 3's rule is that a
+    // bounded fetch must ANNOUNCE itself rather than hand back a short list as if it were whole.
+    const { fetch, calls } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": embedded,
+      "/api/v1/agent/wallets": () =>
+        jsonResponse(200, { success: true, page: [row(1)], isDone: false, continueCursor: "9" }),
+    })
+    const stdout = createCapture()
+    const stderr = createCapture()
+    const code = await run(
+      ["wallets", "--json"],
+      createTestDeps({ fetch, store: createFakeStore({ api_key: "ck_x" }), stdout, stderr }),
+    )
+
+    expect(code).toBe(0)
+    const listCalls = calls.filter((c) => new URL(c.url).pathname === "/api/v1/agent/wallets")
+    expect(listCalls).toHaveLength(25)
+    expect(stderr.text).toContain("NOT complete")
+    expect(stderr.text).toContain("cursor 9")
+    const parsed = JSON.parse(stdout.text) as {
+      linked: { isDone: boolean; continueCursor: string | null }
+      truncated: boolean
+    }
+    expect(parsed.truncated).toBe(true)
+    expect(parsed.linked.isDone).toBe(false)
+    // And it hands back where to continue from, so the list is finishable rather than merely
+    // known to be short.
+    expect(parsed.linked.continueCursor).toBe("9")
+    // The warning must never land inside the document stdout is contracted to carry.
+    expect(() => JSON.parse(stdout.text)).not.toThrow()
+  })
+
+  test("a failure on a LATER page fails the whole read; half a wallet list is never reported as one", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/embedded": embedded,
+      "/api/v1/agent/wallets": [
+        () => jsonResponse(200, { success: true, page: [row(0)], isDone: false, continueCursor: "1" }),
+        () => jsonResponse(500, { success: false, error: { code: "BOOM", message: "down" } }),
+      ],
+    })
+    const stdout = createCapture()
+    const stderr = createCapture()
+    const code = await run(
+      ["wallets"],
+      createTestDeps({ fetch, store: createFakeStore({ api_key: "ck_x" }), stdout, stderr }),
+    )
+
+    expect(code).toBe(1)
+    // Not "Linked wallets (1):" -- one row it happened to have is not the account's wallet list.
+    expect(stdout.text).not.toContain("Linked wallets")
+  })
+})

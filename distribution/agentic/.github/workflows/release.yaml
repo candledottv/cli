@@ -1,0 +1,600 @@
+name: Release CLI
+
+# Runs on the cli-v<version> tag the monorepo's sync creates. Builds four native binaries and the
+# four candle-fido2 security key helpers beside them (Ember Phase 2 PR E: one executable per
+# target, built in the same loop and signed by the same step), signs them keyless with Sigstore,
+# attests provenance, publishes the GitHub Release, then bumps the Homebrew tap. The release has
+# twenty-five assets: candle-<os>-<arch> (4), candle-fido2-<os>-<arch> (4),
+# candle-<version>-<os>-<arch>.tar.gz (4, each holding candle, candle-fido2 and LICENSE), install.sh,
+# SHA256SUMS, ten *.sigstore.json, latest.json.
+#
+# Ember Phase 2 PR F adds the signed macOS Secure Enclave helper, candle-enclave.app, built and
+# Developer ID-signed, notarized and stapled by the macos-helper job below, but ONLY when the
+# checked-in packages/cli/release-policy.json says "signed". Under "omit" (the state until Apple
+# approves the enrolment) the release is exactly the twenty-five assets above. Under "signed" it
+# gains candle-enclave-<version>.app.zip and its Sigstore bundle, the darwin tarballs carry the
+# bundle, and latest.json names it; a missing secret, a failed signature, notarization or staple
+# fails the release, so an unsigned helper is never published.
+#
+# Ember Phase 2 PR G (BE-135, AD-2) adds the synced passkey factor to the same helper, which needs
+# the associated-domains entitlement (webcredentials:cli.candle.tv) and, under Developer ID, a
+# provisioning profile embedded in the bundle. Under "signed" that profile is one more required
+# input, APPLE_DEVELOPER_ID_PROVISIONING_PROFILE_BASE64; it is checked against the team, the
+# bundle id, the entitlement and its expiry before the build, and a missing or wrong one fails
+# the job like the other six. Under "omit" nothing changes.
+#
+# One file, two homes (spec 2026-10-23-candle-github, section 9). This workflow runs in
+# candledottv/agentic, where every version through the bridge release is cut, and the same file runs
+# in candledottv/cli, where every later version is. packages/cli/release-homes.json names both and
+# the bridge version; the `home` job refuses a tag pushed in the wrong home, so one version is never
+# released from both, and every signature check below pins THIS repository's exact identity.
+on:
+  push:
+    tags: ["cli-v*"]
+  # A manual run always builds, signs and verifies, and publishes nothing; a release is cut only
+  # by a cli-v tag push.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  ISSUER: https://token.actions.githubusercontent.com
+
+jobs:
+  # Which home this run is in, decided before any signing input is read. A tag push in a repository
+  # that is not this version's home fails here; a workflow_dispatch rehearsal is allowed in either
+  # home (it publishes nothing) and says which home the version would really be released from.
+  home:
+    runs-on: ubuntu-latest
+    outputs:
+      other: ${{ steps.home.outputs.other }}
+      version_home: ${{ steps.home.outputs.version_home }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Check this release's home
+        id: home
+        run: |
+          homes=packages/cli/release-homes.json
+          bridge="$(jq -r '.bridgeVersion' "$homes")"
+          legacy="$(jq -r '.legacy' "$homes")"
+          current="$(jq -r '.current' "$homes")"
+          version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' packages/cli/package.json | head -1)"
+          printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "packages/cli/package.json has no plain version: ${version}"; exit 1; }
+          printf '%s' "$bridge" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "release-homes.json has no plain bridgeVersion: ${bridge}"; exit 1; }
+          case "${GITHUB_REPOSITORY}" in
+            "$legacy") other="$current" ;;
+            "$current") other="$legacy" ;;
+            *) echo "${GITHUB_REPOSITORY} is not a CLI release home (${legacy}, ${current})"; exit 1 ;;
+          esac
+          # Through the bridge, legacy; after it, current. sort -V puts the larger last.
+          if [ "$(printf '%s\n%s\n' "$version" "$bridge" | sort -V | tail -1)" = "$bridge" ]; then
+            version_home="$legacy"
+          else
+            version_home="$current"
+          fi
+          { echo "other=${other}"; echo "version_home=${version_home}"; } >> "$GITHUB_OUTPUT"
+          if [ "$version_home" = "${GITHUB_REPOSITORY}" ]; then
+            echo "cli-v${version} is released from ${GITHUB_REPOSITORY} (bridge ${bridge})"
+          elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "::notice::rehearsal of ${version} in ${GITHUB_REPOSITORY}; a real cli-v${version} is released from ${version_home} (bridge ${bridge})"
+          else
+            echo "cli-v${version} is released from ${version_home}, not ${GITHUB_REPOSITORY} (bridge ${bridge}); refusing to release it here"
+            exit 1
+          fi
+
+  # The signed macOS Secure Enclave helper (Ember Phase 2 PR F, ED-12, AD-1). One switch decides
+  # whether it is built: packages/cli/release-policy.json, checked in and reviewed. Under "omit"
+  # this job reads no credential and produces only a state artifact saying so. Under "signed"
+  # every signing input is required, and any missing secret, failed signature, failed
+  # notarization or failed staple fails this job, which fails the release. Missing credentials
+  # never select "omit". The release job validates the state artifact against the same policy
+  # before anything is packed, so the two cannot disagree silently.
+  macos-helper:
+    runs-on: macos-latest
+    needs: [home]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Read the release policy
+        id: policy
+        run: |
+          policy="$(jq -r '.macosHelper.release' packages/cli/release-policy.json)"
+          bundle_id="$(jq -r '.macosHelper.bundleId' packages/cli/release-policy.json)"
+          team_id="$(jq -r '.macosHelper.teamId' packages/cli/release-policy.json)"
+          case "$policy" in
+            omit|signed) ;;
+            *) echo "release-policy.json: macosHelper.release must be \"omit\" or \"signed\", got \"$policy\""; exit 1 ;;
+          esac
+          version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' packages/cli/package.json | head -1)"
+          [ -n "$version" ] || { echo "no version in packages/cli/package.json"; exit 1; }
+          { echo "policy=${policy}"; echo "bundle_id=${bundle_id}"; echo "team_id=${team_id}"; echo "version=${version}"; } >> "$GITHUB_OUTPUT"
+          echo "macosHelper.release is ${policy}"
+      - name: Record the omission
+        if: steps.policy.outputs.policy == 'omit'
+        run: |
+          mkdir -p macos-helper
+          jq -n --arg tag "${GITHUB_REF_NAME}" --arg commit "${GITHUB_SHA}" \
+            '{status: "omitted", policy: "omit", tag: $tag, commit: $commit}' > macos-helper/macos-helper-state.json
+          cat macos-helper/macos-helper-state.json
+      - name: Require every signing input
+        if: steps.policy.outputs.policy == 'signed'
+        env:
+          APPLE_DEVELOPER_ID_CERT_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_DEVELOPER_ID_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_PROVISIONING_PROFILE_BASE64 }}
+          POLICY_TEAM_ID: ${{ steps.policy.outputs.team_id }}
+        run: |
+          missing=""
+          for name in APPLE_DEVELOPER_ID_CERT_P12_BASE64 APPLE_DEVELOPER_ID_CERT_PASSWORD APPLE_TEAM_ID APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID APPLE_NOTARY_KEY_P8_BASE64 APPLE_DEVELOPER_ID_PROVISIONING_PROFILE_BASE64; do
+            [ -n "${!name}" ] || missing="${missing} ${name}"
+          done
+          [ -z "$missing" ] || { echo "release-policy.json says signed, and these secrets are not set on this repository:${missing}"; exit 1; }
+          [ "${APPLE_TEAM_ID}" = "${POLICY_TEAM_ID}" ] || { echo "APPLE_TEAM_ID does not match release-policy.json macosHelper.teamId (${POLICY_TEAM_ID})"; exit 1; }
+      # The Developer ID provisioning profile the associated-domains entitlement needs (PR G). It
+      # is decoded once, checked against the team, the bundle id, the entitlement and its expiry,
+      # and embedded by build.sh as Contents/embedded.provisionprofile. A profile for another
+      # team or bundle, or one without the webcredentials domain, would sign cleanly and fail
+      # only on a user's Mac at the first passkey ceremony, so it is refused here instead.
+      - name: Decode and check the provisioning profile
+        if: steps.policy.outputs.policy == 'signed'
+        id: profile
+        env:
+          APPLE_DEVELOPER_ID_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          BUNDLE_ID: ${{ steps.policy.outputs.bundle_id }}
+        run: |
+          profile="${RUNNER_TEMP}/candle-enclave.provisionprofile"
+          printf '%s' "$APPLE_DEVELOPER_ID_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$profile"
+          plist="${RUNNER_TEMP}/candle-enclave.provisionprofile.plist"
+          security cms -D -i "$profile" > "$plist"
+          app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$plist")"
+          [ "$app_id" = "${APPLE_TEAM_ID}.${BUNDLE_ID}" ] || { echo "the provisioning profile is for ${app_id}, not ${APPLE_TEAM_ID}.${BUNDLE_ID}"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.associated-domains' "$plist" | grep -q 'webcredentials:cli.candle.tv' \
+            || { echo "the provisioning profile's associated-domains entitlement does not include webcredentials:cli.candle.tv"; exit 1; }
+          /usr/libexec/PlistBuddy -c 'Print :TeamIdentifier' "$plist" | grep -q "$APPLE_TEAM_ID" \
+            || { echo "the provisioning profile's TeamIdentifier does not include ${APPLE_TEAM_ID}"; exit 1; }
+          expires="$(/usr/libexec/PlistBuddy -c 'Print :ExpirationDate' "$plist")"
+          expires_epoch="$(date -j -f '%a %b %d %H:%M:%S %Z %Y' "$expires" '+%s' 2>/dev/null || python3 -c 'import sys,datetime;print(int(datetime.datetime.strptime(sys.argv[1],"%a %b %d %H:%M:%S %Z %Y").timestamp()))' "$expires")"
+          [ "$expires_epoch" -gt "$(date '+%s')" ] || { echo "the provisioning profile expired on ${expires}"; exit 1; }
+          echo "the provisioning profile is for ${app_id}, expires ${expires}"
+          echo "path=${profile}" >> "$GITHUB_OUTPUT"
+      - name: Import the Developer ID certificate into a temporary keychain
+        if: steps.policy.outputs.policy == 'signed'
+        id: cert
+        env:
+          APPLE_DEVELOPER_ID_CERT_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          keychain="${RUNNER_TEMP}/candle-release.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$APPLE_DEVELOPER_ID_CERT_P12_BASE64" | base64 --decode > "${RUNNER_TEMP}/developer-id.p12"
+          security import "${RUNNER_TEMP}/developer-id.p12" -k "$keychain" -P "$APPLE_DEVELOPER_ID_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "${RUNNER_TEMP}/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+          [ -n "$identity" ] || { echo "the certificate holds no Developer ID Application identity"; exit 1; }
+          cert_team="$(printf '%s' "$identity" | sed -n 's/.*(\([A-Z0-9]\{10\}\))$/\1/p')"
+          [ "$cert_team" = "$APPLE_TEAM_ID" ] || { echo "the certificate's team (${cert_team}) is not APPLE_TEAM_ID"; exit 1; }
+          { echo "keychain=${keychain}"; echo "identity=${identity}"; } >> "$GITHUB_OUTPUT"
+      - name: Build, sign, verify, notarize and staple the helper
+        if: steps.policy.outputs.policy == 'signed'
+        env:
+          VERSION: ${{ steps.policy.outputs.version }}
+          BUNDLE_ID: ${{ steps.policy.outputs.bundle_id }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IDENTITY: ${{ steps.cert.outputs.identity }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          PROFILE: ${{ steps.profile.outputs.path }}
+        run: |
+          out="${RUNNER_TEMP}/helper"
+          bash packages/cli/src/enclave-helper/app/build.sh "$VERSION" "$BUNDLE_ID" "$out" "$TEAM_ID" "$PROFILE"
+          app="${out}/candle-enclave.app"
+          [ -f "${app}/Contents/embedded.provisionprofile" ] || { echo "build.sh did not embed the provisioning profile"; exit 1; }
+          /usr/bin/codesign --force --options runtime --timestamp --entitlements "${out}/candle-enclave.entitlements" --sign "$IDENTITY" "$app"
+          # The same requirement the CLI pins at every unlock (packages/cli/src/vault/enclave.ts):
+          # Apple's anchor, a Developer ID leaf, this team, this bundle id.
+          requirement="=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = \"${TEAM_ID}\" and identifier \"${BUNDLE_ID}\""
+          /usr/bin/codesign --verify --strict --deep --verbose=2 -R "$requirement" "$app"
+          /usr/bin/codesign -d --entitlements - "$app"
+          # The signed entitlements must carry the associated domain the passkey factor needs (PR G).
+          /usr/bin/codesign -d --entitlements - "$app" 2>&1 | grep -q 'webcredentials:cli.candle.tv' \
+            || { echo "the signed helper's entitlements do not carry webcredentials:cli.candle.tv"; exit 1; }
+          rm -f "$PROFILE"
+          printf '%s' "$APPLE_NOTARY_KEY_P8_BASE64" | base64 --decode > "${RUNNER_TEMP}/notary.p8"
+          ditto -c -k --keepParent "$app" "${RUNNER_TEMP}/notarize.zip"
+          xcrun notarytool submit "${RUNNER_TEMP}/notarize.zip" --key "${RUNNER_TEMP}/notary.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --timeout 45m --output-format json > "${RUNNER_TEMP}/notary.json"
+          cat "${RUNNER_TEMP}/notary.json"
+          status="$(jq -r '.status' "${RUNNER_TEMP}/notary.json")"
+          if [ "$status" != "Accepted" ]; then
+            submission="$(jq -r '.id' "${RUNNER_TEMP}/notary.json")"
+            xcrun notarytool log "$submission" --key "${RUNNER_TEMP}/notary.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" || true
+            rm -f "${RUNNER_TEMP}/notary.p8"
+            echo "notarization was not accepted: ${status}"; exit 1
+          fi
+          rm -f "${RUNNER_TEMP}/notary.p8"
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          "${app}/Contents/MacOS/candle-enclave" --version
+          mkdir -p macos-helper
+          asset="candle-enclave-${VERSION}.app.zip"
+          ditto -c -k --keepParent "$app" "macos-helper/${asset}"
+          sha="$(shasum -a 256 "macos-helper/${asset}" | awk '{print $1}')"
+          jq -n --arg tag "${GITHUB_REF_NAME}" --arg commit "${GITHUB_SHA}" --arg asset "$asset" --arg sha "$sha" --arg team "$TEAM_ID" --arg bundle "$BUNDLE_ID" \
+            '{status: "included", policy: "signed", tag: $tag, commit: $commit, asset: $asset, sha256: $sha, teamId: $team, bundleId: $bundle, associatedDomains: ["webcredentials:cli.candle.tv"], provisioningProfile: true}' > macos-helper/macos-helper-state.json
+          cat macos-helper/macos-helper-state.json
+      - name: Remove the temporary keychain
+        if: always() && steps.cert.outputs.keychain != ''
+        run: security delete-keychain "${{ steps.cert.outputs.keychain }}" || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-helper
+          path: macos-helper/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [home, macos-helper]
+    # One list for the compile loop, the pack loop, and the expected-asset list. Adding a target
+    # means editing this value (and PLATFORMS in scripts/release/write-manifest.mjs); the three
+    # loops read it rather than restating the names.
+    env:
+      RELEASE_TARGETS: darwin-arm64 darwin-x64 linux-x64 linux-arm64
+    # Every third-party action here is pinned to a full commit SHA, with its tag in a trailing
+    # comment. A tag is a moving pointer its owner can repoint at any commit, and this job holds
+    # `id-token: write` and signs the binaries users install: what runs in it has to be a fixed
+    # set of bytes. Bump one by resolving the new tag's commit and rewriting the SHA and the
+    # comment together.
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # One file owns the Bun pin: packages/cli/.bun-version, which the sync carries into this
+          # mirror and src/release-pins.test.ts holds equal to the monorepo's own packageManager
+          # field. The in-process verifier carries a shim over Bun's crypto (see
+          # packages/cli/src/bun-crypto-shim.ts), so a runtime change has to be a deliberate bump
+          # of that one file rather than a drift between two copies of the number.
+          bun-version-file: packages/cli/.bun-version
+      - name: Resolve the version and check it against the tag
+        id: version
+        run: |
+          version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' packages/cli/package.json | head -1)"
+          [ -n "$version" ] || { echo "no version in packages/cli/package.json"; exit 1; }
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "cli-v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match package version ${version}"; exit 1
+          fi
+      # --frozen-lockfile, at the REPOSITORY ROOT rather than in packages/cli: this repo is the
+      # exported mirror and it carries a root bun.lock covering the whole workspace, which the
+      # sync refreshes (it runs `bun install` at the mirror root and commits the result) in the
+      # very commit this tag lands on. A signed binary compiled from a dependency graph resolved
+      # fresh at build time is the threat this feature exists to close, so the install fails
+      # closed on a stale lock instead of silently resolving something else. The exact versions in
+      # packages/cli/package.json (pinned by src/release-pins.test.ts) are the second half of
+      # that: they are what the lock is a lock ON.
+      - name: Install (frozen, at the mirror root)
+        run: bun install --frozen-lockfile
+      # Between the install and the tests, and not after them. It needs @sigstore/tuf, so it
+      # cannot run before the install; and the tests have to run against the trust root the
+      # binaries below will embed, so it cannot run after them.
+      - name: Refresh the embedded Sigstore trusted root
+        working-directory: packages/cli
+        run: bun scripts/refresh-sigstore-root.mjs
+      - name: Test
+        working-directory: packages/cli
+        run: bun test
+      - name: Build the binaries
+        working-directory: packages/cli
+        run: |
+          # Tests just ran in this working directory. Wipe so a compile-in-test leftover cannot
+          # sit under `candle-*` when the pack step globs the directory. Recreate before the
+          # compile; the macos-helper artifact is downloaded into this directory AFTER this step.
+          rm -rf dist-bin && mkdir -p dist-bin
+          # shellcheck disable=SC2086
+          for target in ${RELEASE_TARGETS}; do
+            bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --minify --target="bun-${target}" src/index.ts --outfile "dist-bin/candle-${target}"
+            # The security key helper (Ember Phase 2 PR E): the same compile, the same target, the
+            # same job. It loads libfido2 at run time through bun:ffi, so it needs no cross toolchain.
+            bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --minify --target="bun-${target}" src/fido2-helper/main.ts --outfile "dist-bin/candle-fido2-${target}"
+          done
+          ls -la dist-bin
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-helper
+          path: packages/cli/dist-bin/macos-helper
+      # The macos-helper job's result, checked against the same checked-in policy this checkout
+      # carries. An omission is accepted only under "omit" with no archive; an inclusion only under
+      # "signed" with exactly the declared archive and checksum, for this commit and this ref.
+      # Anything else stops the release before a tarball is packed.
+      - name: Validate the macOS helper result against the release policy
+        id: helper
+        working-directory: packages/cli
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          policy="$(jq -r '.macosHelper.release' release-policy.json)"
+          state="dist-bin/macos-helper/macos-helper-state.json"
+          [ -f "$state" ] || { echo "no macos-helper-state.json from the macos-helper job"; exit 1; }
+          status="$(jq -r '.status' "$state")"
+          [ "$(jq -r '.policy' "$state")" = "$policy" ] || { echo "the macos-helper job read policy $(jq -r '.policy' "$state") but this checkout says ${policy}"; exit 1; }
+          [ "$(jq -r '.commit' "$state")" = "${GITHUB_SHA}" ] || { echo "the helper state is for another commit"; exit 1; }
+          [ "$(jq -r '.tag' "$state")" = "${GITHUB_REF_NAME}" ] || { echo "the helper state is for another ref"; exit 1; }
+          archives="$(find dist-bin/macos-helper -name '*.app.zip' | wc -l | tr -d ' ')"
+          case "$status" in
+            omitted)
+              [ "$policy" = "omit" ] || { echo "the helper was omitted under policy ${policy}"; exit 1; }
+              [ "$archives" = "0" ] || { echo "an omitted helper build produced an archive"; exit 1; }
+              echo "included=false" >> "$GITHUB_OUTPUT"
+              echo "this release ships without the Secure Enclave helper (release-policy.json: omit)"
+              ;;
+            included)
+              [ "$policy" = "signed" ] || { echo "the helper was included under policy ${policy}"; exit 1; }
+              asset="$(jq -r '.asset' "$state")"
+              [ "$asset" = "candle-enclave-${VERSION}.app.zip" ] || { echo "unexpected helper asset name ${asset}"; exit 1; }
+              [ "$archives" = "1" ] && [ -f "dist-bin/macos-helper/${asset}" ] || { echo "expected exactly the helper archive ${asset}"; exit 1; }
+              actual="$(sha256sum "dist-bin/macos-helper/${asset}" | awk '{print $1}')"
+              [ "$actual" = "$(jq -r '.sha256' "$state")" ] || { echo "the helper archive's checksum does not match its state"; exit 1; }
+              [ "$(jq -r '.teamId' "$state")" = "$(jq -r '.macosHelper.teamId' release-policy.json)" ] || { echo "the helper was signed for another team than the policy names"; exit 1; }
+              mv "dist-bin/macos-helper/${asset}" "dist-bin/${asset}"
+              { echo "included=true"; echo "asset=${asset}"; } >> "$GITHUB_OUTPUT"
+              echo "this release ships the signed Secure Enclave helper ${asset}"
+              ;;
+            *) echo "unknown helper status ${status}"; exit 1 ;;
+          esac
+          rm -rf dist-bin/macos-helper
+      - name: Pack tarballs and write checksums and the manifest
+        working-directory: packages/cli
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          HELPER_ASSET: ${{ steps.helper.outputs.asset }}
+        run: |
+          cd dist-bin
+          # shellcheck disable=SC2086
+          for target in ${RELEASE_TARGETS}; do
+            mkdir -p "pack/${target}" && cp "candle-${target}" "pack/${target}/candle" && cp "candle-fido2-${target}" "pack/${target}/candle-fido2" && cp ../LICENSE "pack/${target}/LICENSE"
+            contents="candle candle-fido2 LICENSE"
+            # The signed Secure Enclave helper rides in the darwin tarballs when the policy included it.
+            case "$target" in
+              darwin-*)
+                if [ -n "${HELPER_ASSET}" ]; then
+                  unzip -q "${HELPER_ASSET}" -d "pack/${target}"
+                  contents="${contents} candle-enclave.app"
+                fi
+                ;;
+            esac
+            # shellcheck disable=SC2086
+            tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -C "pack/${target}" -czf "candle-${VERSION}-${target}.tar.gz" ${contents}
+          done
+          rm -rf pack
+          cp ../install.sh install.sh
+          # Only this release's own artifacts may match `candle-*`. The checksum line below and the
+          # upload step both take the whole glob, so any other file sitting in this directory
+          # becomes a published asset. `bun test` runs before the build in this same job, and T49's
+          # vault parity test used to compile its 96 MB binary here, under a name beginning with
+          # the same four letters: it shipped in 0.10.0 and 0.11.0, listed in SHA256SUMS, named by
+          # nothing else. (Spelling that name in backticks here would trip check-agentic-skills,
+          # which reads a code span starting with those letters as an invented command.) The
+          # diff is two-sided on purpose, so a MISSING expected asset fails just as loudly. Names
+          # come from RELEASE_TARGETS plus the helper file the validate step actually moved
+          # (HELPER_ASSET is empty under omit, the archive name under signed).
+          {
+            # shellcheck disable=SC2086
+            for target in ${RELEASE_TARGETS}; do
+              printf '%s\n%s\n%s\n' "candle-${target}" "candle-fido2-${target}" "candle-${VERSION}-${target}.tar.gz"
+            done
+            if [ -n "${HELPER_ASSET}" ]; then printf '%s\n' "${HELPER_ASSET}"; fi
+          } | sort > ../expected-assets.txt
+          for asset in candle-*; do printf '%s\n' "$asset"; done | sort > ../actual-assets.txt
+          if ! diff -u ../expected-assets.txt ../actual-assets.txt; then
+            echo "dist-bin does not hold exactly the assets this release publishes (see the diff above)"
+            exit 1
+          fi
+          rm -f ../expected-assets.txt ../actual-assets.txt
+          sha256sum candle-* install.sh > SHA256SUMS
+          cat SHA256SUMS
+          cd ..
+          # shellcheck disable=SC2086
+          bun ../../scripts/release/write-manifest.mjs "${VERSION}" dist-bin ${HELPER_ASSET:+--macos-helper "${HELPER_ASSET}"}
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          # The signing tool is pinned like everything else in this job: every release so far has
+          # run with cosign v2.5.2, and --new-bundle-format below needs 2.2 or newer.
+          cosign-release: "v2.5.2"
+      - name: Sign the binaries and SHA256SUMS (keyless)
+        working-directory: packages/cli/dist-bin
+        env:
+          HELPER_ASSET: ${{ steps.helper.outputs.asset }}
+        run: |
+          # --new-bundle-format, and it is not optional. Without it cosign writes its own LEGACY
+          # bundle ({"base64Signature","cert","rekorBundle"}) rather than the Sigstore protobuf
+          # bundle, and while cosign and gh read both, the in-process verifier every candle
+          # carries (packages/cli/src/release-verify.ts, via @sigstore/bundle) reads only the
+          # protobuf one and refuses the legacy shape outright. 0.6.0 shipped signed that way.
+          # HELPER_ASSET is empty under "omit" and the archive's name under "signed": the Sigstore
+          # signature over the helper sits beside Apple's, so provenance and identity are both present.
+          for f in candle-darwin-arm64 candle-darwin-x64 candle-linux-x64 candle-linux-arm64 candle-fido2-darwin-arm64 candle-fido2-darwin-x64 candle-fido2-linux-x64 candle-fido2-linux-arm64 install.sh SHA256SUMS ${HELPER_ASSET}; do
+            cosign sign-blob --yes --new-bundle-format --bundle "${f}.sigstore.json" "${f}"
+          done
+      - name: Verify what was just signed
+        working-directory: packages/cli/dist-bin
+        env:
+          HELPER_ASSET: ${{ steps.helper.outputs.asset }}
+        run: |
+          # The exact identity this run signed under: this repository's release.yaml at this ref.
+          # A tag build's ends @refs/tags/cli-v<version>; a workflow_dispatch (rehearsal) run signs
+          # under the branch ref, so its identity ends @refs/heads/<branch>. Anchored at both ends
+          # and escaped, so it matches this one identity and nothing that merely contains it.
+          repo_re="${GITHUB_REPOSITORY//./\\.}"
+          ref_re="${GITHUB_REF//./\\.}"
+          id_re="^https://github\.com/${repo_re}/\.github/workflows/release\.yaml@${ref_re}\$"
+          # --new-bundle-format here means "expect a Sigstore protobuf bundle": cosign reads the
+          # legacy shape happily without it, so leaving it off is what let 0.6.0's mis-signed
+          # bundles pass their own self-verify.
+          for f in candle-darwin-arm64 candle-darwin-x64 candle-linux-x64 candle-linux-arm64 candle-fido2-darwin-arm64 candle-fido2-darwin-x64 candle-fido2-linux-x64 candle-fido2-linux-arm64 install.sh SHA256SUMS ${HELPER_ASSET}; do
+            cosign verify-blob --new-bundle-format --bundle "${f}.sigstore.json" --certificate-identity-regexp "${id_re}" --certificate-oidc-issuer "${ISSUER}" "${f}"
+          done
+      # The guard that would have caught 0.6.0. cosign verifying its own output only proves cosign
+      # agrees with cosign; this runs the SAME verifier the installed CLI uses (@sigstore/bundle,
+      # which refuses a legacy bundle) over the assets about to be published, so a release whose
+      # bundles `candle verify` and `candle update` would reject cannot be cut.
+      - name: Verify with the freshly built binary
+        working-directory: packages/cli
+        env:
+          HELPER_ASSET: ${{ steps.helper.outputs.asset }}
+        run: |
+          # The ubuntu runner is x64, so candle-linux-x64 is the host binary and can verify the
+          # rest. GITHUB_REF is refs/tags/cli-v<version> on a tag push, which is exactly the
+          # identity releaseIdentityUri() builds; a workflow_dispatch rehearsal signs under
+          # refs/heads/<branch> and this same expression follows it.
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@${GITHUB_REF}"
+          for f in candle-linux-x64 candle-fido2-linux-x64 install.sh ${HELPER_ASSET}; do
+            ./dist-bin/candle-linux-x64 verify "dist-bin/${f}" --bundle "dist-bin/${f}.sigstore.json" --identity "${identity}" --issuer "${ISSUER}"
+          done
+          # The host helper answers its one argv: the compiled helper starts, and its version and
+          # protocol are the ones this CLI was built with. It reads no terminal and needs no key.
+          ./dist-bin/candle-fido2-linux-x64 --version
+      # The verification negative cases (spec section 11, "Compatibility checks required before
+      # switch"), run with REAL signatures from this run rather than fixtures: the same verifier
+      # every candle carries must refuse each of these. Every case is expected to FAIL; a case that
+      # verifies fails the run. Run on every event, so a rehearsal in either home proves them
+      # against that home's real signing identity before any release is cut.
+      - name: Refuse what must not verify
+        working-directory: packages/cli
+        env:
+          # The other release home, from the home job's read of packages/cli/release-homes.json.
+          OTHER_HOME: ${{ needs.home.outputs.other }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin=./dist-bin/candle-linux-x64
+          result="${RUNNER_TEMP}/candle-verification.json"
+          this_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@${GITHUB_REF}"
+          accept() {
+            "$bin" verify "$@" --issuer "${ISSUER}" --json > "$result"
+            jq -e --arg identity "$this_identity" '.ok == true and .identity == $identity' "$result" >/dev/null || {
+              cat "$result"; echo "::error::positive verification control failed"; exit 1;
+            }
+          }
+          refuse() {
+            local label="$1" reason="$2" status=0; shift 2
+            "$bin" verify "$@" --issuer "${ISSUER}" --json > "$result" || status=$?
+            if [ "$status" -ne 1 ] || ! jq -e --arg reason "$reason" \
+              '.ok == false and .code == "SIGNATURE_INVALID" and (.message | contains($reason))' "$result" >/dev/null; then
+              cat "$result"
+              echo "::error::expected a specific verification refusal (exit ${status}): ${label}"; exit 1
+            fi
+            echo "refused, as it must be: ${label}"
+          }
+          f=dist-bin/candle-linux-x64
+          # The same binary, bundle and issuer must first verify under their real identity.
+          # A crashing verifier or an unreadable input cannot turn the whole matrix green.
+          accept "$f" --bundle "$f.sigstore.json" --identity "$this_identity"
+          identity_mismatch="certificate identity error - expected "
+          digest_mismatch="the bundle's message digest does not match the file"
+          refuse "the other home's identity (${OTHER_HOME})" "$identity_mismatch" "$f" --bundle "$f.sigstore.json" \
+            --identity "https://github.com/${OTHER_HOME}/.github/workflows/release.yaml@${GITHUB_REF}"
+          refuse "another workflow in this repository" "$identity_mismatch" "$f" --bundle "$f.sigstore.json" \
+            --identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yaml@${GITHUB_REF}"
+          refuse "another tag (cli-v0.0.1)" "$identity_mismatch" "$f" --bundle "$f.sigstore.json" \
+            --identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@refs/tags/cli-v0.0.1"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            # A rehearsal's signature names a branch: it can never pass as this version's release.
+            refuse "a rehearsal signature presented as cli-v${VERSION}" "$identity_mismatch" "$f" --bundle "$f.sigstore.json" \
+              --identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@refs/tags/cli-v${VERSION}"
+          fi
+          refuse "a substituted platform asset (linux-arm64 bytes, linux-x64 bundle)" "$digest_mismatch" dist-bin/candle-linux-arm64 \
+            --bundle "$f.sigstore.json" --identity "$this_identity"
+          refuse "the helper's bytes under the binary's bundle" "$digest_mismatch" dist-bin/candle-fido2-linux-x64 \
+            --bundle "$f.sigstore.json" --identity "$this_identity"
+          tampered="${RUNNER_TEMP}/candle-linux-x64.tampered"
+          cp "$f" "$tampered" && printf '\0' >> "$tampered"
+          refuse "a file whose checksum no longer matches its signature" "$digest_mismatch" "$tampered" \
+            --bundle "$f.sigstore.json" --identity "$this_identity"
+          rm -f "$tampered"
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            packages/cli/dist-bin/candle-darwin-arm64
+            packages/cli/dist-bin/candle-darwin-x64
+            packages/cli/dist-bin/candle-linux-x64
+            packages/cli/dist-bin/candle-linux-arm64
+            packages/cli/dist-bin/candle-fido2-darwin-arm64
+            packages/cli/dist-bin/candle-fido2-darwin-x64
+            packages/cli/dist-bin/candle-fido2-linux-x64
+            packages/cli/dist-bin/candle-fido2-linux-arm64
+            packages/cli/dist-bin/candle-*.tar.gz
+            packages/cli/dist-bin/install.sh
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        if: steps.helper.outputs.included == 'true'
+        with:
+          subject-path: packages/cli/dist-bin/candle-enclave-*.app.zip
+      - name: Rehearsal complete (nothing published)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "rehearsal complete: built, signed and verified; nothing published"
+      - name: Create the GitHub Release
+        if: github.event_name == 'push'
+        working-directory: packages/cli/dist-bin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="cli-v${VERSION}"
+          # R1.6/R2.9: keep this compatibility note in the first release carrying A1.
+          notes="Formats and compatibility: https://docs.candle.tv/developers/cli-release-notes
+
+          A project .env no longer configures the CLI. Compiled binaries ignore .env and bunfig.toml; export CANDLE_* variables or store settings in a profile.
+
+          Doctor now detects owner/bot roles. API key valid (launch:write) is renamed API key valid; in bot role, Launch wallet delegated is renamed Embedded wallet. JSON rows have stable ids, and role and provenance fields are additive. A paused profile fails the Trade path check."
+          # The compatibility boundary, in the two releases that carry it (spec section 9).
+          bridge="$(jq -r '.bridgeVersion' ../release-homes.json)"
+          legacy="$(jq -r '.legacy' ../release-homes.json)"
+          current="$(jq -r '.current' ../release-homes.json)"
+          if [ "$VERSION" = "$bridge" ]; then
+            notes="${notes}
+
+          Release home: this is the final CLI release published from ${legacy}. Later releases are published from https://github.com/${current}; run candle update once more to reach them. Releases through ${bridge} stay here, and candle update --to still finds them."
+          elif [ "${GITHUB_REPOSITORY}" = "$current" ]; then
+            notes="${notes}
+
+          Release home: published from ${current}, signed by its release workflow. Releases through ${bridge} remain in https://github.com/${legacy}."
+          fi
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "Candle CLI ${VERSION}" --notes "$notes" --generate-notes
+          gh release upload "$tag" --clobber candle-* install.sh install.sh.sigstore.json SHA256SUMS SHA256SUMS.sigstore.json latest.json
+      - name: Check the Homebrew tap token
+        if: github.event_name == 'push'
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set" >&2
+            exit 1
+          fi
+      - name: Checkout homebrew-tap
+        if: github.event_name == 'push'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: candledottv/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap-checkout
+      - name: Bump the Homebrew tap
+        if: github.event_name == 'push'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          bash scripts/release/bump-tap.sh "${VERSION}" packages/cli/dist-bin tap-checkout "${GITHUB_REPOSITORY}"

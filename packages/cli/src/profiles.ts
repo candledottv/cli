@@ -1,0 +1,358 @@
+/**
+ * profiles: one device, several accounts (docs/superpowers/specs/2026-08-19-cli-profiles-design.md).
+ *
+ * A profile is the non-secret half of an identity, stored in config.json under `profiles[name]`;
+ * its device token and API key live in the SecretStore under the namespaced refs below. This
+ * module is pure: resolution, naming, migration of the config shape, and the identity line. The
+ * IO around it (reading config, copying secrets on migration) lives in index.ts and the commands.
+ */
+
+import type { CliConfig, ProfileConfig } from "./config"
+// Type-only: deps.ts imports a value from this module, so a value import back here would form a
+// runtime cycle. A type import is erased at compile time and carries no such risk.
+import type { CommandContext } from "./deps"
+import { bold, fullIds, type StyleDeps, symbols, type TerminalStyle, terminalStyle } from "./presentation"
+import { shortId } from "./render"
+
+export type { ProfileConfig }
+
+/** `profile:<name>:device_token` / `profile:<name>:api_key`, mirroring walletSignerRef's per-wallet
+ * namespacing so the store needs no new concept. */
+export function profileSecretRef(name: string, kind: "deviceToken" | "apiKey"): string {
+  return `profile:${name}:${kind === "deviceToken" ? "device_token" : "api_key"}`
+}
+
+/** A name that is safe as a keychain account attribute, a flag value and a JSON key: no
+ * whitespace, quotes or newlines, at most 32 characters, starting with a letter or digit. */
+export function isValidProfileName(name: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(name)
+}
+
+export type ProfileResolution = { ok: true; name: string | undefined } | { ok: false; message: string }
+
+function listForHumans(profiles: Record<string, ProfileConfig>, active: string | undefined): string {
+  return Object.entries(profiles)
+    .map(
+      ([name, p]) =>
+        `  ${name}${name === active ? " (active)" : ""}${p.account ? `  ${p.account}` : ""}${p.apiUrl ? `  ${p.apiUrl}` : ""}`,
+    )
+    .join("\n")
+}
+
+/**
+ * Highest wins: the --profile flag, CANDLE_PROFILE, activeProfile, the sole profile. With
+ * several profiles and none selected this REFUSES: guessing is how a wallet import landed on the
+ * wrong account on 2026-08-19, and a two-line refusal cannot mislead. No profiles at all resolves
+ * to `undefined`, the pre-profile mode, so a fresh install and an env-only invocation behave as
+ * they always did.
+ */
+export function resolveProfileName(
+  config: CliConfig,
+  opts: { flag?: string; env: Record<string, string | undefined> },
+): ProfileResolution {
+  const profiles = config.profiles ?? {}
+  const names = Object.keys(profiles)
+  const requested = opts.flag?.trim() || opts.env.CANDLE_PROFILE?.trim() || undefined
+  if (requested !== undefined) {
+    if (!isValidProfileName(requested)) return { ok: false, message: `Invalid profile name: ${requested}` }
+    // Object.hasOwn, not `in`: `in` walks the prototype chain, so "constructor", "toString" and
+    // friends resolve as profile names against an ordinary object literal.
+    if (!Object.hasOwn(profiles, requested)) {
+      return {
+        ok: false,
+        message: `No profile named "${requested}".${names.length ? `\nProfiles on this machine:\n${listForHumans(profiles, config.activeProfile)}` : " Run: candle auth login --profile " + requested}`,
+      }
+    }
+    return { ok: true, name: requested }
+  }
+  if (config.activeProfile && Object.hasOwn(profiles, config.activeProfile))
+    return { ok: true, name: config.activeProfile }
+  if (names.length === 0) return { ok: true, name: undefined }
+  if (names.length === 1) return { ok: true, name: names[0] }
+  return {
+    ok: false,
+    message: `Several profiles exist and none is selected. Pick one with --profile <name> or CANDLE_PROFILE=<name>:\n${listForHumans(profiles, config.activeProfile)}`,
+  }
+}
+
+/**
+ * `auth login`'s own resolution, and the only lenient one about EXISTENCE. Same order as
+ * `resolveProfileName` -- the flag, CANDLE_PROFILE, activeProfile, the sole profile -- with one
+ * deliberate difference: a named profile need NOT already exist (naming one is how login creates
+ * it), so this never refuses for that reason the way `resolveProfileName` does. `undefined` means
+ * "no profile is in play", which login answers by deriving a name from the host; it is not an
+ * error the way it would be for a command acting AS an identity.
+ *
+ * An invalid name IS refused (`ProfileResolution`'s `ok: false`), the same shape every other
+ * caller already returns. Dispatch (index.ts) treats that as a usage error for `auth login`
+ * specifically, exit 2. A `--profile` this shape-invalid is also caught by `authLogin` itself,
+ * which names the flag in its own message; what this function closes is `CANDLE_PROFILE`, which
+ * used to be silently skipped here and fall through to the active profile, so an operator with a
+ * mistyped env var logged in as, and overwrote the credentials of, a profile they never named.
+ */
+export function resolveProfileNameForLogin(
+  config: CliConfig,
+  opts: { flag?: string; env: Record<string, string | undefined> },
+): ProfileResolution {
+  const profiles = config.profiles ?? {}
+  const requested = opts.flag?.trim() || opts.env.CANDLE_PROFILE?.trim() || undefined
+  if (requested !== undefined) {
+    if (!isValidProfileName(requested)) return { ok: false, message: `Invalid profile name: ${requested}` }
+    return { ok: true, name: requested }
+  }
+  if (config.activeProfile && Object.hasOwn(profiles, config.activeProfile))
+    return { ok: true, name: config.activeProfile }
+  const names = Object.keys(profiles)
+  return { ok: true, name: names.length === 1 ? names[0] : undefined }
+}
+
+export const PRE_PROFILE_FIELDS = [
+  "apiUrl",
+  "keyPrefix",
+  "deviceTokenPrefix",
+  "scopes",
+  "label",
+  "portalOrigin",
+] as const
+
+/**
+ * The config half of migration: a pre-profile install becomes profile "default", active. The old
+ * top-level fields are LEFT IN PLACE so a rollback to the previous CLI keeps working. The secret
+ * copy (`device_token` -> `profile:default:device_token`, same for the key) is index.ts's job
+ * because it needs the store. Idempotent: a config that already has `profiles` is returned as is.
+ */
+export function migratedConfig(config: CliConfig): { config: CliConfig; migrated: boolean } {
+  if (config.profiles !== undefined) return { config, migrated: false }
+  const legacy: ProfileConfig = {}
+  for (const field of PRE_PROFILE_FIELDS) {
+    const value = config[field]
+    if (value !== undefined) (legacy as Record<string, unknown>)[field] = value
+  }
+  if (Object.keys(legacy).length === 0) return { config, migrated: false }
+  return { config: { ...config, profiles: { default: legacy }, activeProfile: "default" }, migrated: true }
+}
+
+/**
+ * The non-secret fields a command should read for THIS invocation: the profile's own when one is
+ * in play (an unknown name yields nothing rather than borrowing another identity's), else the
+ * pre-profile top-level ones. Defined once because the four places that hand-rolled the ternary
+ * each got a piece of it wrong: `auth status` printed "not set" for both prefixes on every
+ * login-created profile, `keys list` reported this device's own key as another machine's, and
+ * `doctor` dropped the scopes from its agent-key row. A single reader is also what keeps the
+ * legacy shape read-only in exactly one place when Phase 2 drops it.
+ */
+export function effectiveProfileFields(config: CliConfig, profile: string | undefined): ProfileConfig {
+  if (profile !== undefined) return config.profiles?.[profile] ?? {}
+  const legacy: ProfileConfig = {}
+  for (const field of PRE_PROFILE_FIELDS) {
+    const value = config[field]
+    if (value !== undefined) (legacy as Record<string, unknown>)[field] = value
+  }
+  return legacy
+}
+
+/** "staging" or "production" for Candle's own hosts, else the hostname with dots as dashes,
+ * run through `isValidProfileName` (a hostname may legally start with a character a profile name
+ * may not, and such an entry could never be selected with `--profile` again) and de-duplicated
+ * with a numeric suffix against the profiles that already exist. */
+export function defaultProfileNameFor(apiUrl: string, existing: Record<string, ProfileConfig> | undefined): string {
+  let host = "profile"
+  try {
+    host = new URL(apiUrl).hostname
+  } catch {
+    // keep the fallback
+  }
+  let base: string
+  const environment = candleEnvironment(apiUrl)
+  if (environment !== undefined) base = environment
+  else
+    base =
+      host
+        .replace(/[^A-Za-z0-9._-]/g, "-")
+        .replace(/\./g, "-")
+        .slice(0, 28) || "profile"
+  if (!isValidProfileName(base)) base = "profile"
+  const taken = new Set(Object.keys(existing ?? {}))
+  if (!taken.has(base)) return base
+  for (let n = 2; ; n++) {
+    const candidate = `${base}-${n}`
+    if (!taken.has(candidate)) return candidate
+  }
+}
+
+/**
+ * Which Candle deployment an API URL names (BE-296, D4): `staging` for `staging.api.candle.tv`,
+ * `production` for `api.candle.tv` and `api.alpha.candle.tv`, `undefined` for any other host or an
+ * unparseable URL. `defaultProfileNameFor` calls this so the profile name a login derives and the
+ * environment the promote ceremony prints beside the API URL can never disagree.
+ */
+export function candleEnvironment(apiUrl: string): "production" | "staging" | undefined {
+  let host: string
+  try {
+    host = new URL(apiUrl).hostname
+  } catch {
+    return undefined
+  }
+  if (host === "staging.api.candle.tv") return "staging"
+  if (host === "api.candle.tv" || host === "api.alpha.candle.tv") return "production"
+  return undefined
+}
+
+const API_KEY_PREFIXES = ["cndl_live_", "cndl_test_"] as const
+/** 32 random bytes, base64url, unpadded: the server's `RANDOM_LEN` (`apps/api/src/lib/agent-keys.ts`). */
+const API_KEY_RANDOM_LENGTH = 43
+
+/**
+ * The public prefix of an API key, by the server's own rule (`parseAgentKey`): `cndl_live_` or
+ * `cndl_test_`, a 43-character random part, and the prefix is its first 8 characters. That is the
+ * value `candle keys list` prints in its `Prefix` column and what `GET /keys` calls `keyPrefix`.
+ * `undefined` for anything else, so a caller can never print a slice of a secret it did not
+ * recognise as a key (BE-296, D4).
+ */
+export function apiKeyPrefix(key: string): string | undefined {
+  const trimmed = key.trim()
+  for (const prefix of API_KEY_PREFIXES) {
+    if (!trimmed.startsWith(prefix)) continue
+    const random = trimmed.slice(prefix.length)
+    if (random.length !== API_KEY_RANDOM_LENGTH) return undefined
+    return random.slice(0, 8)
+  }
+  return undefined
+}
+
+/** The credential env vars that BEAT the store (see deps.ts's resolvers), named where they are
+ * acting. Non-blank only: an exported-but-empty variable overrides nothing. */
+export function credentialEnvOverrides(env: Record<string, string | undefined>): string[] {
+  return ["CANDLE_API_KEY", "CANDLE_DEVICE_TOKEN"].filter((name) => env[name]?.trim())
+}
+
+/**
+ * The line every authenticated command prints first. Names what it does not know rather than
+ * omitting it, because an absent field reads as "fine" and this line exists to be noticed.
+ *
+ * `overrides`, when non-empty, REPLACES the account: the cached name describes the profile's own
+ * stored key, and an env override is a different credential for a possibly different account.
+ * Printing the cached name beside a credential nothing checked asserts exactly the identity this
+ * line exists to stop being assumed. For the same reason the override branch is username-free: the
+ * username belongs to the profile's own account, not to whatever the env var supplied.
+ *
+ * `username` is the account's Candle handle (optional). When it and an account are both known the
+ * line reads `Account <username> (<address>)`; with no username it is the address alone.
+ *
+ * The compact form (CLI legibility audit 4.2): `Profile prod · Account Quant- (FfU8…8pPD) ·
+ * api.alpha.candle.tv`. The labels and normal weight stay, as the profiles spec's "Identity on
+ * screen" asks, and the profile name is bold when `style` allows color. Only two things shrink:
+ * the address (`shortId`; `full`, the global `--full`, prints it whole) and an `https://` scheme.
+ * Any other scheme is kept, so a plain `http://` API stays visible.
+ *
+ * The separator is the kit's note mark (`symbols(style).note`): `·` on a styled stream, `-` when
+ * that stream is plain (`--plain`, a pipe, CI, `TERM=dumb`). A caller that omits `style` gets the
+ * styled mark, which is the form the audit shows.
+ */
+export function identityLine(
+  profile: string | undefined,
+  account: string | undefined,
+  apiUrl: string,
+  overrides?: string[],
+  username?: string,
+  options: { style?: TerminalStyle; full?: boolean } = {},
+): string {
+  const address = account === undefined ? undefined : shortId(account, options.full)
+  const shown = overrides?.length
+    ? `unknown (${overrides.join(", ")} override)`
+    : username && address
+      ? `${username} (${address})`
+      : (address ?? "unknown")
+  const name = profile ?? "none"
+  const host = apiUrl.replace(/^https:\/\//i, "").replace(/\/+$/, "")
+  const sep = options.style ? symbols(options.style).note : "·"
+  return `Profile ${options.style ? bold(name, options.style) : name} ${sep} Account ${shown} ${sep} ${host}`
+}
+
+/** Every authenticated command prints this before its own output, then a blank line, human mode
+ * only; --json outputs carry `profile` and `account` fields instead. Cached account, no network:
+ * the live comparison is the Phase 2 guard. */
+export async function printIdentity(ctx: CommandContext): Promise<void> {
+  if (ctx.json) return
+  const config = await ctx.deps.readConfig()
+  const fields = effectiveProfileFields(config, ctx.profile)
+  const line = identityLine(
+    ctx.profile,
+    fields.account,
+    ctx.apiUrl,
+    credentialEnvOverrides(ctx.deps.env),
+    fields.username,
+    identityStyle(ctx.deps, "stdout"),
+  )
+  ctx.deps.stdout.write(`${line}\n\n`)
+}
+
+/** The `identityLine` options for a stream: its style (bold only where color is on) and `--full`. */
+export function identityStyle(deps: StyleDeps, stream: "stdout" | "stderr"): { style: TerminalStyle; full: boolean } {
+  return { style: terminalStyle(deps, stream), full: fullIds(deps) }
+}
+
+/** How old the cached account is, in the largest whole unit; a browsing command shows this
+ * instead of spending a network call per profile. A future stamp (clock skew) reads as now. */
+export function formatCacheAge(now: number, cachedAt: number | undefined): string {
+  if (cachedAt === undefined) return "not cached"
+  const seconds = Math.max(0, Math.floor((now - cachedAt) / 1000))
+  if (seconds < 60) return "just now"
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.floor(hours / 24)}d ago`
+}
+
+export interface ProfileRow {
+  name: string
+  active: boolean
+  account?: string
+  cachedAge: string
+  apiUrl?: string
+  keyPrefix?: string
+  /**
+   * BE-355 (D5): the host of this profile's stored Solana RPC, `null` when none is stored (the
+   * public default), and never the URL itself, which may carry a provider key. A stored value that
+   * does not parse reads `invalid (fix with profile set)`.
+   */
+  rpcHost: string | null
+}
+
+export const INVALID_RPC_HOST = "invalid (fix with profile set)"
+
+/** The host of a stored `rpcUrl`, by D5's rule; `null` for none. */
+export function rpcHostOf(rpcUrl: string | undefined): string | null {
+  if (rpcUrl === undefined || rpcUrl.trim() === "") return null
+  try {
+    return new URL(rpcUrl).host
+  } catch {
+    return INVALID_RPC_HOST
+  }
+}
+
+/**
+ * The rows `profile list` prints, sorted by name. Cached account and its age; no network.
+ *
+ * An account WITHOUT a stamp reads "age unknown", not "not cached": every profile written before
+ * `accountCachedAt` existed is in exactly that state, and "not cached" printed beside the cached
+ * account itself, contradicting the column next to it. "Not cached" is reserved for the case it
+ * actually describes, a profile that has no account recorded at all.
+ */
+export function profileTable(config: CliConfig, now: number): ProfileRow[] {
+  return Object.entries(config.profiles ?? {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, p]) => ({
+      name,
+      active: config.activeProfile === name,
+      account: p.account,
+      cachedAge:
+        p.account !== undefined && p.accountCachedAt === undefined
+          ? "age unknown"
+          : formatCacheAge(now, p.accountCachedAt),
+      apiUrl: p.apiUrl,
+      keyPrefix: p.keyPrefix,
+      rpcHost: rpcHostOf(p.rpcUrl),
+    }))
+}

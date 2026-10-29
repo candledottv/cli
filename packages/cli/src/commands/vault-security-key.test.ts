@@ -1,0 +1,1701 @@
+/**
+ * Ember Phase 2 (BE-140, CC-03, ED-11, CC-12): the security key factor, end to end through `run()`.
+ *
+ * The authenticator is scripted and everything else is real: the helper protocol (validation,
+ * selection, snapshot, feature detection), the CLI's translation and its independent UV check, the
+ * ED-4 derivation, the vault write and the re-open with the new factor. The two hardware facts no
+ * script can stand in for (that a real key's `hmac-secret` output is what it is, and that a PIN-only
+ * key satisfies user verification through the PIN protocol) are T47's, run by hand.
+ *
+ * Two shapes of fake. The in-process one answers `spawnHelper` by running the real protocol code
+ * over a scripted backend, which is fast and lets a test mutate the device set between calls; the
+ * subprocess one spawns the scripted helper over a real pipe through the real spawn seam, so the
+ * happy path is also proven against the shape the compiled helper has.
+ *
+ * T58 (CC-12's refusal matrix) is here too, because every row of it is a `run()` with the platform
+ * facts injected.
+ */
+import { describe, expect, setDefaultTimeout, test } from "bun:test"
+import { createHash } from "node:crypto"
+import { access, chmod, constants, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { sha256 } from "@noble/hashes/sha256"
+import { base58, base64 } from "@scure/base"
+import { Keypair } from "@solana/web3.js"
+import type { CommandContext, Deps } from "../deps"
+import {
+  AUTHDATA_FLAG_BE,
+  AUTHDATA_FLAG_UP,
+  AUTHDATA_FLAG_UV,
+  deviceIdFor,
+  handleLine,
+  RP_ID,
+} from "../fido2-helper/protocol"
+import { type BackendLogEntry, type HelperScript, scriptedBackend } from "../fido2-helper/test-backend"
+import { humanText } from "../human-output.test-support"
+import { realSpawnHelper, run } from "../index"
+import { releaseIdentityUri } from "../release"
+import {
+  createCapture,
+  createFakeStore,
+  createRoutedFetch,
+  createTestDeps,
+  jsonResponse,
+  TEST_HOME,
+} from "../test-support"
+import { HELPER_ENV } from "../vault/fido2"
+import { HIDRAW_MESSAGE, SHIPPING_TARGETS } from "../vault/platform"
+import { generatedPassphraseFrom, useCheapKdf } from "../vault/test-vault"
+import { CLI_VERSION } from "../version"
+import {
+  createKeystore,
+  defaultTeeKeystorePath,
+  type KeystoreEntry,
+  readKeystore,
+  serializeKeystore,
+  TEE_KEYSTORE_PURPOSE,
+  writeKeystoreFile,
+} from "../wallet-keystore"
+import { unlockInteractively } from "./vault-support"
+
+setDefaultTimeout(60_000)
+useCheapKdf()
+
+const unreachableFetch = (async () => {
+  throw new Error("no test in this file should make a network call")
+}) as unknown as typeof fetch
+
+const PIN = "482913"
+/** The scripted key's PRF output: a fixed 32 bytes, so an unlock derives the same KEK as the add. */
+const HMAC_SECRET = base64.encode(new Uint8Array(32).map((_, i) => (i * 37 + 11) & 0xff))
+const CRED = base64.encode(new Uint8Array(48).map((_, i) => (i * 7 + 3) & 0xff))
+const AAGUID = "2fc0579f811347eab116bb5a8db9202a"
+
+function authDataFor(rpId: string, flags: number): string {
+  const out = new Uint8Array(37)
+  out.set(sha256(new TextEncoder().encode(rpId)), 0)
+  out[32] = flags
+  return base64.encode(out)
+}
+
+const UV = authDataFor(RP_ID, AUTHDATA_FLAG_UP | AUTHDATA_FLAG_UV)
+
+const yubikey = (path = "/dev/hidraw3", extra: Partial<HelperScript["devices"][number]> = {}) => ({
+  path,
+  product: "YubiKey 5 NFC",
+  manufacturer: "Yubico",
+  aaguid: AAGUID,
+  extensions: ["hmac-secret", "credProtect"],
+  options: { rk: true, clientPin: true, uv: false },
+  ...extra,
+})
+
+/** A script for one PIN-only YubiKey that registers and asserts with user verification. */
+function goodScript(): HelperScript {
+  return {
+    devices: [yubikey()],
+    register: { credentialId: CRED, aaguid: AAGUID, authData: UV },
+    assert: { hmacSecret: HMAC_SECRET, authData: UV },
+  }
+}
+
+interface Harness {
+  deps: Deps
+  stdout: ReturnType<typeof createCapture>
+  stderr: ReturnType<typeof createCapture>
+  asked: string[]
+  /** Every call that reached the scripted authenticator, PIN included. */
+  calls: BackendLogEntry[]
+  dir: string
+  vaultPath: string
+  script: HelperScript
+}
+
+interface HarnessOptions {
+  secrets?: string[]
+  lines?: string[]
+  env?: Record<string, string>
+  tty?: boolean
+  script?: HelperScript
+  /** Whether a helper executable is present. Default present, at CANDLE_FIDO2_HELPER. */
+  helper?: "ready" | "absent"
+  platform?: string
+  arch?: string
+  /** Spawn the scripted helper as a real subprocess instead of answering in process. */
+  subprocess?: boolean
+}
+
+async function harness(opts: HarnessOptions = {}): Promise<Harness> {
+  const dir = opts.env?.CANDLE_CONFIG_DIR ?? (await mkdtemp(join(tmpdir(), "candle-vault-sk-")))
+  const stdout = createCapture()
+  const stderr = createCapture()
+  const asked: string[] = []
+  const calls: BackendLogEntry[] = []
+  const secrets = [...(opts.secrets ?? [])]
+  const lines = [...(opts.lines ?? [])]
+  const script = opts.script ?? goodScript()
+  const env: Record<string, string> = { CANDLE_CONFIG_DIR: dir, HOME: dir, ...(opts.env ?? {}) }
+  let spawnHelper: Deps["spawnHelper"]
+  if (opts.subprocess) {
+    const scriptPath = join(dir, `script-${Math.random().toString(36).slice(2)}.json`)
+    script.log = join(dir, "backend.log")
+    await writeFile(scriptPath, JSON.stringify(script))
+    const helper = join(dir, "candle-fido2")
+    const scripted = join(import.meta.dir, "..", "fido2-helper", "scripted-helper.ts")
+    await writeFile(helper, `#!/bin/sh\nexec bun "${scripted}" "${scriptPath}"\n`)
+    await chmod(helper, 0o755)
+    env[HELPER_ENV] = helper
+    spawnHelper = realSpawnHelper
+  } else {
+    if ((opts.helper ?? "ready") === "ready") {
+      const helper = join(dir, "candle-fido2")
+      await writeFile(helper, "#!/bin/sh\nexit 1\n")
+      await chmod(helper, 0o755)
+      env[HELPER_ENV] = helper
+    }
+    // The real protocol code over the scripted backend, in process. What `spawnHelper` returns is
+    // exactly what the compiled helper prints: one JSON line, exit 0 or 1.
+    spawnHelper = async (_path, line) => {
+      const response = handleLine(line, () => scriptedBackend(script, (entry) => calls.push(entry)))
+      return { stdout: `${JSON.stringify(response)}\n`, stderr: "", exitCode: response.ok ? 0 : 1, signal: null }
+    }
+  }
+  const deps = createTestDeps({
+    fetch: unreachableFetch,
+    stdout,
+    stderr,
+    env,
+    platform: opts.platform ?? "linux",
+    arch: opts.arch ?? "x64",
+    isTTY: { stdin: opts.tty ?? true, stdout: opts.tty ?? true, stderr: opts.tty ?? true },
+    spawnHelper,
+    promptSecret: async (text: string) => {
+      asked.push(`secret: ${text}`)
+      const next = secrets.shift()
+      if (next === undefined) throw new Error(`promptSecret asked for more than the test scripted: ${text}`)
+      return next
+    },
+    promptLine: async (text: string) => {
+      asked.push(`line: ${text}`)
+      const next = lines.shift()
+      if (next === undefined) throw new Error(`promptLine asked for more than the test scripted: ${text}`)
+      return next
+    },
+  })
+  return { deps, stdout, stderr, asked, calls, dir, vaultPath: join(dir, "vault.enc"), script }
+}
+
+async function initVault(): Promise<Harness & { passphrase: string }> {
+  // BE-245: three lines and no secret. Enter at D8's passphrase choice, Enter to acknowledge
+  // having saved the words, "no" at the recovery-phrase ceremony. The copy-back is gone.
+  const h = await harness({ lines: ["", "", "no"] })
+  const code = await run(["vault", "init", "--keystore", h.vaultPath], h.deps)
+  if (code !== 0) throw new Error(`init failed (${code}): ${h.stderr.text}${h.stdout.text}`)
+  return { ...h, passphrase: generatedPassphraseFrom(h.stdout.text) }
+}
+
+interface VaultJson {
+  generation: number
+  index: { ciphertext: string }
+  root: { ciphertext: string }
+  envelopes: Array<Record<string, unknown> & { id: string; factor: string; transport?: string }>
+  keys: unknown[]
+}
+
+async function readVault(path: string): Promise<VaultJson> {
+  return JSON.parse(await readFile(path, "utf8")) as VaultJson
+}
+
+/** Adds the scripted key to a fresh vault and returns everything a later test needs. */
+async function vaultWithKey(opts: Partial<HarnessOptions> = {}) {
+  const v = await initVault()
+  const add = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN, v.passphrase], ...opts })
+  const code = await run(
+    ["vault", "factor", "add", "security-key", "--label", "desk key", "--keystore", v.vaultPath],
+    add.deps,
+  )
+  if (code !== 0) throw new Error(`factor add security-key failed (${code}): ${add.stderr.text}${add.stdout.text}`)
+  const file = await readVault(v.vaultPath)
+  const keyEnvelope = file.envelopes.find(
+    (envelope) => envelope.factor === "passkey-prf",
+  ) as VaultJson["envelopes"][number]
+  return { ...v, add, keyId: keyEnvelope.id, keyEnvelope }
+}
+
+describe("factor add security-key: the ceremony", () => {
+  test("registers, derives once, writes only the index, and re-opens with the new key before reporting", async () => {
+    const v = await initVault()
+    const before = await readVault(v.vaultPath)
+    const add = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN, v.passphrase] })
+    const code = await run(
+      ["vault", "factor", "add", "security-key", "--label", "desk key", "--keystore", v.vaultPath],
+      add.deps,
+    )
+    expect(add.stderr.text + add.stdout.text).not.toContain("Error")
+    expect(code).toBe(0)
+
+    // The key is settled before the passphrase is asked: PIN first, then the vault.
+    expect(add.asked[0]).toContain("PIN for YubiKey 5 NFC")
+    expect(add.asked[1]).toContain("Current vault passphrase")
+    expect(add.asked).toHaveLength(2)
+
+    // Three touches: register, the assertion the KEK derives from, and the re-open proof. Every
+    // one carried the PIN, to the one named path.
+    expect(add.calls.map((call) => call.op)).toEqual(["register", "assert", "assert"])
+    expect(add.calls.every((call) => call.path === "/dev/hidraw3" && call.pin === PIN)).toBe(true)
+    expect(add.calls[0]?.rpId).toBe("cli.candle.tv")
+    expect(add.calls[1]?.credentialId).toBe(CRED)
+    // The salt the key saw is the ED-11 derivation, not the envelope's raw prfSalt.
+    const after = await readVault(v.vaultPath)
+    const envelope = after.envelopes.find((candidate) => candidate.factor === "passkey-prf") as Record<string, unknown>
+    expect(add.calls[1]?.salt).not.toBe(envelope.prfSalt)
+
+    // ED-1: the index moved under the new header, the root and the key blobs did not.
+    expect(after.envelopes).toHaveLength(2)
+    expect(after.generation).toBe(before.generation + 1)
+    expect(after.index.ciphertext).not.toBe(before.index.ciphertext)
+    expect(after.root.ciphertext).toBe(before.root.ciphertext)
+
+    // CC-01's passkey-prf row, recorded; the locator is not.
+    expect(envelope).toMatchObject({
+      factor: "passkey-prf",
+      transport: "ctap2",
+      domain: "hardware-token",
+      label: "desk key",
+      rpId: "cli.candle.tv",
+      userVerification: "required",
+      backupEligible: false,
+      backupState: false,
+      saltDerivation: "webauthn-prf",
+      aaguid: AAGUID,
+      product: "YubiKey 5 NFC",
+    })
+    expect(JSON.stringify(envelope)).not.toContain("deviceId")
+    expect(JSON.stringify(envelope)).not.toContain("hidraw")
+
+    expect(humanText(add.stdout.text)).toContain(humanText("Added security key factor"))
+    expect(humanText(add.stdout.text)).toContain(humanText("re-read and opened with the new key"))
+    expect(humanText(add.stdout.text)).toContain(humanText("One security key is not a recoverable factor"))
+    // One passphrase plus one hardware key: still one recoverable factor (CC-03).
+    expect(humanText(add.stdout.text)).toContain(humanText("1 recoverable factor(s)"))
+  })
+
+  test("the same ceremony over a real subprocess through the real spawn seam", async () => {
+    const v = await initVault()
+    const add = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN, v.passphrase], subprocess: true })
+    const code = await run(["vault", "factor", "add", "security-key", "--keystore", v.vaultPath], add.deps)
+    expect(add.stderr.text + add.stdout.text).not.toContain("Error")
+    expect(code).toBe(0)
+    const log = (await readFile(join(v.dir, "backend.log"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as BackendLogEntry)
+    expect(log.map((entry) => entry.op)).toEqual(["register", "assert", "assert"])
+    expect(log.every((entry) => entry.pin === PIN)).toBe(true)
+
+    // And the key then opens the vault, over the subprocess too.
+    const file = await readVault(v.vaultPath)
+    const keyId = file.envelopes.find((envelope) => envelope.factor === "passkey-prf")?.id as string
+    const status = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN], subprocess: true })
+    expect(await run(["vault", "status", "--unlock", "--factor", keyId, "--keystore", v.vaultPath], status.deps)).toBe(
+      0,
+    )
+    expect(status.stdout.text).toContain("Keys (0)")
+  })
+
+  test("no secret reaches stdout, stderr, --json or the file: the PIN and the PRF output are canaries", async () => {
+    const v = await initVault()
+    const add = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN, v.passphrase] })
+    add.deps.stdout = add.stdout
+    const code = await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], add.deps)
+    expect(code).toBe(0)
+    const payload = JSON.parse(add.stdout.text) as Record<string, unknown>
+    expect(payload).toMatchObject({
+      ok: true,
+      factor: "passkey-prf",
+      transport: "ctap2",
+      domain: "hardware-token",
+      verified: true,
+    })
+    const everything = add.stdout.text + add.stderr.text + (await readFile(v.vaultPath, "utf8"))
+    expect(everything).not.toContain(PIN)
+    expect(everything).not.toContain(HMAC_SECRET)
+    expect(everything).not.toContain(v.passphrase)
+    expect(add.stdout.text.trim().split("\n")).toHaveLength(1)
+  })
+
+  test("a key without hmac-secret is refused before the passphrase is asked and before it is touched", async () => {
+    const v = await initVault()
+    const add = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN, v.passphrase],
+      script: { ...goodScript(), devices: [yubikey("/dev/hidraw3", { extensions: ["credProtect"] })] },
+    })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], add.deps)).toBe(1)
+    expect(JSON.parse(add.stdout.text)).toMatchObject({ ok: false, code: "VAULT_PRF_UNSUPPORTED" })
+    expect(add.asked).toEqual([])
+    expect(add.calls).toEqual([])
+    expect((await readVault(v.vaultPath)).envelopes).toHaveLength(1)
+  })
+
+  test("a key with no PIN and no biometric is VAULT_UV_UNSUPPORTED, never the non-verified secret", async () => {
+    const v = await initVault()
+    const add = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [v.passphrase],
+      script: {
+        ...goodScript(),
+        devices: [yubikey("/dev/hidraw3", { options: { rk: true, clientPin: false, uv: false } })],
+      },
+    })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], add.deps)).toBe(1)
+    const payload = JSON.parse(add.stdout.text) as { code: string; suggestion?: string }
+    expect(payload.code).toBe("VAULT_UV_UNSUPPORTED")
+    expect(payload.suggestion).toContain("Set a PIN on this key")
+    expect(add.asked).toEqual([])
+    expect(add.calls).toEqual([])
+  })
+
+  test("a biometric key with no PIN set is driven with its built-in verification and no PIN prompt", async () => {
+    const v = await initVault()
+    const add = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [v.passphrase],
+      script: {
+        ...goodScript(),
+        devices: [
+          yubikey("/dev/hidraw3", { product: "YubiKey Bio", options: { rk: true, clientPin: false, uv: true } }),
+        ],
+      },
+    })
+    expect(await run(["vault", "factor", "add", "security-key", "--keystore", v.vaultPath], add.deps)).toBe(0)
+    expect(add.asked.filter((line) => line.includes("PIN"))).toEqual([])
+    expect(add.calls.every((call) => call.pin === null)).toBe(true)
+  })
+
+  test("with two keys attached and none named, nothing is sent to either and both are listed with --device", async () => {
+    const v = await initVault()
+    const add = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN, v.passphrase],
+      script: { ...goodScript(), devices: [yubikey("/dev/hidraw3"), yubikey("/dev/hidraw4")] },
+    })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], add.deps)).toBe(1)
+    const payload = JSON.parse(add.stdout.text) as { code: string; message: string }
+    expect(payload.code).toBe("VAULT_AUTHENTICATOR_AMBIGUOUS")
+    expect(payload.message.match(/--device \S+/g)).toHaveLength(2)
+    expect(add.asked).toEqual([])
+    expect(add.calls).toEqual([])
+  })
+
+  test("naming one of two keys of the same model drives exactly that key, and the PIN goes nowhere else", async () => {
+    const v = await initVault()
+    const script = { ...goodScript(), devices: [yubikey("/dev/hidraw3"), yubikey("/dev/hidraw4")] }
+    const list = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, script })
+    // The ids come from a listing, as they would for an operator.
+    const listed = handleLine(
+      JSON.stringify({ op: "info", vaultId: "v", envelopeId: "e", digest: base64.encode(new Uint8Array(32)) }),
+      () => scriptedBackend(script),
+    )
+    if (!listed.ok || listed.op !== "info") throw new Error("listing failed")
+    const second = listed.devices.find((device) => device.path === "/dev/hidraw4")?.deviceId as string
+    void list
+    const add = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN, v.passphrase], script })
+    expect(
+      await run(["vault", "factor", "add", "security-key", "--device", second, "--keystore", v.vaultPath], add.deps),
+    ).toBe(0)
+    expect(add.calls.length).toBe(3)
+    expect(add.calls.every((call) => call.path === "/dev/hidraw4" && call.pin === PIN)).toBe(true)
+    expect(add.calls.some((call) => call.path === "/dev/hidraw3")).toBe(false)
+  })
+
+  test("a credential the key reports as backup-eligible is refused as not hardware-bound, nothing written", async () => {
+    const v = await initVault()
+    const add = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN, v.passphrase],
+      script: {
+        ...goodScript(),
+        register: {
+          credentialId: CRED,
+          aaguid: AAGUID,
+          authData: authDataFor(RP_ID, AUTHDATA_FLAG_UP | AUTHDATA_FLAG_UV | AUTHDATA_FLAG_BE),
+        },
+      },
+    })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], add.deps)).toBe(1)
+    const payload = JSON.parse(add.stdout.text) as { code: string; message: string }
+    expect(payload.code).toBe("VAULT_FACTOR_UNAVAILABLE")
+    expect(payload.message).toContain("backup-eligible")
+    expect((await readVault(v.vaultPath)).envelopes).toHaveLength(1)
+    expect(add.calls.map((call) => call.op)).toEqual(["register"])
+  })
+
+  test("a registration the key made without user verification is refused with nothing written", async () => {
+    const v = await initVault()
+    const add = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN, v.passphrase],
+      script: {
+        ...goodScript(),
+        register: { credentialId: CRED, aaguid: AAGUID, authData: authDataFor(RP_ID, AUTHDATA_FLAG_UP) },
+      },
+    })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], add.deps)).toBe(1)
+    const payload = JSON.parse(add.stdout.text) as { code: string; message: string }
+    expect(payload.code).toBe("VAULT_UNLOCK_FAILED")
+    expect(payload.message).toContain("UV flag is clear")
+    expect((await readVault(v.vaultPath)).envelopes).toHaveLength(1)
+  })
+
+  test("an empty PIN is VAULT_PIN_REQUIRED and nothing is sent to the key; a wrong PIN is VAULT_PIN_INVALID", async () => {
+    const v = await initVault()
+    const empty = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [""] })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], empty.deps)).toBe(
+      1,
+    )
+    expect(JSON.parse(empty.stdout.text)).toMatchObject({ code: "VAULT_PIN_REQUIRED" })
+    expect(empty.calls).toEqual([])
+
+    const wrong = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: ["000000", v.passphrase],
+      script: { ...goodScript(), register: { error: { code: "PIN_INVALID", message: "FIDO_ERR_PIN_INVALID" } } },
+    })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], wrong.deps)).toBe(
+      1,
+    )
+    expect(JSON.parse(wrong.stdout.text)).toMatchObject({ code: "VAULT_PIN_INVALID" })
+    expect((await readVault(v.vaultPath)).envelopes).toHaveLength(1)
+  })
+
+  test("a cancelled or timed-out touch is VAULT_AUTHENTICATOR_CANCELLED with nothing written", async () => {
+    const v = await initVault()
+    const add = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN, v.passphrase],
+      script: { ...goodScript(), register: { error: { code: "CANCELLED", message: "FIDO_ERR_USER_ACTION_TIMEOUT" } } },
+    })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], add.deps)).toBe(1)
+    expect(JSON.parse(add.stdout.text)).toMatchObject({ code: "VAULT_AUTHENTICATOR_CANCELLED" })
+    expect((await readVault(v.vaultPath)).envelopes).toHaveLength(1)
+  })
+
+  test("a key removed between the listing and the operation is VAULT_AUTHENTICATOR_CHANGED", async () => {
+    const v = await initVault()
+    const add = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN, v.passphrase] })
+    // Unplugged after `info` (which the session ran) and before `register` (which re-enumerates).
+    const original = add.deps.promptSecret
+    add.deps.promptSecret = async (text) => {
+      if (text.includes("Current vault passphrase")) add.script.devices = []
+      return original(text)
+    }
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], add.deps)).toBe(1)
+    expect(JSON.parse(add.stdout.text)).toMatchObject({ code: "VAULT_AUTHENTICATOR_CHANGED" })
+    expect(add.calls).toEqual([])
+    expect((await readVault(v.vaultPath)).envelopes).toHaveLength(1)
+  })
+
+  test("a key that disappears during the operation is VAULT_FACTOR_UNAVAILABLE, not a retry elsewhere", async () => {
+    const v = await initVault()
+    const add = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN, v.passphrase],
+      script: { ...goodScript(), register: { error: { code: "DEVICE_IO", message: "FIDO_ERR_TX" } } },
+    })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], add.deps)).toBe(1)
+    expect(JSON.parse(add.stdout.text)).toMatchObject({ code: "VAULT_FACTOR_UNAVAILABLE" })
+    expect(add.calls.map((call) => call.op)).toEqual(["register"])
+  })
+})
+
+describe("unlocking with a security key", () => {
+  test("a vault transfer's one unlock names the send on the key's line (ED-12, 2026-10-09 amendment)", async () => {
+    const v = await vaultWithKey()
+    const h = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN] })
+    const to = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
+    // `--from nope` stops the transfer right after the unlock: one PIN, one assertion, no second.
+    expect(
+      await run(
+        [
+          "vault",
+          "transfer",
+          to,
+          "--amount",
+          "1.5",
+          "--asset",
+          "SOL",
+          "--from",
+          "nope",
+          "--factor",
+          v.keyId,
+          "--keystore",
+          v.vaultPath,
+        ],
+        h.deps,
+      ),
+    ).toBe(2)
+    expect(h.calls.map((call) => call.op)).toEqual(["assert"])
+    expect(h.asked).toEqual([expect.stringContaining("PIN for YubiKey 5 NFC")])
+    expect(humanText(h.stderr.text)).toContain(humanText(`to send 1.5 SOL to ${to}.`))
+    expect(h.stderr.text).not.toContain("to unlock the vault")
+  })
+
+  test("--factor <id> drives that envelope; status --unlock lists the keys; two assertions for new-key", async () => {
+    const v = await vaultWithKey()
+    const status = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN] })
+    expect(
+      await run(["vault", "status", "--unlock", "--factor", v.keyId, "--keystore", v.vaultPath], status.deps),
+    ).toBe(0)
+    expect(status.asked).toEqual([expect.stringContaining("PIN for YubiKey 5 NFC")])
+    expect(status.calls.map((call) => call.op)).toEqual(["assert"])
+    expect(status.stdout.text).toContain("Keys (0)")
+
+    // new-key opens, writes, then re-opens the written file with the same factor: a second touch.
+    const key = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN] })
+    expect(
+      await run(
+        ["vault", "new-key", "--chain", "solana", "--factor", "security-key", "--keystore", v.vaultPath],
+        key.deps,
+      ),
+    ).toBe(0)
+    expect(key.calls.map((call) => call.op)).toEqual(["assert", "assert"])
+    expect(key.asked).toHaveLength(1)
+    expect((await readVault(v.vaultPath)).keys).toHaveLength(1)
+  })
+
+  test("--factor <label> drives the envelope vault status names", async () => {
+    const v = await vaultWithKey()
+    const status = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN] })
+    expect(
+      await run(["vault", "status", "--unlock", "--factor", "desk key", "--keystore", v.vaultPath], status.deps),
+    ).toBe(0)
+    expect(status.asked).toEqual([expect.stringContaining("PIN for YubiKey 5 NFC")])
+    expect(status.stdout.text).toContain("Keys (0)")
+  })
+
+  test("with a passphrase and a key both drivable and no --factor, the operator is asked which", async () => {
+    const v = await vaultWithKey()
+    const byKey = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, lines: [v.keyId], secrets: [PIN] })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], byKey.deps)).toBe(0)
+    expect(byKey.asked[0]).toContain("Unlock with:")
+    expect(byKey.asked[0]).toContain(`id ${v.keyId}`)
+    // BE-294: the silent probe runs before the menu, then the one real assertion.
+    expect(byKey.calls.map((call) => call.op)).toEqual(["probe", "assert"])
+
+    const byPassphrase = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      lines: ["passphrase"],
+      secrets: [v.passphrase],
+    })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], byPassphrase.deps)).toBe(0)
+    expect(byPassphrase.calls.map((call) => call.op)).toEqual(["probe"])
+
+    const neither = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, lines: ["whatever"] })
+    expect(await run(["vault", "status", "--unlock", "--json", "--keystore", v.vaultPath], neither.deps)).toBe(1)
+    expect(JSON.parse(neither.stdout.text)).toMatchObject({ code: "VAULT_FACTOR_UNAVAILABLE" })
+    expect(neither.calls.map((call) => call.op)).toEqual(["probe"])
+  })
+
+  test("the passphrase-only vault is untouched by any of this: no prompt for which factor, no helper run", async () => {
+    const v = await initVault()
+    const status = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [v.passphrase] })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], status.deps)).toBe(0)
+    expect(status.asked).toEqual([expect.stringContaining("Vault passphrase")])
+    expect(status.calls).toEqual([])
+  })
+
+  test("an assertion made without user verification is refused before any unwrap, with nothing derived", async () => {
+    const v = await vaultWithKey()
+    const status = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN],
+      script: { ...goodScript(), assert: { hmacSecret: HMAC_SECRET, authData: authDataFor(RP_ID, AUTHDATA_FLAG_UP) } },
+    })
+    expect(
+      await run(["vault", "status", "--unlock", "--factor", v.keyId, "--json", "--keystore", v.vaultPath], status.deps),
+    ).toBe(1)
+    const payload = JSON.parse(status.stdout.text) as { code: string; message: string }
+    expect(payload.code).toBe("VAULT_UNLOCK_FAILED")
+    expect(payload.message).toContain("UV flag is clear")
+    expect(status.stdout.text).not.toContain(HMAC_SECRET)
+  })
+
+  test("the named key does not hold the credential: VAULT_CREDENTIAL_NOT_PRESENT, one attempt, no passphrase asked", async () => {
+    const v = await vaultWithKey()
+    const status = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN],
+      script: { ...goodScript(), assert: { error: { code: "NO_CREDENTIAL", message: "FIDO_ERR_NO_CREDENTIALS" } } },
+    })
+    expect(
+      await run(["vault", "status", "--unlock", "--factor", v.keyId, "--json", "--keystore", v.vaultPath], status.deps),
+    ).toBe(1)
+    expect(JSON.parse(status.stdout.text)).toMatchObject({ code: "VAULT_CREDENTIAL_NOT_PRESENT" })
+    expect(status.calls.map((call) => call.op)).toEqual(["assert"])
+    expect(status.asked.filter((line) => line.includes("passphrase"))).toEqual([])
+  })
+
+  test("a helper code the CLI does not know is VAULT_UNLOCK_FAILED and is never retried against the passphrase", async () => {
+    const v = await vaultWithKey()
+    const status = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN],
+      script: { ...goodScript(), assert: { error: { code: "SOMETHING_NEW" as never, message: "future" } } },
+    })
+    expect(
+      await run(["vault", "status", "--unlock", "--factor", v.keyId, "--json", "--keystore", v.vaultPath], status.deps),
+    ).toBe(1)
+    const payload = JSON.parse(status.stdout.text) as { code: string; message: string }
+    expect(payload.code).toBe("VAULT_UNLOCK_FAILED")
+    expect(payload.message).toContain("SOMETHING_NEW")
+    expect(status.asked).toHaveLength(1)
+  })
+
+  test("a different key's PRF output does not unwrap: VAULT_UNLOCK_FAILED, nothing derived from it", async () => {
+    const v = await vaultWithKey()
+    const other = base64.encode(new Uint8Array(32).fill(0xee))
+    const status = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN],
+      script: { ...goodScript(), assert: { hmacSecret: other, authData: UV } },
+    })
+    expect(
+      await run(["vault", "status", "--unlock", "--factor", v.keyId, "--json", "--keystore", v.vaultPath], status.deps),
+    ).toBe(1)
+    const payload = JSON.parse(status.stdout.text) as { code: string; suggestion?: string }
+    expect(payload.code).toBe("VAULT_UNLOCK_FAILED")
+    expect(payload.suggestion).toContain("no other factor was tried")
+  })
+
+  test("userVerification: required edited out of the envelope breaks the file; an edited salt breaks the tag", async () => {
+    const v = await vaultWithKey()
+    const original = await readFile(v.vaultPath, "utf8")
+    const edited = JSON.parse(original) as VaultJson
+    const envelope = edited.envelopes.find((candidate) => candidate.factor === "passkey-prf") as Record<string, unknown>
+    delete envelope.userVerification
+    await writeFile(v.vaultPath, JSON.stringify(edited, null, 2))
+    const stripped = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN] })
+    expect(await run(["vault", "status", "--keystore", v.vaultPath], stripped.deps)).toBe(1)
+    expect(humanText(stripped.stderr.text)).toContain(humanText("userVerification: required"))
+
+    const resalted = JSON.parse(original) as VaultJson
+    const target = resalted.envelopes.find((candidate) => candidate.factor === "passkey-prf") as Record<string, unknown>
+    target.prfSalt = base64
+      .encode(new Uint8Array(32).fill(1))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "")
+    await writeFile(v.vaultPath, JSON.stringify(resalted, null, 2))
+    const wrong = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN] })
+    expect(
+      await run(["vault", "status", "--unlock", "--factor", v.keyId, "--json", "--keystore", v.vaultPath], wrong.deps),
+    ).toBe(1)
+    expect(JSON.parse(wrong.stdout.text)).toMatchObject({ code: "VAULT_UNLOCK_FAILED" })
+    await writeFile(v.vaultPath, original)
+  })
+
+  test("backup opens the copy with the same key (a second touch) and verifies it in full", async () => {
+    const v = await vaultWithKey()
+    const dest = join(await mkdtemp(join(tmpdir(), "candle-vault-copy-")), "vault-backup.enc")
+    const backup = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN] })
+    const code = await run(
+      ["vault", "backup", "--to", dest, "--factor", "security-key", "--keystore", v.vaultPath],
+      backup.deps,
+    )
+    expect(backup.stderr.text + backup.stdout.text).not.toContain("Error")
+    expect(code).toBe(0)
+    expect(backup.calls.map((call) => call.op)).toEqual(["assert", "assert"])
+    expect(humanText(backup.stdout.text)).toContain(humanText("all 8 passed"))
+  })
+
+  test("factor list and status report the key as available here, with the helper, and as unavailable without", async () => {
+    const v = await vaultWithKey()
+    const withHelper = await harness({ env: { CANDLE_CONFIG_DIR: v.dir } })
+    expect(await run(["vault", "factor", "list", "--json", "--keystore", v.vaultPath], withHelper.deps)).toBe(0)
+    const listed = JSON.parse(withHelper.stdout.text) as {
+      envelopes: Array<{ factor: string; transport?: string; availability: string; domain: string }>
+      recoverableFactors: number
+    }
+    const key = listed.envelopes.find((envelope) => envelope.factor === "passkey-prf")
+    expect(key).toMatchObject({ transport: "ctap2", domain: "hardware-token", availability: "available" })
+    expect(listed.recoverableFactors).toBe(1)
+
+    const without = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, helper: "absent" })
+    expect(await run(["vault", "status", "--json", "--keystore", v.vaultPath], without.deps)).toBe(0)
+    const status = JSON.parse(without.stdout.text) as {
+      envelopes: Array<{ factor: string; availability: string; availabilityReason?: string }>
+    }
+    const absent = status.envelopes.find((envelope) => envelope.factor === "passkey-prf")
+    expect(absent?.availability).toBe("unavailable-on-this-device")
+    expect(absent?.availabilityReason).toContain("npm package")
+  })
+
+  test("two envelopes on two keys are a recoverable pair; the CLI cannot tell two on one key apart and says so", async () => {
+    const v = await vaultWithKey()
+    const second = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN, v.passphrase],
+      script: {
+        ...goodScript(),
+        devices: [yubikey("/dev/hidraw7")],
+        register: { credentialId: base64.encode(new Uint8Array(48).fill(5)), aaguid: AAGUID, authData: UV },
+      },
+    })
+    // BE-337 (D1): the vault has a key, so without `--factor` the menu would ask; the passphrase
+    // named on the flag is today's order (the new key's PIN, then the passphrase) and no line.
+    expect(
+      await run(
+        [
+          "vault",
+          "factor",
+          "add",
+          "security-key",
+          "--label",
+          "drawer key",
+          "--factor",
+          "passphrase",
+          "--keystore",
+          v.vaultPath,
+        ],
+        second.deps,
+      ),
+    ).toBe(0)
+    expect(second.stderr.text).not.toContain("Passphrase only:")
+    // D3 refusal 3: the second enrollment excludes the first key's credential.
+    expect(second.calls.find((call) => call.op === "register")?.excludeCredentialIds).toEqual([CRED])
+    expect(humanText(second.stdout.text)).toContain(humanText("2 recoverable factor(s)"))
+    expect(humanText(second.stdout.text)).toContain(
+      humanText("Two security key envelopes on two different keys are a recoverable pair"),
+    )
+  })
+})
+
+describe("T58: CC-12's refusal matrix, every row with the platform injected", () => {
+  const rows: Array<{ platform: string; arch: string; shipping: boolean }> = [
+    { platform: "darwin", arch: "arm64", shipping: true },
+    { platform: "darwin", arch: "x64", shipping: true },
+    { platform: "linux", arch: "x64", shipping: true },
+    { platform: "linux", arch: "arm64", shipping: true },
+    { platform: "win32", arch: "x64", shipping: false },
+  ]
+
+  for (const row of rows) {
+    test(`${row.platform}-${row.arch}: factor add of each unsupported or unavailable factor is typed, and nothing is substituted`, async () => {
+      const v = await initVault()
+      const facts = { platform: row.platform, arch: row.arch }
+
+      // Security key with no helper: on a shipping target it is the helper that is missing; off
+      // them the platform itself is refused (BE-124).
+      const noHelper = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, helper: "absent", ...facts })
+      expect(
+        await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], noHelper.deps),
+      ).toBe(1)
+      const securityKey = JSON.parse(noHelper.stdout.text) as { code: string; message: string; suggestion?: string }
+      expect(securityKey.code).toBe(row.shipping ? "VAULT_HELPER_MISSING" : "VAULT_FACTOR_UNSUPPORTED_ON_PLATFORM")
+      expect(securityKey.message).toContain(row.shipping ? "npm package" : "BE-124")
+      expect(`${securityKey.message} ${securityKey.suggestion}`).toContain("No other factor is substituted")
+      expect(noHelper.asked).toEqual([])
+
+      // Secure Enclave and the synced passkey: PRs F and G, refused everywhere in this release.
+      const touchId = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, ...facts })
+      expect(await run(["vault", "factor", "add", "touch-id", "--json", "--keystore", v.vaultPath], touchId.deps)).toBe(
+        1,
+      )
+      const enclave = JSON.parse(touchId.stdout.text) as { code: string; message: string }
+      expect(enclave.code).toBe("VAULT_FACTOR_UNSUPPORTED_ON_PLATFORM")
+      expect(enclave.message).toContain(row.platform === "darwin" ? "a later release" : "macOS only")
+
+      const passkey = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, ...facts })
+      expect(await run(["vault", "factor", "add", "passkey", "--json", "--keystore", v.vaultPath], passkey.deps)).toBe(
+        1,
+      )
+      const synced = JSON.parse(passkey.stdout.text) as { code: string; message: string }
+      expect(synced.code).toBe("VAULT_FACTOR_UNSUPPORTED_ON_PLATFORM")
+      expect(synced.message).toContain(row.platform === "darwin" ? "a later release" : "macOS only")
+
+      // A supported factor with the helper present and no device attached.
+      if (row.shipping) {
+        const noDevice = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, ...facts, script: { devices: [] } })
+        expect(
+          await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], noDevice.deps),
+        ).toBe(1)
+        expect(JSON.parse(noDevice.stdout.text)).toMatchObject({ code: "VAULT_FACTOR_UNAVAILABLE" })
+        expect((await readVault(v.vaultPath)).envelopes).toHaveLength(1)
+      }
+    })
+  }
+
+  test("an envelope of an unsupported transport is listed unsupported-on-this-platform, not offered, and refused by name", async () => {
+    const v = await initVault()
+    // A platform-macos envelope (PR G, BE-135) in CC-01's shape. This build's policy is `omit`,
+    // so on macOS the factor is not in the build and on Linux it is macOS only; either way the
+    // envelope is kept verbatim (ED-7) and never offered.
+    const file = JSON.parse(await readFile(v.vaultPath, "utf8")) as VaultJson
+    file.envelopes.push({
+      id: "g1g1g1g1",
+      factor: "passkey-prf",
+      transport: "platform-macos",
+      domain: "apple-account",
+      label: "synced",
+      createdAt: "2026-09-18T00:00:00.000Z",
+      rpId: "cli.candle.tv",
+      credentialId: "AQIDBAUGBwgJCgsMDQ4PEA",
+      prfSalt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      userVerification: "required",
+      backupEligible: true,
+      backupState: true,
+      saltDerivation: "platform",
+      helper: { teamId: "ABCDE12345", bundleId: "tv.candle.cli.enclave", minVersion: "0.13.0" },
+      wrap: {
+        alg: "AES-256-GCM",
+        iv: "AAAAAAAAAAAAAAAA",
+        ciphertext: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      },
+    })
+    await writeFile(v.vaultPath, JSON.stringify(file, null, 2))
+
+    for (const platform of ["darwin", "linux"]) {
+      const status = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, platform })
+      expect(await run(["vault", "status", "--json", "--keystore", v.vaultPath], status.deps)).toBe(0)
+      const listed = JSON.parse(status.stdout.text) as {
+        envelopes: Array<{ id: string; availability: string; availabilityReason?: string }>
+      }
+      const synced = listed.envelopes.find((envelope) => envelope.id === "g1g1g1g1")
+      expect(synced?.availability).toBe("unsupported-on-this-platform")
+      expect(synced?.availabilityReason).toContain(platform === "darwin" ? "a later release" : "macOS only")
+
+      // Asked for explicitly: the typed code, before any prompt, and no other envelope tried.
+      const explicit = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, platform })
+      expect(
+        await run(
+          ["vault", "status", "--unlock", "--factor", "g1g1g1g1", "--json", "--keystore", v.vaultPath],
+          explicit.deps,
+        ),
+      ).toBe(1)
+      expect(JSON.parse(explicit.stdout.text)).toMatchObject({ code: "VAULT_FACTOR_UNSUPPORTED_ON_PLATFORM" })
+      expect(explicit.asked).toEqual([])
+      expect(explicit.calls).toEqual([])
+    }
+
+    // And with no --factor the passphrase is used without a menu: the synced envelope is not offered.
+    const plain = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, platform: "darwin", secrets: [v.passphrase] })
+    // The header changed outside this CLI, so the open itself fails the index tag; what matters
+    // here is that the only prompt was the passphrase and no menu offered the unsupported envelope.
+    await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], plain.deps)
+    expect(plain.asked).toEqual([expect.stringContaining("Vault passphrase")])
+  })
+
+  test("a security key envelope with no helper is unavailable-on-this-device, and asking for it is VAULT_HELPER_MISSING", async () => {
+    const v = await vaultWithKey()
+    const explicit = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, helper: "absent" })
+    expect(
+      await run(
+        ["vault", "status", "--unlock", "--factor", v.keyId, "--json", "--keystore", v.vaultPath],
+        explicit.deps,
+      ),
+    ).toBe(1)
+    const payload = JSON.parse(explicit.stdout.text) as { code: string; suggestion?: string }
+    expect(payload.code).toBe("VAULT_HELPER_MISSING")
+    expect(explicit.asked).toEqual([])
+    // With no --factor, the passphrase opens it without a menu: the key is not offered here.
+    const plain = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, helper: "absent", secrets: [v.passphrase] })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], plain.deps)).toBe(0)
+    expect(plain.asked).toEqual([expect.stringContaining("Vault passphrase")])
+  })
+
+  test("the Linux hidraw message is printed verbatim with VAULT_AUTHENTICATOR_NOT_READABLE, and never suggests root", async () => {
+    const v = await initVault()
+    const linux = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      platform: "linux",
+      script: { ...goodScript(), devices: [yubikey("/dev/hidraw3", { unreadable: true })] },
+    })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], linux.deps)).toBe(
+      1,
+    )
+    const payload = JSON.parse(linux.stdout.text) as { code: string; message: string }
+    expect(payload.code).toBe("VAULT_AUTHENTICATOR_NOT_READABLE")
+    expect(payload.message).toBe(HIDRAW_MESSAGE)
+    expect(payload.message).not.toMatch(/sudo|as root/)
+    expect(linux.asked).toEqual([])
+    expect(linux.calls).toEqual([])
+
+    // With another, readable key attached and named, the unreadable one is simply not touched.
+    const named = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      platform: "linux",
+      secrets: [PIN, v.passphrase],
+      script: { ...goodScript(), devices: [yubikey("/dev/hidraw3", { unreadable: true }), yubikey("/dev/hidraw4")] },
+    })
+    const listed = handleLine(
+      JSON.stringify({ op: "info", vaultId: "v", envelopeId: "e", digest: base64.encode(new Uint8Array(32)) }),
+      () => scriptedBackend(named.script),
+    )
+    if (!listed.ok || listed.op !== "info") throw new Error("listing failed")
+    const readable = listed.devices.find((device) => device.readable)?.deviceId as string
+    expect(
+      await run(
+        ["vault", "factor", "add", "security-key", "--device", readable, "--keystore", v.vaultPath],
+        named.deps,
+      ),
+    ).toBe(0)
+    expect(named.calls.every((call) => call.path === "/dev/hidraw4")).toBe(true)
+  })
+
+  test("the Windows row has no binary: the release target list has not silently gained one (E24)", async () => {
+    expect([...SHIPPING_TARGETS].sort()).toEqual(["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"])
+    const candidates = [
+      join(import.meta.dir, "..", "..", "..", "..", "distribution", "agentic", ".github", "workflows", "release.yaml"),
+      join(import.meta.dir, "..", "..", "..", "..", ".github", "workflows", "release.yaml"),
+    ]
+    let workflow: string | undefined
+    for (const candidate of candidates) {
+      try {
+        workflow = await readFile(candidate, "utf8")
+        break
+      } catch {
+        // Try the next location.
+      }
+    }
+    if (workflow === undefined) throw new Error(`release.yaml not found at any of: ${candidates.join(", ")}`)
+    const listed = workflow
+      .match(/^\s+RELEASE_TARGETS:\s*(.+)$/m)?.[1]
+      ?.trim()
+      .split(/\s+/)
+    expect(listed?.slice().sort()).toEqual([...SHIPPING_TARGETS].sort())
+    const loops = [...workflow.matchAll(/for target in ([^;]+); do/g)].map((match) => (match[1] ?? "").trim())
+    expect(loops.length).toBeGreaterThan(0)
+    for (const loop of loops) {
+      const targets = loop === `\${RELEASE_TARGETS}` || loop === "$RELEASE_TARGETS" ? listed : loop.split(/\s+/)
+      expect([...(targets ?? [])].sort()).toEqual([...SHIPPING_TARGETS].sort())
+    }
+    expect(workflow).not.toMatch(/windows|win32|\.exe/i)
+    // The helper is built in the same loop, and signed by the same step, as the four binaries.
+    expect(workflow).toContain(`candle-fido2-\${target}`)
+    expect(workflow).toMatch(/cosign sign-blob[^\n]*\n/)
+    expect(workflow).toContain(
+      "candle-fido2-darwin-arm64 candle-fido2-darwin-x64 candle-fido2-linux-x64 candle-fido2-linux-arm64",
+    )
+  })
+})
+
+describe("what refuses without a terminal", () => {
+  test("factor add security-key needs a terminal for the PIN and the passphrase", async () => {
+    const v = await initVault()
+    const piped = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, tty: false })
+    expect(await run(["vault", "factor", "add", "security-key", "--json", "--keystore", v.vaultPath], piped.deps)).toBe(
+      1,
+    )
+    const payload = JSON.parse(piped.stdout.text) as { message: string }
+    expect(payload.message).toContain("security key PIN")
+    expect(piped.calls).toEqual([])
+  })
+})
+
+describe("TEE paths honour --factor and --device (the vault-backed TEE lifecycle and tee enable --vault-key)", () => {
+  const TEE_PASS = "a strong tee-store passphrase"
+  const ACCOUNT = "AcctSecurityKey11111111111111111111111111"
+  const API = "https://api.test"
+  const teeKey = Keypair.generate()
+  const TEE = teeKey.publicKey.toBase58()
+  const freshKey = Keypair.generate()
+  const FRESH = freshKey.publicKey.toBase58()
+  const VAULT_DEST = Keypair.generate().publicKey.toBase58()
+
+  function teeEntry(key: Keypair, address: string, overrides: Partial<KeystoreEntry> = {}): KeystoreEntry {
+    return {
+      index: 0,
+      chain: "solana",
+      address,
+      label: "tee-0",
+      createdAt: "2026-09-16T00:00:00.000Z",
+      privateKey: base58.encode(key.secretKey),
+      imported: false,
+      tee: { network: "solana-mainnet" },
+      ...overrides,
+    }
+  }
+
+  /** An enabled Phase 1 TEE entry, the shape `import-legacy` migrates to `lifecycle: "enabled"`. */
+  const enabledTee = (): KeystoreEntry =>
+    teeEntry(teeKey, TEE, {
+      imported: true,
+      linkedWalletId: "lw_tee1",
+      privyWalletId: "pw_tee1",
+      importedAt: "2026-09-16T01:00:00.000Z",
+      tee: {
+        network: "solana-mainnet",
+        vaultDestination: VAULT_DEST,
+        boundKeyPrefix: "ck_live_x",
+        remoteAuthority: "verified-active",
+        enabledAt: "2026-09-16T01:00:00.000Z",
+      },
+    })
+
+  async function seedTeeStore(dir: string, entries: KeystoreEntry[]): Promise<string> {
+    const ks = await createKeystore(TEE_PASS)
+    const path = defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME)
+    await writeKeystoreFile(
+      path,
+      await serializeKeystore(entries, ks.key, ks.salt, ks.iterations, TEE_KEYSTORE_PURPOSE),
+    )
+    return path
+  }
+
+  /** The harness with real files (the TEE store is read through `deps.readFile`), a profile whose
+   * account the migration records, and an API key for the lifecycle read. */
+  async function teeHarness(dir: string, opts: Omit<HarnessOptions, "env"> & { fetch?: typeof fetch } = {}) {
+    const h = await harness({ env: { CANDLE_CONFIG_DIR: dir }, ...opts })
+    h.deps.readFile = (path) => readFile(path, "utf8")
+    h.deps.writeFile = (path, content) => writeFile(path, content, "utf8")
+    h.deps.store = createFakeStore({ "profile:sk:api_key": "ck_live_x" })
+    if (opts.fetch) h.deps.fetch = opts.fetch
+    await h.deps.writeConfig({
+      activeProfile: "sk",
+      profiles: { sk: { account: ACCOUNT, apiUrl: API, accountCachedAt: Date.now() } },
+    })
+    return h
+  }
+
+  /** A vault with a passphrase and the scripted key, holding a migrated enabled TEE entry. */
+  async function vaultWithKeyAndTee() {
+    const v = await vaultWithKey()
+    const teePath = await seedTeeStore(v.dir, [enabledTee()])
+    // The migration itself opens the vault with the key: the legacy store passphrase first, then
+    // the factor `--factor` names (PIN and a touch), and the on-disk verification re-opens with it.
+    const migrate = await teeHarness(v.dir, { secrets: [TEE_PASS, PIN] })
+    const code = await run(
+      [
+        "vault",
+        "import-legacy",
+        "--tee",
+        "--from",
+        teePath,
+        "--factor",
+        v.keyId,
+        "--no-verify-account",
+        "--keystore",
+        v.vaultPath,
+      ],
+      migrate.deps,
+    )
+    if (code !== 0) throw new Error(`import-legacy failed (${code}): ${migrate.stderr.text}${migrate.stdout.text}`)
+    expect(migrate.calls.map((call) => call.op)).toEqual(["assert", "assert"])
+    expect(migrate.asked.filter((line) => line.includes("Vault passphrase"))).toEqual([])
+    return { ...v, teePath }
+  }
+
+  test("tee status on a migrated vault TEE entry opens with --factor <key>, no passphrase asked, no legacy store read", async () => {
+    const v = await vaultWithKeyAndTee()
+    const routes = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () =>
+        jsonResponse(200, {
+          success: true,
+          id: "lw_tee1",
+          state: "enabled",
+          remoteAuthority: "verified-active",
+          evidenceObservedAt: 1_726_000_000_000,
+          profile: "ember-tee",
+          boundKeyPrefix: "ck_live_x",
+          vaultDestination: VAULT_DEST,
+        }),
+    })
+    const status = await teeHarness(v.dir, { secrets: [PIN], fetch: routes.fetch })
+    const code = await run(
+      ["tee", "status", "--verify", TEE, "--json", "--factor", v.keyId, "--no-verify-account"],
+      status.deps,
+    )
+    expect(status.stderr.text).not.toContain("Error")
+    expect(code).toBe(0)
+    const report = JSON.parse(status.stdout.text) as {
+      source: string
+      vaultLifecycle: string
+      server: { state: string }
+    }
+    expect(report.source).toBe("vault")
+    expect(report.vaultLifecycle).toBe("enabled")
+    expect(report.server.state).toBe("enabled")
+    // Exactly one factor prompt, the key's PIN; one assertion; the TEE store passphrase never asked.
+    expect(status.asked).toEqual([expect.stringContaining("PIN for YubiKey 5 NFC")])
+    expect(status.calls.map((call) => call.op)).toEqual(["assert"])
+    expect(status.calls[0]?.pin).toBe(PIN)
+  })
+
+  test("with both factors drivable and no --factor, the TEE command asks which, like every vault command", async () => {
+    const v = await vaultWithKeyAndTee()
+    const byKey = await teeHarness(v.dir, { lines: [v.keyId], secrets: [PIN] })
+    expect(await run(["tee", "status", "--verify", TEE, "--json", "--no-verify-account"], byKey.deps)).toBe(0)
+    expect(byKey.asked[0]).toContain("Unlock with:")
+    expect(byKey.calls.map((call) => call.op)).toEqual(["probe", "assert"])
+
+    const byPassphrase = await teeHarness(v.dir, { lines: ["passphrase"], secrets: [v.passphrase] })
+    expect(await run(["tee", "status", "--verify", TEE, "--json", "--no-verify-account"], byPassphrase.deps)).toBe(0)
+    expect(byPassphrase.calls.map((call) => call.op)).toEqual(["probe"])
+  })
+
+  test("a key that does not hold the credential refuses the TEE command typed: no passphrase, no legacy store, no retry", async () => {
+    const v = await vaultWithKeyAndTee()
+    const status = await teeHarness(v.dir, {
+      secrets: [PIN],
+      script: { ...goodScript(), assert: { error: { code: "NO_CREDENTIAL", message: "FIDO_ERR_NO_CREDENTIALS" } } },
+    })
+    expect(
+      await run(["tee", "status", "--verify", TEE, "--json", "--factor", v.keyId, "--no-verify-account"], status.deps),
+    ).toBe(1)
+    expect(JSON.parse(status.stdout.text)).toMatchObject({ code: "VAULT_CREDENTIAL_NOT_PRESENT" })
+    expect(status.asked).toEqual([expect.stringContaining("PIN for YubiKey 5 NFC")])
+    expect(status.calls.map((call) => call.op)).toEqual(["assert"])
+  })
+
+  test("tee enable --vault-key names the destination through the key and never substitutes the passphrase", async () => {
+    const v = await vaultWithKeyAndTee()
+    // A cold vault key to pin as the sweep destination, created through the key factor.
+    const key = await teeHarness(v.dir, { secrets: [PIN] })
+    expect(
+      await run(
+        [
+          "vault",
+          "new-key",
+          "--chain",
+          "solana",
+          "--label",
+          "cold",
+          "--json",
+          "--factor",
+          v.keyId,
+          "--no-verify-account",
+          "--keystore",
+          v.vaultPath,
+        ],
+        key.deps,
+      ),
+    ).toBe(0)
+    const cold = (JSON.parse(key.stdout.text) as { address: string }).address
+
+    const ENCRYPTION_PUBLIC_KEY = await (async () => {
+      const receiver = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"])
+      return Buffer.from(await crypto.subtle.exportKey("raw", receiver.publicKey)).toString("base64")
+    })()
+    const submits: Record<string, unknown>[] = []
+    const routes = createRoutedFetch({
+      "/api/v1/agent/wallets/import/init": () =>
+        jsonResponse(200, { success: true, encryptionPublicKey: ENCRYPTION_PUBLIC_KEY }),
+      "/api/v1/agent/wallets/import/submit": (req) => {
+        const body = JSON.parse(String(req.init.body)) as Record<string, unknown>
+        submits.push(body)
+        return jsonResponse(200, {
+          success: true,
+          id: "lw_tee2",
+          address: body.address,
+          chain: "solana",
+          privyWalletId: "pw_tee2",
+          profile: "ember-tee",
+          vaultDestination: body.vaultDestination,
+          boundKeyPrefix: "ck_live_x",
+          remoteAuthority: "verified-active",
+          evidenceObservedAt: 1_726_000_000_000,
+          state: "enabled",
+        })
+      },
+    })
+    // A fresh legacy TEE entry, seeded AFTER the migration so the vault does not own it (the
+    // migrated address would be refused a legacy write, correctly). Same passphrase, new store.
+    await seedTeeStore(v.dir, [enabledTee(), teeEntry(freshKey, FRESH, { index: 1, label: "tee-1" })])
+    // No --keystore on `tee enable`: there that flag names the Phase 1 TEE store, and the vault is
+    // at its default path under CANDLE_CONFIG_DIR.
+    // Prompts, in order: the key's PIN for the destination lookup, the key's PIN again for the
+    // vault-ownership check of the TEE address, the legacy TEE store passphrase, the typed
+    // `confirm` typed under the destination (BE-1710). No vault passphrase anywhere.
+    const enable = await teeHarness(v.dir, { secrets: [PIN, PIN, TEE_PASS], lines: ["confirm"], fetch: routes.fetch })
+    const code = await run(
+      ["tee", "enable", FRESH, "--vault-key", "cold", "--factor", v.keyId, "--no-verify-account"],
+      enable.deps,
+    )
+    expect(enable.stderr.text).not.toContain("Error")
+    expect(code).toBe(0)
+    expect(submits).toHaveLength(1)
+    expect(submits[0]).toMatchObject({ address: FRESH, vaultDestination: cold })
+    expect(enable.asked.filter((line) => line.includes("Vault passphrase"))).toEqual([])
+    expect(enable.calls.map((call) => call.op)).toEqual(["assert", "assert"])
+    expect(enable.calls.every((call) => call.pin === PIN && call.path === "/dev/hidraw3")).toBe(true)
+    // The legacy store, not the vault, was written for the fresh address; the migrated entry is untouched.
+    const store = await readKeystore(await readFile(v.teePath, "utf8"), TEE_PASS, {
+      expectPurpose: TEE_KEYSTORE_PURPOSE,
+    })
+    expect(store.entries.find((entry) => entry.address === FRESH)).toMatchObject({
+      imported: true,
+      linkedWalletId: "lw_tee2",
+      tee: { vaultDestination: cold },
+    })
+  })
+
+  test("tee enable --vault-key with a key that cannot open the vault is the typed refusal before any import call", async () => {
+    const v = await vaultWithKeyAndTee()
+    const routes = createRoutedFetch({})
+    const enable = await teeHarness(v.dir, {
+      secrets: [PIN],
+      fetch: routes.fetch,
+      script: { ...goodScript(), assert: { error: { code: "NO_CREDENTIAL", message: "FIDO_ERR_NO_CREDENTIALS" } } },
+    })
+    const code = await run(
+      ["tee", "enable", FRESH, "--vault-key", "cold", "--json", "--factor", v.keyId, "--no-verify-account"],
+      enable.deps,
+    )
+    expect(code).toBe(1)
+    expect(JSON.parse(enable.stdout.text)).toMatchObject({ code: "VAULT_CREDENTIAL_NOT_PRESENT" })
+    expect(enable.asked).toEqual([expect.stringContaining("PIN for YubiKey 5 NFC")])
+    expect(routes.calls).toHaveLength(0)
+  })
+})
+
+/**
+ * BE-275 D8 (test 10): `--install-helper` on a release binary with no helper beside it downloads,
+ * verifies and installs THIS binary's own `candle-fido2` (pinned to `releaseIdentityUri(CLI_VERSION)`,
+ * never the latest), then enrols in the same run. Anything short of a verified install installs
+ * nothing, asks for nothing, writes nothing, and is the typed refusal with the reason named.
+ *
+ * The filesystem is real here (a temp dir stands in for the bin dir) because the helper the
+ * install writes has to be found by `locateFido2Helper`'s real executable check; the download and
+ * the verifier are the injected seams, exactly as in update.test.ts.
+ */
+describe("BE-275 D8: --install-helper installs this release's helper, then enrols", () => {
+  const HELPER_BYTES = new TextEncoder().encode("#!/bin/sh\nexit 1\n")
+  const HELPER_ASSET = "candle-fido2-linux-x64"
+  const TAG = `cli-v${CLI_VERSION}`
+
+  /** The release's own manifest and assets, at the pinned tag: `--install-helper` reads
+   * `releases/download/<this version>/latest.json`, never `latest/`. */
+  function releaseRoutes(opts: { helper?: boolean } = { helper: true }) {
+    const sum = createHash("sha256").update(HELPER_BYTES).digest("hex")
+    const manifest = {
+      version: CLI_VERSION,
+      tag: TAG,
+      assets: { "linux-x64": { name: "candle-linux-x64", sha256: "00", size: 1 } },
+      ...(opts.helper
+        ? { helpers: { "linux-x64": { name: HELPER_ASSET, sha256: sum, size: HELPER_BYTES.length } } }
+        : {}),
+    }
+    return {
+      [`/releases/download/${TAG}/latest.json`]: () => jsonResponse(200, manifest),
+      [`/releases/download/${TAG}/SHA256SUMS`]: () => new Response(`${sum}  ${HELPER_ASSET}\n`),
+      [`/releases/download/${TAG}/${HELPER_ASSET}`]: () => new Response(HELPER_BYTES),
+      [`/releases/download/${TAG}/${HELPER_ASSET}.sigstore.json`]: () => jsonResponse(200, { fixture: true }),
+      // The unpinned manifest answers something else entirely, so a run that read it would fail
+      // on a missing asset rather than pass by accident.
+      "/releases/latest/download/latest.json": () =>
+        jsonResponse(200, { version: "99.0.0", tag: "cli-v99.0.0", assets: {} }),
+    }
+  }
+
+  /** A release-binary harness: `candle` lives in the vault's temp dir and no helper is beside it.
+   * Writes and renames are real, with the modes the real deps use. */
+  async function binaryHarness(
+    v: Awaited<ReturnType<typeof initVault>>,
+    fetch: typeof globalThis.fetch,
+    verify: Deps["verify"],
+  ) {
+    const h = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir, CANDLE_RELEASE_BASE_URL: "https://example.test" },
+      secrets: [PIN, v.passphrase],
+      helper: "absent",
+    })
+    // initVault's harness put its own stub helper in this dir (at CANDLE_FIDO2_HELPER); this
+    // machine is a release binary with NO helper beside it, so that file goes.
+    await rm(join(v.dir, "candle-fido2"), { force: true })
+    h.deps.fetch = fetch
+    h.deps.execPath = join(v.dir, "candle")
+    h.deps.verify = verify
+    h.deps.writeBytes = async (path, bytes) => {
+      await writeFile(path, bytes, { mode: 0o755, flag: "wx" })
+    }
+    h.deps.rename = rename
+    h.deps.unlink = async (path) => {
+      await rm(path)
+    }
+    return h
+  }
+
+  const isExecutable = (path: string) =>
+    access(path, constants.X_OK).then(
+      () => true,
+      () => false,
+    )
+
+  test("downloads, verifies against this binary's own identity, installs beside it, and enrols", async () => {
+    const v = await initVault()
+    const before = await readFile(v.vaultPath, "utf8")
+    const { fetch, calls } = createRoutedFetch(releaseRoutes())
+    const seen: { bytes: Uint8Array; identityUri: string }[] = []
+    const h = await binaryHarness(v, fetch, (bytes, _bundle, identityUri) => {
+      seen.push({ bytes, identityUri })
+      return { ok: true }
+    })
+    const code = await run(
+      ["vault", "factor", "add", "security-key", "--install-helper", "--label", "desk key", "--keystore", v.vaultPath],
+      h.deps,
+    )
+    expect(code, h.stderr.text + h.stdout.text).toBe(0)
+    // Pinned to THIS binary's version: the helper for a newer release is the protocol mismatch
+    // fido2.ts exists to refuse.
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.identityUri).toBe(releaseIdentityUri(CLI_VERSION))
+    expect(Array.from(seen[0]?.bytes ?? [])).toEqual(Array.from(HELPER_BYTES))
+    expect(calls.map((c) => new URL(c.url).pathname)).toContain(`/releases/download/${TAG}/latest.json`)
+    expect(calls.map((c) => new URL(c.url).pathname)).not.toContain("/releases/latest/download/latest.json")
+    // Installed beside the binary, executable, and no staged file left behind.
+    const helperPath = join(v.dir, "candle-fido2")
+    expect(await isExecutable(helperPath)).toBe(true)
+    expect(await readFile(helperPath, "utf8")).toBe(new TextDecoder().decode(HELPER_BYTES))
+    expect(humanText(h.stderr.text)).toContain(
+      humanText(`Installed candle-fido2 ${CLI_VERSION} to ${helperPath}; enrolling.`),
+    )
+    // Then the enrolment it was asked for, in the same run.
+    expect(humanText(h.stdout.text)).toContain(humanText("Added security key factor"))
+    const file = await readVault(v.vaultPath)
+    expect(file.envelopes.some((envelope) => envelope.factor === "passkey-prf")).toBe(true)
+    expect(await readFile(v.vaultPath, "utf8")).not.toBe(before)
+  })
+
+  test("a helper that fails verification installs nothing, asks nothing, writes nothing, and names why", async () => {
+    const v = await initVault()
+    const before = await readFile(v.vaultPath, "utf8")
+    const { fetch } = createRoutedFetch(releaseRoutes())
+    const h = await binaryHarness(v, fetch, () => ({ ok: false, reason: "no matching certificate identity" }))
+    const code = await run(
+      ["vault", "factor", "add", "security-key", "--install-helper", "--keystore", v.vaultPath, "--json"],
+      h.deps,
+    )
+    expect(code).toBe(1)
+    const body = JSON.parse(h.stdout.text) as { code: string; message: string; suggestion: string }
+    expect(body.code).toBe("VAULT_HELPER_MISSING")
+    expect(body.message).toContain(`--install-helper could not install candle-fido2 ${CLI_VERSION}`)
+    expect(body.message).toContain("signature verification failed")
+    expect(body.message).toContain("no matching certificate identity")
+    expect(body.suggestion).toContain("Nothing was installed.")
+    expect(body.suggestion).toContain("No other factor is substituted and nothing was written.")
+    expect(await isExecutable(join(v.dir, "candle-fido2"))).toBe(false)
+    expect(h.asked).toEqual([])
+    expect(await readFile(v.vaultPath, "utf8")).toBe(before)
+    // --json: progress is human commentary and stays off stderr.
+    expect(h.stderr.text).toBe("")
+  })
+
+  test("a release that declares no helper for this platform is the refusal, not a download", async () => {
+    const v = await initVault()
+    const { fetch, calls } = createRoutedFetch(releaseRoutes({ helper: false }))
+    const h = await binaryHarness(v, fetch, () => ({ ok: true }))
+    expect(
+      await run(["vault", "factor", "add", "security-key", "--install-helper", "--keystore", v.vaultPath], h.deps),
+    ).toBe(1)
+    expect(humanText(h.stderr.text)).toContain(humanText(`release ${TAG} declares no ${HELPER_ASSET}`))
+    expect(calls.map((c) => new URL(c.url).pathname)).toEqual([`/releases/download/${TAG}/latest.json`])
+    expect(await isExecutable(join(v.dir, "candle-fido2"))).toBe(false)
+  })
+
+  test("with the helper already present, the flag downloads nothing and enrols", async () => {
+    const v = await initVault()
+    // The harness's default helper is at CANDLE_FIDO2_HELPER; fetch stays unreachable, so any
+    // network call would surface as a failure.
+    const h = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN, v.passphrase] })
+    expect(await run(["vault", "enroll", "security-key", "--install-helper", "--keystore", v.vaultPath], h.deps)).toBe(
+      0,
+    )
+    expect(humanText(h.stderr.text)).toContain(humanText("candle-fido2 is already at"))
+    expect(humanText(h.stderr.text)).toContain(humanText("nothing downloaded"))
+    expect(humanText(h.stdout.text)).toContain(humanText("Added security key factor"))
+  })
+
+  test("on an npm install the flag cannot help and says so, without touching the network", async () => {
+    const v = await initVault()
+    const h = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, helper: "absent" })
+    // The harness default execPath is node: a script install (D10).
+    expect(
+      await run(
+        ["vault", "factor", "add", "security-key", "--install-helper", "--keystore", v.vaultPath, "--json"],
+        h.deps,
+      ),
+    ).toBe(1)
+    const body = JSON.parse(h.stdout.text) as { code: string; message: string }
+    expect(body.code).toBe("VAULT_HELPER_MISSING")
+    expect(body.message).toContain("ships no candle-fido2 executable")
+  })
+})
+
+// ── BE-294: the unlock factor menu ────────────────────────────────────────────────────────────
+
+const CRED_A = CRED
+const CRED_B = base64.encode(new Uint8Array(48).fill(5))
+const D1 = "/dev/hidraw3"
+const D2 = "/dev/hidraw4"
+const deviceIdAt = (path: string) => deviceIdFor({ path, aaguid: AAGUID })
+
+/** A vault with a passphrase, then key A (`yubikey-a`), then key B (`yubikey-b`), in that file order. */
+async function vaultWithTwoKeys(labels: { a?: string; b?: string } = {}) {
+  const v = await initVault()
+  const addKey = async (label: string, credentialId: string) => {
+    const add = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      secrets: [PIN, v.passphrase],
+      script: { ...goodScript(), register: { credentialId, aaguid: AAGUID, authData: UV } },
+    })
+    // BE-337 (D1): once the vault has a key, `factor add security-key` offers it as the opener;
+    // `--factor passphrase` keeps these fixtures on the passphrase path.
+    const code = await run(
+      ["vault", "factor", "add", "security-key", "--label", label, "--factor", "passphrase", "--keystore", v.vaultPath],
+      add.deps,
+    )
+    if (code !== 0) throw new Error(`factor add security-key failed (${code}): ${add.stderr.text}${add.stdout.text}`)
+  }
+  await addKey(labels.a ?? "yubikey-a", CRED_A)
+  await addKey(labels.b ?? "yubikey-b", CRED_B)
+  const keys = (await readVault(v.vaultPath)).envelopes.filter((envelope) => envelope.factor === "passkey-prf")
+  return { ...v, aId: keys[0]?.id as string, bId: keys[1]?.id as string }
+}
+
+/** One or two YubiKeys, with what each holds as the probe sees it. */
+function menuScript(
+  devices: string[],
+  probe: Record<string, Record<string, "present" | "absent" | "unknown">>,
+): HelperScript {
+  return { ...goodScript(), devices: devices.map((path) => yubikey(path)), probe }
+}
+
+const ops = (h: Harness) => h.calls.map((call) => call.op)
+
+describe("BE-294: the unlock factor menu", () => {
+  test("T2: a row's number opens that factor; the attached key is row 1", async () => {
+    const v = await vaultWithTwoKeys()
+    const script = () => menuScript([D1], { [D1]: { [CRED_A]: "present" } })
+
+    const one = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, lines: ["1"], secrets: [PIN], script: script() })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], one.deps)).toBe(0)
+    expect(one.asked[0]).toBe(
+      `line: Unlock with:\n  1  yubikey-a  (security key, attached)      id ${v.aId}\n  2  yubikey-b  (security key, not attached)  id ${v.bId}\n  3  Passphrase\n> `,
+    )
+    expect(one.calls.filter((call) => call.op === "assert").map((call) => call.credentialId)).toEqual([CRED_A])
+
+    const two = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, lines: ["2"], secrets: [PIN], script: script() })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], two.deps)).toBe(0)
+    expect(two.asked[1]).toContain("PIN for YubiKey 5 NFC")
+    expect(two.calls.filter((call) => call.op === "assert").map((call) => call.credentialId)).toEqual([CRED_B])
+
+    const three = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      lines: ["3"],
+      secrets: [v.passphrase],
+      script: script(),
+    })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], three.deps)).toBe(0)
+    expect(three.asked.slice(1)).toEqual([expect.stringContaining("secret: Vault passphrase")])
+    expect(ops(three)).not.toContain("assert")
+  })
+
+  test("T3: an envelope id and `passphrase` in any case still answer the menu", async () => {
+    const v = await vaultWithTwoKeys()
+    const byId = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, lines: [v.aId], secrets: [PIN] })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], byId.deps)).toBe(0)
+    expect(byId.calls.filter((call) => call.op === "assert").map((call) => call.credentialId)).toEqual([CRED_A])
+    for (const answer of ["passphrase", "Passphrase", " PASSPHRASE "]) {
+      const h = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, lines: [answer], secrets: [v.passphrase] })
+      expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], h.deps), answer).toBe(0)
+      expect(ops(h), answer).not.toContain("assert")
+    }
+  })
+
+  test("T4: anything else is refused once, typed, with nothing tried and no second prompt", async () => {
+    const v = await vaultWithTwoKeys()
+    for (const answer of ["0", "4", "01", "-1", "", "yubikey-a", "whatever", "1.0", "100"]) {
+      const h = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, lines: [answer] })
+      expect(await run(["vault", "status", "--unlock", "--json", "--keystore", v.vaultPath], h.deps), answer).toBe(1)
+      expect(JSON.parse(h.stdout.text), answer).toMatchObject({
+        code: "VAULT_FACTOR_UNAVAILABLE",
+        message: `No factor numbered or named ${JSON.stringify(answer)}; nothing was tried.`,
+        suggestion: "Answer a number from 1 to 3, or pass --factor.",
+      })
+      expect(ops(h), answer).not.toContain("assert")
+      expect(h.asked, answer).toHaveLength(1)
+    }
+  })
+
+  test("T5: one attached key does not skip the menu, and is marked and listed first", async () => {
+    const v = await vaultWithTwoKeys()
+    // B is second in the file; only B is attached, so B is row 1.
+    const h = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      lines: ["1"],
+      secrets: [PIN],
+      script: menuScript([D1], { [D1]: { [CRED_B]: "present" } }),
+    })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], h.deps)).toBe(0)
+    expect(h.asked[0]).toContain(`  1  yubikey-b  (security key, attached)      id ${v.bId}\n`)
+    expect(h.asked[0]).toContain(`  2  yubikey-a  (security key, not attached)  id ${v.aId}\n`)
+    expect(h.stderr.text).not.toContain("so the vault opens with it")
+    expect(h.calls.filter((call) => call.op === "assert").map((call) => call.credentialId)).toEqual([CRED_B])
+    // The probe comes first and carries nothing secret; then the one real assertion.
+    expect(ops(h)).toEqual(["probe", "probe", "assert"])
+    expect(h.calls.filter((call) => call.op === "probe").every((call) => call.pin === null && !call.salt)).toBe(true)
+  })
+
+  test("T6: --factor bypasses the probe and the menu entirely", async () => {
+    const v = await vaultWithTwoKeys()
+    const byId = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [PIN] })
+    expect(await run(["vault", "status", "--unlock", "--factor", v.aId, "--keystore", v.vaultPath], byId.deps)).toBe(0)
+    expect(ops(byId)).toEqual(["assert"])
+    expect(byId.asked.some((line) => line.includes("Unlock with:"))).toBe(false)
+
+    const passphrase = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, secrets: [v.passphrase] })
+    expect(
+      await run(["vault", "status", "--unlock", "--factor", "passphrase", "--keystore", v.vaultPath], passphrase.deps),
+    ).toBe(0)
+    expect(ops(passphrase)).toEqual([])
+
+    const one = await vaultWithKey()
+    const byKind = await harness({ env: { CANDLE_CONFIG_DIR: one.dir }, secrets: [PIN] })
+    expect(
+      await run(["vault", "status", "--unlock", "--factor", "security-key", "--keystore", one.vaultPath], byKind.deps),
+    ).toBe(0)
+    expect(ops(byKind)).toEqual(["assert"])
+  })
+
+  test("T7: two attached keys; the chosen row picks its device, --device still wins, --factor still refuses", async () => {
+    const v = await vaultWithTwoKeys()
+    const script = () => menuScript([D1, D2], { [D1]: { [CRED_A]: "present" }, [D2]: { [CRED_B]: "present" } })
+
+    const picked = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, lines: ["2"], secrets: [PIN], script: script() })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], picked.deps)).toBe(0)
+    expect(picked.asked[0]).toContain(`  1  yubikey-a  (security key, attached)  id ${v.aId}\n`)
+    expect(picked.asked[0]).toContain(`  2  yubikey-b  (security key, attached)  id ${v.bId}\n`)
+    const asserted = picked.calls.filter((call) => call.op === "assert")
+    expect(asserted.map((call) => [call.path, call.credentialId])).toEqual([[D2, CRED_B]])
+    expect(humanText(picked.stderr.text)).toContain(
+      humanText(`Using the attached security key: YubiKey 5 NFC (--device ${deviceIdAt(D2)})`),
+    )
+    expect(picked.stderr.text).not.toContain("AMBIGUOUS")
+
+    const named = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      lines: ["2"],
+      secrets: [PIN],
+      script: { ...script(), assert: { error: { code: "NO_CREDENTIAL", message: "FIDO_ERR_NO_CREDENTIALS" } } },
+    })
+    expect(
+      await run(
+        ["vault", "status", "--unlock", "--json", "--device", deviceIdAt(D1), "--keystore", v.vaultPath],
+        named.deps,
+      ),
+    ).toBe(1)
+    expect(named.calls.filter((call) => call.op === "probe").every((call) => call.path === D1)).toBe(true)
+    // Only d1 was asked, so B (on d2) is left unmarked rather than called not attached.
+    expect(named.asked[0]).toContain(`  1  yubikey-a  (security key, attached)  id ${v.aId}\n`)
+    expect(named.asked[0]).toContain(`  2  yubikey-b  (security key)            id ${v.bId}\n`)
+    expect(JSON.parse(named.stdout.text)).toMatchObject({ code: "VAULT_CREDENTIAL_NOT_PRESENT" })
+
+    const flagged = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, script: script() })
+    expect(
+      await run(["vault", "status", "--unlock", "--json", "--factor", v.aId, "--keystore", v.vaultPath], flagged.deps),
+    ).toBe(1)
+    expect(JSON.parse(flagged.stdout.text)).toMatchObject({ code: "VAULT_AUTHENTICATOR_AMBIGUOUS" })
+    expect(ops(flagged)).toEqual([])
+  })
+
+  test("T8: a failed or uncertain probe drops the markers, keeps file order, prints nothing, and unlocks by number", async () => {
+    const v = await vaultWithTwoKeys()
+    const unmarked = (asked: string) => {
+      expect(asked).toContain(`  1  yubikey-a  (security key)  id ${v.aId}\n`)
+      expect(asked).toContain(`  2  yubikey-b  (security key)  id ${v.bId}\n`)
+    }
+
+    // An older helper refuses the op before touching any device.
+    const older = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, lines: ["2"], secrets: [PIN] })
+    const inner = older.deps.spawnHelper
+    older.deps.spawnHelper = async (path, line, o) => {
+      if ((JSON.parse(line) as { op: string }).op !== "probe") return inner(path, line, o)
+      const refusal = { ok: false, protocol: 1, code: "BAD_REQUEST", message: 'unknown op "probe"' }
+      return { stdout: `${JSON.stringify(refusal)}\n`, stderr: "", exitCode: 1, signal: null }
+    }
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], older.deps)).toBe(0)
+    unmarked(older.asked[0] as string)
+    expect(older.stderr.text).not.toContain("BAD_REQUEST")
+    expect(older.stderr.text).not.toContain("probe")
+    expect(older.calls.filter((call) => call.op === "assert").map((call) => call.credentialId)).toEqual([CRED_B])
+
+    // Unknown for A: A has no marker; B, absent from a readable device, is still not attached.
+    const uncertain = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      lines: ["1"],
+      secrets: [PIN],
+      script: menuScript([D1], { [D1]: { [CRED_A]: "unknown" } }),
+    })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], uncertain.deps)).toBe(0)
+    expect(uncertain.asked[0]).toContain(`  1  yubikey-a  (security key)                id ${v.aId}\n`)
+    expect(uncertain.asked[0]).toContain(`  2  yubikey-b  (security key, not attached)  id ${v.bId}\n`)
+
+    // A device this user cannot read: no key can be called not attached.
+    const unreadable = await harness({
+      env: { CANDLE_CONFIG_DIR: v.dir },
+      lines: ["passphrase"],
+      secrets: [v.passphrase],
+      script: { ...goodScript(), devices: [yubikey(D1), yubikey(D2, { unreadable: true })], probe: {} },
+    })
+    expect(await run(["vault", "status", "--unlock", "--keystore", v.vaultPath], unreadable.deps)).toBe(0)
+    unmarked(unreadable.asked[0] as string)
+  })
+
+  test("T9: without a TTY there is no probe, no helper spawn and no menu; the prompt refuses as before", async () => {
+    const v = await vaultWithTwoKeys()
+    for (const json of [false, true]) {
+      const h = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, tty: false })
+      let spawned = 0
+      h.deps.spawnHelper = async () => {
+        spawned++
+        throw new Error("no helper may be spawned without a TTY")
+      }
+      // The production prompt's own guard (`promptVisibleLine`), which throws before writing.
+      h.deps.promptLine = async () => {
+        throw new Error("No TTY available for interactive input; this command cannot run unattended")
+      }
+      const args = ["vault", "status", "--unlock", ...(json ? ["--json"] : []), "--keystore", v.vaultPath]
+      expect(await run(args, h.deps)).toBe(1)
+      expect(spawned).toBe(0)
+      expect(h.calls).toEqual([])
+      // The command's own terminal refusal comes first, unchanged from 0.11.5.
+      expect(humanText(h.stdout.text + h.stderr.text)).toContain(humanText("vault status --unlock needs a terminal"))
+      expect(h.stdout.text + h.stderr.text).not.toContain("Unlock with:")
+    }
+
+    // And at the chooser itself: the one `promptLine` refuses as it always did, and nothing ran first.
+    const h = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, tty: false })
+    let spawned = 0
+    h.deps.spawnHelper = async () => {
+      spawned++
+      throw new Error("no helper may be spawned without a TTY")
+    }
+    h.deps.promptLine = async () => {
+      throw new Error("No TTY available for interactive input; this command cannot run unattended")
+    }
+    const ctx = { deps: h.deps, json: false, apiUrl: "http://unused.invalid" } as unknown as CommandContext
+    const raw = await readFile(v.vaultPath, "utf8")
+    await expect(unlockInteractively(ctx, v.vaultPath, raw)).rejects.toThrow("No TTY available for interactive input")
+    expect(spawned).toBe(0)
+  })
+
+  test("T12: labels cannot drive the terminal or reorder the row, and fall back to the product", async () => {
+    const bidi = ["؜", "‎", "‏", "‪", "‫", "‬", "‭", "‮"]
+    bidi.push("⁦", "⁧", "⁨", "⁩")
+    const v = await vaultWithTwoKeys({ a: "evil\u001b[2J\nkey", b: `x${bidi.join("")}y` })
+    const h = await harness({ env: { CANDLE_CONFIG_DIR: v.dir }, lines: ["nope"] })
+    expect(await run(["vault", "status", "--unlock", "--json", "--keystore", v.vaultPath], h.deps)).toBe(1)
+    const menu = h.asked[0] as string
+    expect(menu).not.toContain("\u001b")
+    expect(menu).toContain("evil [2J key")
+    for (const character of bidi) expect(menu).not.toContain(character)
+    expect(menu).toContain(`x${" ".repeat(bidi.length)}y`)
+
+    const only = await vaultWithTwoKeys({ a: bidi.join(""), b: "yubikey-b" })
+    const fallback = await harness({ env: { CANDLE_CONFIG_DIR: only.dir }, lines: ["nope"] })
+    expect(await run(["vault", "status", "--unlock", "--json", "--keystore", only.vaultPath], fallback.deps)).toBe(1)
+    expect(fallback.asked[0]).toContain(`  1  YubiKey 5 NFC  (security key)  id ${only.aId}\n`)
+  })
+})

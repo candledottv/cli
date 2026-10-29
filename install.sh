@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# Candle CLI installer. Downloads the signed release binary for this machine into ~/.local/bin,
+# checks its SHA-256 against the release's SHA256SUMS and manifest (consistency), verifies its
+# Sigstore signature with cosign or gh (the actual verification; the install fails closed without
+# one unless CANDLE_INSTALL_ALLOW_UNSIGNED=1), and prepends the bin dir to PATH. The security key
+# helper (candle-fido2, Ember Phase 2 PR E) is fetched and verified the same way and installed
+# beside the binary; a release that predates it is installed without one, and says so. Usage:
+#   curl -fsSL https://candle.tv/install.sh | bash
+#   curl -fsSL https://candle.tv/install.sh | bash -s -- --to cli-v0.6.0 --no-modify-path
+# Never uses sudo. Writes only the bin dir, a temp dir, and (unless --no-modify-path) one rc file.
+set -euo pipefail
+
+BIN_DIR="${CANDLE_INSTALL_DIR:-$HOME/.local/bin}"
+VERSION_TAG=""
+MODIFY_PATH=1
+FORCE=0
+# Keep these literals identical to packages/cli/release-homes.json and to identityRegex() and
+# RELEASE_ISSUER in packages/cli/src/release.ts; release.test.ts greps this file for them.
+# Versions through BRIDGE_VERSION are released from LEGACY_REPOSITORY, later ones from
+# CURRENT_REPOSITORY, and each is verified against its own home's identity only.
+BRIDGE_VERSION='0.12.0'
+LEGACY_REPOSITORY='candledottv/agentic'
+CURRENT_REPOSITORY='candledottv/cli'
+IDENTITY_REGEX='^https://github.com/candledottv/agentic/\.github/workflows/release\.yaml@refs/tags/cli-v'
+CURRENT_IDENTITY_REGEX='^https://github.com/candledottv/cli/\.github/workflows/release\.yaml@refs/tags/cli-v'
+ISSUER='https://token.actions.githubusercontent.com'
+# Where an unpinned install looks for the latest release. "legacy" until the switch (spec
+# 2026-10-23-candle-github, section 9, step 4), when it becomes "current" in the same change as the
+# tap formula and package metadata.
+DEFAULT_HOME='legacy'
+
+usage() {
+  cat <<EOF
+Candle CLI installer
+  --to <tag>          Install a specific release (default: latest), e.g. cli-v0.6.0
+                      (--version <tag> is an alias; the CLI's own flag is: candle update --to)
+  --bin-dir <dir>     Where to put the binary (default: ~/.local/bin)
+  --no-modify-path    Do not edit your shell rc file
+  --force             Install even if Homebrew already provides candle
+EOF
+}
+
+require_arg() {
+  # $1: the flag name, for the message. Guards "$2" (the loop's remaining-args count) so a flag
+  # given as the last argument prints usage and exits 2, instead of tripping "set -u" on "$2".
+  [ "$2" -ge 2 ] || { echo "install.sh: $1 requires an argument" >&2; usage >&2; exit 2; }
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    # `--to` is the spelling `candle update` uses; `--version` is kept because it is what this
+    # script has always taken and what is already pasted in READMEs and issues.
+    --to|--version) require_arg "$1" "$#"; VERSION_TAG="$2"; shift 2 ;;
+    --to=*|--version=*) VERSION_TAG="${1#*=}"; shift ;;
+    --bin-dir) require_arg "$1" "$#"; BIN_DIR="$2"; shift 2 ;;
+    --bin-dir=*) BIN_DIR="${1#*=}"; shift ;;
+    --no-modify-path) MODIFY_PATH=0; shift ;;
+    --force) FORCE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# A leading ~ in --bin-dir or $CANDLE_INSTALL_DIR (the shell does not expand it inside a quoted
+# assignment, and this runs before any quoting the caller did): expand it to $HOME ourselves.
+BIN_DIR="${BIN_DIR/#\~/$HOME}"
+
+fail() { echo "install.sh: $*" >&2; exit 1; }
+
+# 1. Platform.
+os="$(uname -s)"; machine="$(uname -m)"
+case "$os" in
+  Darwin) os="darwin" ;;
+  Linux) os="linux" ;;
+  MINGW*|MSYS*|CYGWIN*) fail "Windows is not supported by install.sh yet. Run: npm i -g @candledottv/cli" ;;
+  *) fail "Unsupported OS: $os. Supported: darwin-arm64, darwin-x64, linux-x64, linux-arm64" ;;
+esac
+case "$machine" in
+  arm64|aarch64) arch="arm64" ;;
+  x86_64|amd64) arch="x64" ;;
+  *) fail "Unsupported architecture: $machine. Supported: darwin-arm64, darwin-x64, linux-x64, linux-arm64" ;;
+esac
+# The darwin binaries are Bun builds linked for macOS 13 or later: `otool -l` reads `minos 13.0` on
+# both architectures of every release from cli-v0.6.0 to cli-v0.10.0, and on candle-fido2. They are
+# not built to run on macOS 12, so an install there would succeed and then fail at run time. Refuse
+# before downloading anything, and name the package that does run there (npm, on Node). An
+# unreadable version proceeds: the check exists to save a wasted install, not to guess.
+if [ "$os" = "darwin" ] && command -v sw_vers >/dev/null 2>&1; then
+  macos_version="$(sw_vers -productVersion 2>/dev/null || true)"
+  macos_major="${macos_version%%.*}"
+  case "$macos_major" in
+    ''|*[!0-9]*) ;;
+    *) [ "$macos_major" -ge 13 ] || fail "macOS $macos_version is too old: the Candle CLI binary needs macOS 13 (Ventura) or later. On this Mac, install the npm package instead, which runs on Node 18 or later: npm i -g @candledottv/cli" ;;
+  esac
+fi
+asset="candle-${os}-${arch}"
+helper="candle-fido2-${os}-${arch}"
+
+# 2. Tools.
+command -v curl >/dev/null 2>&1 || fail "curl is required"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  fail "sha256sum or shasum is required"
+fi
+
+# 7 (early). An existing Homebrew install owns its files; defer to brew unless forced.
+if [ "$FORCE" -eq 0 ] && command -v candle >/dev/null 2>&1; then
+  existing="$(command -v candle)"
+  resolved="$(cd "$(dirname "$existing")" && pwd -P)/$(basename "$existing")"
+  if [ -L "$existing" ]; then resolved="$(readlink "$existing")"; fi
+  case "$resolved" in
+    */Cellar/candle/*|/opt/homebrew/*|/usr/local/Cellar/*)
+      echo "candle is installed by Homebrew at $existing. Run: brew upgrade candle (or rerun with --force)."
+      exit 0 ;;
+  esac
+fi
+
+# The home a version is released from: through the bridge, legacy; after it, current. $1 must
+# already be three dot-separated numbers.
+home_of() {
+  local a b c x y z
+  IFS=. read -r a b c <<< "$1"
+  IFS=. read -r x y z <<< "$BRIDGE_VERSION"
+  if [ "$a" -ne "$x" ]; then [ "$a" -lt "$x" ] && echo legacy || echo current; return; fi
+  if [ "$b" -ne "$y" ]; then [ "$b" -lt "$y" ] && echo legacy || echo current; return; fi
+  [ "$c" -le "$z" ] && echo legacy || echo current
+}
+repository_of() { if [ "$1" = legacy ]; then echo "$LEGACY_REPOSITORY"; else echo "$CURRENT_REPOSITORY"; fi; }
+
+# 3. Resolve the release. A pinned tag's version decides its home (the documented `--to` lookup
+# rule); otherwise DEFAULT_HOME. CANDLE_RELEASE_BASE_URL moves where bytes come from, never which
+# identity they must carry.
+fetch_home="$DEFAULT_HOME"
+if [ -n "$VERSION_TAG" ]; then
+  printf '%s' "$VERSION_TAG" | grep -Eq '^cli-v[0-9]+\.[0-9]+\.[0-9]+$' \
+    || fail "--to takes a release tag such as cli-v0.11.39, not ${VERSION_TAG}"
+  fetch_home="$(home_of "${VERSION_TAG#cli-v}")"
+fi
+RELEASE_BASE="${CANDLE_RELEASE_BASE_URL:-https://github.com/$(repository_of "$fetch_home")}"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+if [ -n "$VERSION_TAG" ]; then
+  download_base="${RELEASE_BASE}/releases/download/${VERSION_TAG}"
+else
+  download_base="${RELEASE_BASE}/releases/latest/download"
+fi
+# Pin the protocol so a redirect cannot downgrade an https release fetch to plain http. Left empty
+# for a non-https RELEASE_BASE (the fixture server in tests, and any --bin-dir-style local override).
+CURL_OPTS=()
+case "$RELEASE_BASE" in
+  https://*) CURL_OPTS=(--proto '=https' --proto-redir '=https') ;;
+esac
+curl "${CURL_OPTS[@]+"${CURL_OPTS[@]}"}" -fsSL "${download_base}/latest.json" -o "$tmp/latest.json" || fail "could not fetch the release manifest from ${download_base}/latest.json"
+version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$tmp/latest.json" | head -1)"
+[ -n "$version" ] || fail "the release manifest has no version"
+
+# Bind signature verification to the version actually being installed.
+#
+# IDENTITY_REGEX above ends at `cli-v`, so on its own it accepts a signature minted for ANY cli-v
+# tag. That is a signed downgrade: ask for 0.8.0, be handed a legitimately signed 0.3.0 with known
+# holes, and verification passes. `candle verify` and `candle update` already pin the exact tag
+# through releaseIdentityUri(); this is the installer catching up.
+#
+# The version is VALIDATED before it reaches the identity, not trusted. It comes out of a
+# downloaded latest.json, which is exactly the input an attacker controls, and release.ts records
+# what an unvalidated one does: `{"version": "x|"}` yields an identity whose alternation matches
+# every identity there is, so a file signed by an unrelated project verifies.
+printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+  || fail "the release manifest has a malformed version: ${version}"
+# A manifest describing a different version than the tag we asked for is a mismatch worth stopping
+# on, not reconciling.
+if [ -n "$VERSION_TAG" ] && [ "$VERSION_TAG" != "cli-v${version}" ]; then
+  fail "requested ${VERSION_TAG} but the manifest at that tag describes cli-v${version}; nothing installed"
+fi
+# The origin check: a manifest read from one home must name a version that home releases. A
+# manifest cannot move a version to the other home's signer.
+version_home="$(home_of "$version")"
+if [ "$version_home" != "$fetch_home" ]; then
+  fail "the release manifest from $(repository_of "$fetch_home") names ${version}, which is released from $(repository_of "$version_home"); nothing installed"
+fi
+release_repository="$(repository_of "$version_home")"
+if [ "$version_home" = legacy ]; then identity_regex="$IDENTITY_REGEX"; else identity_regex="$CURRENT_IDENTITY_REGEX"; fi
+# The ONE pin, consumed by both verifier branches below. The signing certificate's SAN is
+# `<workflow file>@<tag ref>`, a single string that carries the workflow and the tag together, so
+# pinning it exactly pins both with no regex and no escaping step in between. It is the same
+# string releaseIdentityUri() builds for `candle update` and `candle verify`, and the same one the
+# release job self-verifies against, so three verifiers check one value.
+identity_exact="https://github.com/${release_repository}/.github/workflows/release.yaml@refs/tags/cli-v${version}"
+
+# 4 and 5. Download and verify: the checksum against SHA256SUMS and the manifest, then the
+# signature where a verifier exists. One function, run for the binary and again for the helper, so
+# the two cannot drift apart in what they check.
+curl "${CURL_OPTS[@]+"${CURL_OPTS[@]}"}" -fsSL "${download_base}/SHA256SUMS" -o "$tmp/SHA256SUMS" || fail "could not fetch SHA256SUMS"
+
+# $1: the asset name. Downloads it and its bundle into $tmp, checks both checksums, and verifies
+# the signature. Sets verified=1 when a verifier ran, 0 when the install rests on the checksum.
+verify_asset() {
+  local name="$1"
+  curl "${CURL_OPTS[@]+"${CURL_OPTS[@]}"}" -fsSL "${download_base}/${name}.sigstore.json" -o "$tmp/$name.sigstore.json" || fail "could not fetch the signature bundle for $name"
+  local actual expected_sums expected_manifest
+  actual="$(sha256 "$tmp/$name")"
+  expected_sums="$(awk -v a="$name" '$2 == a {print $1}' "$tmp/SHA256SUMS")"
+  # The release workflow pretty-prints latest.json, so an asset's "name" and "sha256" fields usually
+  # sit on different lines and a line-oriented sed can't see them together. Strip all whitespace
+  # first so the whole file collapses to one line, regardless of how it was printed.
+  expected_manifest="$(tr -d '[:space:]' < "$tmp/latest.json" | sed -n "s/.*\"${name}\"[^}]*\"sha256\":\"\([0-9a-f]*\)\".*/\1/p")"
+  [ "$actual" = "$expected_sums" ] || fail "checksum mismatch for $name (SHA256SUMS says $expected_sums, file is $actual); nothing installed"
+  [ -n "$expected_manifest" ] || fail "latest.json has no sha256 for $name"
+  [ "$actual" = "$expected_manifest" ] || fail "checksum mismatch between SHA256SUMS and latest.json for $name; nothing installed"
+
+  verified=0
+  if command -v cosign >/dev/null 2>&1; then
+    # --new-bundle-format says "expect a Sigstore protobuf bundle", which is what the release
+    # workflow signs and the only shape candle's own in-process verifier reads. Without the flag
+    # cosign also accepts its legacy {"base64Signature","cert","rekorBundle"} shape, so a release
+    # mis-signed that way (0.6.0 was) would install here and then fail every `candle update`.
+    # The flag needs cosign 2.2 or newer; an older cosign rejects the unknown flag and the install
+    # stops, which is the right way to be wrong.
+    if ! verify_output="$(cosign verify-blob --new-bundle-format --bundle "$tmp/$name.sigstore.json" --certificate-identity "$identity_exact" --certificate-oidc-issuer "$ISSUER" "$tmp/$name" 2>&1)"; then
+      echo "$verify_output" >&2
+      fail "signature verification failed for $name; nothing installed"
+    fi
+    verified=1
+  elif command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    # --cert-identity, not just --repo: the repo alone accepts an attestation from ANY workflow in
+    # the release's home repository that can mint one. The exact identity is the certificate's SAN, which
+    # names the workflow FILE and the TAG in one string, so this branch checks exactly what the
+    # cosign branch above checks: the same $identity_exact, passed to a different verifier.
+    #
+    # Nothing else from gh's identity flag group beside it: gh puts --cert-identity, its regex
+    # form and the two signer-* flags in one mutually exclusive group, and has since the
+    # signer-workflow flag first shipped (gh 2.52.0). Passing two of them is refused before a
+    # byte is read, which is what broke every install on a machine with gh and without cosign.
+    # And the signer-workflow flag alone would be weaker, not equivalent: it asserts the workflow
+    # file, a prefix of the SAN, and accepts any tag's attestation. release.test.ts greps this
+    # file for that flag, and install-script.test.ts replays this exact argv against the real gh,
+    # so the pair cannot come back.
+    if ! verify_output="$(gh attestation verify "$tmp/$name" --repo "$release_repository" --cert-identity "$identity_exact" 2>&1)"; then
+      echo "$verify_output" >&2
+      fail "signature verification failed for $name (gh attestation verify); nothing installed"
+    fi
+    verified=1
+  fi
+  if [ "$verified" -eq 0 ]; then
+    if [ "${CANDLE_INSTALL_ALLOW_UNSIGNED:-}" != "1" ]; then
+      # Named per platform, and only ways that work. This used to say "apt/dnf install cosign";
+      # cosign is packaged in neither Debian/Ubuntu nor Fedora, so the one instruction a Linux user
+      # was handed could only fail. Upstream ships a single static binary, and gh is the other route.
+      fail "no signature verifier found, so the download is not verified and nothing was installed. This binary will hold API keys and wallet signers, so the installer stops here by default. Install one and rerun: on macOS, brew install cosign; on Linux, download cosign from https://github.com/sigstore/cosign/releases (a single binary) or run gh auth login for the GitHub CLI. To install on the checksum alone: CANDLE_INSTALL_ALLOW_UNSIGNED=1 curl -fsSL https://candle.tv/install.sh | bash"
+    fi
+    echo "Warning: signature not verified for $name (CANDLE_INSTALL_ALLOW_UNSIGNED=1); the checksum matched. To verify later:"
+    echo "  cosign verify-blob --new-bundle-format --bundle ${name}.sigstore.json --certificate-identity-regexp '${identity_regex}' --certificate-oidc-issuer ${ISSUER} ${name}"
+  fi
+}
+
+curl "${CURL_OPTS[@]+"${CURL_OPTS[@]}"}" -fsSL "${download_base}/${asset}" -o "$tmp/$asset" || fail "no release binary for ${os}-${arch} at ${download_base}/${asset}"
+verify_asset "$asset"
+
+# The manifest decides whether this platform ships a security key helper. A declared helper
+# must download and verify before any install is written, just like the Secure Enclave helper.
+helper_present=0
+if tr -d '[:space:]' < "$tmp/latest.json" | grep -Fq "\"name\":\"${helper}\""; then
+  curl "${CURL_OPTS[@]+"${CURL_OPTS[@]}"}" -fsSL "${download_base}/${helper}" -o "$tmp/$helper" \
+    || fail "the release manifest declares the security key helper ${helper} but it could not be downloaded; nothing installed"
+  verify_asset "$helper"
+  helper_present=1
+else
+  echo "Note: release ${version} has no ${helper} asset in its manifest, so the security key factor is not installed (it needs CLI 0.11.0 or newer)."
+fi
+
+# The signed Secure Enclave helper (Ember Phase 2 PR F), macOS only. Whether a release carries it
+# is the MANIFEST's word, not a download's: a release cut with the helper omitted
+# (release-policy.json "omit", the state until Apple approves the enrolment) has no macosHelper
+# entry in latest.json, and that is a valid omission; a release whose manifest declares one must
+# deliver it, so a failed download or a failed check of a declared helper stops the install with
+# nothing installed, rather than quietly installing a CLI without the helper its release promised.
+# The declared name must be exactly the archive this version's release job produces. It installs
+# as a bundle beside candle, which is where the CLI looks.
+enclave_zip="$(tr -d '[:space:]' < "$tmp/latest.json" | sed -n 's/.*"macosHelper":{"name":"\([^"]*\)".*/\1/p')"
+enclave_present=0
+if [ "$os" = "darwin" ]; then
+  if [ -n "$enclave_zip" ]; then
+    [ "$enclave_zip" = "candle-enclave-${version}.app.zip" ] \
+      || fail "the release manifest declares a Secure Enclave helper named ${enclave_zip}, not candle-enclave-${version}.app.zip; nothing installed"
+    curl "${CURL_OPTS[@]+"${CURL_OPTS[@]}"}" -fsSL "${download_base}/${enclave_zip}" -o "$tmp/$enclave_zip" \
+      || fail "the release manifest declares the Secure Enclave helper ${enclave_zip} but it could not be downloaded from ${download_base}; nothing installed"
+    verify_asset "$enclave_zip"
+    enclave_present=1
+  else
+    echo "Note: release ${version} ships no signed Secure Enclave helper (its manifest declares none), so the Touch ID factor is not installed (it arrives in a later release, once Apple has approved the signing enrolment)."
+  fi
+fi
+
+# 6. Install atomically. $tmp is often a different filesystem than $BIN_DIR (tmpfs on Linux), and
+# mv across filesystems is a copy, not a rename, so it is not atomic and a rerun over an existing
+# install could leave candle missing or truncated if interrupted mid-copy. Stage the final bytes
+# inside BIN_DIR itself so the last step is a same-filesystem rename.
+mkdir -p "$BIN_DIR"
+# mktemp, not ".candle.new.$$": a PID is guessable and short-lived, so on a shared or
+# group-writable bin dir somebody can create that exact path first and have `mv` move THEIR file
+# over candle. mktemp creates the file itself and fails rather than reusing one that exists.
+staged="$(mktemp "$BIN_DIR/.candle.new.XXXXXX")"
+staged_helper=""
+if [ "$helper_present" -eq 1 ]; then staged_helper="$(mktemp "$BIN_DIR/.candle-fido2.new.XXXXXX")"; fi
+staged_enclave=""
+if [ "$enclave_present" -eq 1 ]; then staged_enclave="$(mktemp -d "$BIN_DIR/.candle-enclave.new.XXXXXX")"; fi
+trap 'rm -rf "$tmp" "$staged" "$staged_helper" "$staged_enclave"' EXIT
+cp "$tmp/$asset" "$staged"
+chmod 755 "$staged"
+mv -f "$staged" "$BIN_DIR/candle"
+if [ "$helper_present" -eq 1 ]; then
+  # Beside the binary, which is where the CLI looks (or set CANDLE_FIDO2_HELPER to point elsewhere).
+  cp "$tmp/$helper" "$staged_helper"
+  chmod 755 "$staged_helper"
+  mv -f "$staged_helper" "$BIN_DIR/candle-fido2"
+fi
+if [ "$enclave_present" -eq 1 ]; then
+  # ditto keeps the bundle's signature and notarization ticket intact; the staged directory is
+  # on BIN_DIR's filesystem so the final step is one rename of the bundle directory.
+  ditto -x -k "$tmp/$enclave_zip" "$staged_enclave"
+  [ -x "$staged_enclave/candle-enclave.app/Contents/MacOS/candle-enclave" ] || fail "the Secure Enclave helper archive does not contain candle-enclave.app; nothing installed for it"
+  rm -rf "$BIN_DIR/candle-enclave.app"
+  mv "$staged_enclave/candle-enclave.app" "$BIN_DIR/candle-enclave.app"
+fi
+
+# 7. An npm-global candle elsewhere on PATH: say which one wins.
+if command -v candle >/dev/null 2>&1; then
+  other="$(command -v candle)"
+  if [ "$other" != "$BIN_DIR/candle" ] && head -c 2 "$other" 2>/dev/null | grep -q '#!'; then
+    echo "Note: another candle is on PATH at $other (an npm install). PATH order decides which runs; remove it with: npm uninstall -g @candledottv/cli"
+  fi
+fi
+
+# 8. PATH. The block PREPENDS the bin dir and is appended at the END of the rc, so it runs after
+# anything else the file sets: ~/.local/bin/candle beats an npm candle in /usr/local/bin.
+# shellcheck disable=SC2016 # literal text for the rc file; it expands when that file is sourced, not here
+export_line='export PATH="$HOME/.local/bin:$PATH"'
+if [ "$BIN_DIR" != "$HOME/.local/bin" ]; then export_line="export PATH=\"$BIN_DIR:\$PATH\""; fi
+# shellcheck disable=SC2016 # literal text for the "For this session" hint; $PATH is fish's own variable, not ours
+fish_line="set -gx PATH $BIN_DIR \$PATH"
+case ":$PATH:" in
+  *":$BIN_DIR:"*) on_path=1 ;;
+  *) on_path=0 ;;
+esac
+if [ "$on_path" -eq 0 ]; then
+  case "${SHELL:-}" in
+    */fish) session_line="$fish_line" ;;
+    *) session_line="$export_line" ;;
+  esac
+  if [ "$MODIFY_PATH" -eq 1 ]; then
+    case "${SHELL:-}" in
+      */zsh) rc="$HOME/.zshrc"; line="$export_line" ;;
+      */fish) rc="$HOME/.config/fish/config.fish"; line="fish_add_path --prepend $BIN_DIR" ;;
+      *) if [ -f "$HOME/.bashrc" ]; then rc="$HOME/.bashrc"; else rc="$HOME/.bash_profile"; fi; line="$export_line" ;;
+    esac
+    mkdir -p "$(dirname "$rc")"
+    if ! grep -qs "# candle installer" "$rc"; then
+      printf '\n# candle installer\n%s\n' "$line" >> "$rc"
+      echo "Added $BIN_DIR to PATH in $rc"
+    fi
+  fi
+  echo "For this session: $session_line"
+fi
+
+# 9. Prove it.
+echo "Installed candle $version to $BIN_DIR/candle"
+"$BIN_DIR/candle" --version
+if [ "$helper_present" -eq 1 ]; then
+  echo "Installed candle-fido2 to $BIN_DIR/candle-fido2 (security keys need libfido2: brew install libfido2, or your distribution's libfido2 package)"
+fi
+if [ "$enclave_present" -eq 1 ]; then
+  echo "Installed the signed Secure Enclave helper to $BIN_DIR/candle-enclave.app (the Touch ID factor: candle vault factor add touch-id)"
+fi
+echo "Shell completions: candle completion zsh|bash|fish"
+echo "Next: candle setup"

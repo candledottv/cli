@@ -1,0 +1,704 @@
+/**
+ * Ember Phase 3 PR F (BE-226, R6): `candle sign` and `candle sign message` through `run()`.
+ *
+ * Every refusal in the BYO matrix, each asserted WITH `--yes` where the matrix says so, because the
+ * flag skips the confirmation prompt and nothing else: a vault or TEE signer, an unnamed external
+ * signer, a failing or unreachable simulation, an undecodable input (nothing displayed), a v0
+ * transaction whose lookup table cannot be fetched (nothing displayed), and the happy path with the
+ * display carrying the signing wallet's own deltas and naming every other recipient.
+ */
+import { describe, expect, setDefaultTimeout, test } from "bun:test"
+import { ed25519 } from "@noble/curves/ed25519"
+import { base58 } from "@scure/base"
+import {
+  AddressLookupTableAccount,
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  Transaction,
+  TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+} from "@solana/web3.js"
+import type { Deps } from "../deps"
+import { humanText } from "../human-output.test-support"
+import { run } from "../index"
+import { displayWidth } from "../presentation"
+import { ADDRESS_LOOKUP_TABLE_PROGRAM_ID, decodeTransaction } from "../solana-alt"
+import { SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID } from "../solana-lite"
+import { createCapture, createFakeConfigStore, createRoutedFetch, createTestDeps, jsonResponse } from "../test-support"
+import type { KeyEntry } from "../vault/format"
+import { deriveSolanaKey, solanaExternalPath, solanaTeePath, solanaVaultPath } from "../vault/hd"
+import { closeVault, commitVault, freshKeyId, sealKeyBlob } from "../vault/store"
+import { FIXTURE_ENTROPY, makeVault, testClock, useCheapKdf } from "../vault/test-vault"
+import { renderableAsText } from "./sign"
+
+setDefaultTimeout(90_000)
+useCheapKdf()
+
+const RPC = "https://rpc.test/rpc"
+const BLOCKHASH = "EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N"
+const entropy = () => Uint8Array.from(FIXTURE_ENTROPY)
+const external0 = await deriveSolanaKey(entropy(), solanaExternalPath(0))
+const external1 = await deriveSolanaKey(entropy(), solanaExternalPath(1))
+const vault0 = await deriveSolanaKey(entropy(), solanaVaultPath(0))
+const tee0 = await deriveSolanaKey(entropy(), solanaTeePath(0))
+const recipient = Keypair.generate().publicKey
+
+interface RawAccount {
+  owner: string
+  lamports: number
+  data: Uint8Array
+}
+
+function account(owner: string, lamports: number, data: Uint8Array = new Uint8Array(0)): RawAccount {
+  return { owner, lamports, data }
+}
+
+function encode(raw: RawAccount | null) {
+  return raw === null
+    ? null
+    : {
+        owner: raw.owner,
+        lamports: raw.lamports,
+        data: [Buffer.from(raw.data).toString("base64"), "base64"],
+        executable: false,
+        rentEpoch: 0,
+      }
+}
+
+interface RpcScript {
+  pre: Record<string, RawAccount | null>
+  /** What the simulation answers for each account; defaults to the pre-state (no change). */
+  post?: Record<string, RawAccount | null>
+  simulateErr?: unknown
+  unreachable?: boolean
+  sendFails?: boolean
+  /** BE-355 (T11): the send answers HTTP 429; the client never retries a send. */
+  sendRateLimited?: boolean
+}
+
+/** The scripted RPC: pre-state, post-state (what the simulation answers), tables, mints. */
+function rpcFake(script: RpcScript) {
+  const calls: string[] = []
+  let sent: string | undefined
+  const routed = createRoutedFetch({
+    "/rpc": async (req) => {
+      if (script.unreachable) throw new Error("connection refused")
+      const { method, params, id } = JSON.parse(String(req.init.body)) as {
+        method: string
+        params: unknown[]
+        id: number
+      }
+      calls.push(method)
+      const reply = (result: unknown) => jsonResponse(200, { id, jsonrpc: "2.0", result })
+      switch (method) {
+        case "getMultipleAccounts":
+          return reply({ value: ((params[0] as string[]) ?? []).map((address) => encode(script.pre[address] ?? null)) })
+        case "simulateTransaction": {
+          const addresses = ((params[1] as { accounts: { addresses: string[] } }).accounts.addresses ?? []) as string[]
+          return reply({
+            value: {
+              err: script.simulateErr ?? null,
+              logs: script.simulateErr
+                ? ["Program log: refused"]
+                : ["Program 11111111111111111111111111111111 success"],
+              accounts: addresses.map((address) => encode((script.post ?? script.pre)[address] ?? null)),
+              unitsConsumed: 150,
+            },
+          })
+        }
+        case "sendTransaction":
+          if (script.sendRateLimited) return new Response("rate limited", { status: 429 })
+          if (script.sendFails) {
+            return jsonResponse(200, { id, jsonrpc: "2.0", error: { code: -32002, message: "Blockhash not found" } })
+          }
+          sent = String(params[0])
+          return reply("ok")
+        default:
+          throw new Error(`unexpected RPC method ${method}`)
+      }
+    },
+  })
+  return {
+    ...routed,
+    calls,
+    get sent() {
+      return sent
+    },
+  }
+}
+
+/** A vault with external 0 and 1, vault key 0 and a local-candidate TEE entry, all from the fixture root. */
+async function vaultWithEveryRole() {
+  const made = await makeVault()
+  const entries: KeyEntry[] = []
+  const blobs: Awaited<ReturnType<typeof sealKeyBlob>>[] = []
+  const add = async (role: KeyEntry["role"], derived: typeof external0, label: string) => {
+    const id = freshKeyId()
+    blobs.push(await sealKeyBlob(made.vault, id, derived.secret64))
+    entries.push({
+      id,
+      chain: "solana",
+      curve: "ed25519",
+      address: derived.address,
+      label,
+      createdAt: "2026-09-19T00:00:00.000Z",
+      role,
+      origin: "derived",
+      derivation: { scheme: "slip10-ed25519", path: derived.path },
+      exposure: { everRemoteExposed: role === "tee-wallet", everExported: false },
+      ...(role === "tee-wallet"
+        ? { tee: { network: "solana-mainnet" as const, lifecycle: "local-candidate" as const } }
+        : {}),
+    })
+  }
+  await add("vault", vault0, "cold")
+  await add("tee-wallet", tee0, "agent")
+  await add("external", external0, "trader")
+  await add("external", external1, "second")
+  await commitVault(
+    made.vault,
+    {
+      index: {
+        hd: {
+          ...made.vault.index.hd,
+          nextIndex: { ...made.vault.index.hd.nextIndex, solanaVault: 1, solanaTee: 1, solanaExternal: 2 },
+          exposedIndexes: { ...made.vault.index.hd.exposedIndexes, solanaTee: [0] },
+        },
+        entries,
+      },
+      addKeys: blobs,
+    },
+    testClock,
+  )
+  closeVault(made.vault)
+  return made
+}
+
+async function harness(rpc: ReturnType<typeof rpcFake>, input: Uint8Array, extra: Partial<Deps> = {}) {
+  const made = await vaultWithEveryRole()
+  const stdout = createCapture()
+  const stderr = createCapture()
+  let secretPrompts = 0
+  const deps = createTestDeps({
+    ...extra,
+    fetch: rpc.fetch,
+    stdout,
+    stderr,
+    env: { CANDLE_CONFIG_DIR: made.dir },
+    readBytes: async (path) => {
+      if (path !== "tx.txt") throw new Error(`unexpected file ${path}`)
+      return input
+    },
+    readStdin: async () => input,
+    promptSecret: async () => {
+      secretPrompts++
+      return made.passphrase
+    },
+  })
+  return {
+    made,
+    deps,
+    stdout,
+    stderr,
+    get secretPrompts() {
+      return secretPrompts
+    },
+  }
+}
+
+function legacyTransfer(from: PublicKey, lamports = 1_000): Uint8Array {
+  const tx = new Transaction({ feePayer: from, recentBlockhash: BLOCKHASH }).add(
+    SystemProgram.transfer({ fromPubkey: from, toPubkey: recipient, lamports }),
+  )
+  return new Uint8Array(tx.serialize({ requireAllSignatures: false, verifySignatures: false }))
+}
+
+const base64Of = (bytes: Uint8Array) => new TextEncoder().encode(`${Buffer.from(bytes).toString("base64")}\n`)
+
+const systemPre = (lamports: number) => account(SYSTEM_PROGRAM_ID, lamports)
+
+const signArgs = (...extra: string[]) => ["sign", "--file", "tx.txt", "--rpc-url", RPC, ...extra]
+
+describe("candle sign refuses, before any prompt and with --yes", () => {
+  test("a vault key as fee payer is SIGN_SIGNER_NOT_EXTERNAL, and --yes changes nothing", async () => {
+    for (const yes of [[], ["--yes"]]) {
+      const rpc = rpcFake({ pre: {} })
+      const h = await harness(rpc, base64Of(legacyTransfer(new PublicKey(vault0.address))))
+      expect(await run(signArgs("--wallet", "trader", "--json", ...yes), h.deps)).toBe(1)
+      const body = JSON.parse(h.stdout.text.trim())
+      expect(body.code).toBe("SIGN_SIGNER_NOT_EXTERNAL")
+      expect(body.message).toContain(vault0.address)
+      expect(body.message).toContain("a vault key")
+      expect(rpc.calls).not.toContain("simulateTransaction")
+    }
+  })
+
+  test("a TEE wallet as fee payer, and an address this vault does not hold, are each SIGN_SIGNER_NOT_EXTERNAL", async () => {
+    const h = await harness(rpcFake({ pre: {} }), base64Of(legacyTransfer(new PublicKey(tee0.address))))
+    expect(await run(signArgs("--wallet", "trader", "--json", "--yes"), h.deps)).toBe(1)
+    expect(JSON.parse(h.stdout.text.trim())).toMatchObject({
+      code: "SIGN_SIGNER_NOT_EXTERNAL",
+      message: expect.stringContaining("a TEE wallet"),
+    })
+
+    const stranger = await harness(rpcFake({ pre: {} }), base64Of(legacyTransfer(Keypair.generate().publicKey)))
+    expect(await run(signArgs("--wallet", "trader", "--json", "--yes"), stranger.deps)).toBe(1)
+    expect(JSON.parse(stranger.stdout.text.trim())).toMatchObject({
+      code: "SIGN_SIGNER_NOT_EXTERNAL",
+      message: expect.stringContaining("not an address this vault holds"),
+    })
+  })
+
+  test("an external signer the invocation did not name is SIGN_SIGNER_NOT_PROVIDED, never a half-signed transaction", async () => {
+    const h = await harness(rpcFake({ pre: {} }), base64Of(legacyTransfer(new PublicKey(external0.address))))
+    expect(await run(signArgs("--wallet", "second", "--json", "--yes"), h.deps)).toBe(1)
+    const body = JSON.parse(h.stdout.text.trim())
+    expect(body.code).toBe("SIGN_SIGNER_NOT_PROVIDED")
+    expect(body.suggestion).toContain("--wallet trader")
+    expect(body.signedTransaction).toBeUndefined()
+  })
+
+  test("--wallet naming a vault key is refused by role, and --wallet is required", async () => {
+    const h = await harness(rpcFake({ pre: {} }), base64Of(legacyTransfer(new PublicKey(external0.address))))
+    expect(await run(signArgs("--wallet", "cold", "--json", "--yes"), h.deps)).toBe(1)
+    expect(JSON.parse(h.stdout.text.trim()).code).toBe("SIGN_SIGNER_NOT_EXTERNAL")
+    h.stdout.text = ""
+    expect(await run(signArgs("--json"), h.deps)).toBe(2)
+  })
+
+  test("a failing simulation is SIGN_SIMULATION_FAILED with the program error and logs, and --yes offers no override", async () => {
+    const pre = { [external0.address]: systemPre(1_000_000) }
+    for (const yes of [[], ["--yes"]]) {
+      const rpc = rpcFake({ pre, simulateErr: { InstructionError: [0, "Custom"] } })
+      const h = await harness(rpc, base64Of(legacyTransfer(new PublicKey(external0.address))))
+      expect(await run(signArgs("--wallet", "trader", "--json", ...yes), h.deps)).toBe(1)
+      const body = JSON.parse(h.stdout.text.trim())
+      expect(body.code).toBe("SIGN_SIMULATION_FAILED")
+      expect(body.message).toContain("InstructionError")
+      expect(body.message).toContain("Program log: refused")
+      expect(body.message).toContain("no override")
+      expect(rpc.sent).toBeUndefined()
+      // The factor was presented once, to open the vault; never a second time for a signature.
+      expect(h.secretPrompts).toBe(1)
+    }
+  })
+
+  test("an unreachable RPC is SIGN_SIMULATION_FAILED too", async () => {
+    const h = await harness(
+      rpcFake({ pre: {}, unreachable: true }),
+      base64Of(legacyTransfer(new PublicKey(external0.address))),
+    )
+    expect(await run(signArgs("--wallet", "trader", "--json", "--yes"), h.deps)).toBe(1)
+    expect(JSON.parse(h.stdout.text.trim())).toMatchObject({ code: "SIGN_SIMULATION_FAILED" })
+  })
+
+  test("strict-base64 failure, trailing bytes, a truncated transaction and an unsupported message version are SIGN_TRANSACTION_UNDECODABLE with nothing displayed", async () => {
+    const wire = legacyTransfer(new PublicKey(external0.address))
+    const versioned = new Uint8Array([...wire.subarray(0, 65), 0x81, ...wire.subarray(65)])
+    for (const input of [
+      new TextEncoder().encode("not base64 at all!\n"),
+      base64Of(new Uint8Array([...wire, 1, 2])),
+      base64Of(versioned),
+      base64Of(wire.subarray(0, 40)),
+    ]) {
+      const rpc = rpcFake({ pre: {} })
+      const h = await harness(rpc, input)
+      expect(await run(signArgs("--wallet", "trader", "--yes"), h.deps)).toBe(1)
+      expect(humanText(h.stderr.text)).toContain(humanText("not one base64 legacy or v0 transaction"))
+      expect(h.stderr.text).not.toContain("Decoded transaction")
+      expect(rpc.calls).toEqual([])
+      // Nothing was even asked of the vault.
+      expect(h.secretPrompts).toBe(0)
+    }
+  })
+})
+
+/** A v0 transaction from the external wallet whose recipient is loaded from a lookup table. */
+function v0Fixture() {
+  const tableKey = Keypair.generate().publicKey
+  const data = new Uint8Array(56 + 32)
+  const view = new DataView(data.buffer)
+  view.setUint32(0, 1, true)
+  view.setBigUint64(4, 0xffffffffffffffffn, true)
+  data[21] = 0
+  data.set(recipient.toBytes(), 56)
+  const table = new AddressLookupTableAccount({ key: tableKey, state: AddressLookupTableAccount.deserialize(data) })
+  const from = new PublicKey(external0.address)
+  const message = new TransactionMessage({
+    payerKey: from,
+    recentBlockhash: BLOCKHASH,
+    instructions: [
+      SystemProgram.transfer({ fromPubkey: from, toPubkey: recipient, lamports: 7_000 }),
+      new TransactionInstruction({
+        programId: new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"),
+        keys: [],
+        data: Buffer.from("hi"),
+      }),
+    ],
+  }).compileToV0Message([table])
+  const wire = new VersionedTransaction(message).serialize()
+  expect(message.addressTableLookups).toHaveLength(1)
+  return { wire, tableKey: tableKey.toBase58(), tableData: data, message }
+}
+
+describe("candle sign: v0 with lookup tables, the display, the confirmation and the output", () => {
+  test("an unfetchable table is SIGN_LOOKUP_TABLE_UNRESOLVED after decoding, with nothing displayed", async () => {
+    const fixture = v0Fixture()
+    const rpc = rpcFake({ pre: {} })
+    const h = await harness(rpc, base64Of(fixture.wire))
+    expect(await run(signArgs("--wallet", "trader", "--yes"), h.deps)).toBe(1)
+    expect(humanText(h.stderr.text)).toContain(humanText(`lookup table ${fixture.tableKey} does not exist`))
+    expect(h.stderr.text).not.toContain("Decoded transaction")
+    expect(rpc.calls).toEqual(["getMultipleAccounts"])
+    expect(h.secretPrompts).toBe(0)
+  })
+
+  test("with the table fetched the display is built from the compiled order, the deltas come from the simulation, and the signature verifies", async () => {
+    const fixture = v0Fixture()
+    const pre = {
+      [fixture.tableKey]: account(ADDRESS_LOOKUP_TABLE_PROGRAM_ID, 1, fixture.tableData),
+      [external0.address]: systemPre(1_000_000),
+      [recipient.toBase58()]: null,
+    }
+    const post = { ...pre, [external0.address]: systemPre(988_000), [recipient.toBase58()]: systemPre(7_000) }
+    const rpc = rpcFake({ pre, post })
+    const h = await harness(rpc, base64Of(fixture.wire))
+    expect(await run(signArgs("--wallet", "trader"), h.deps)).toBe(0)
+    const display = h.stderr.text
+    expect(display).toContain("v0, 2 instruction(s)")
+    expect(display).toContain("(1 lookup table(s) resolved)")
+    expect(display).toContain(`fee payer   ${external0.address}`)
+    expect(display).toContain("program     System (11111111111111111111111111111111)")
+    expect(display).toContain("program     Memo (")
+    expect(display).toContain("trader      0.001 SOL -> 0.000988 SOL (-0.000012 SOL)")
+    expect(display).toContain(`receives    ${recipient.toBase58()} receives +0.000007 SOL`)
+    expect(display).toContain("simulation is evidence, not a guarantee")
+    // The prompt: the factor a second time, since --yes was not given.
+    expect(h.secretPrompts).toBe(2)
+    // stdout is the signed transaction alone, valid for the external key, over the exact message.
+    const signed = decodeTransaction(new Uint8Array(Buffer.from(h.stdout.text.trim(), "base64")))
+    expect(Array.from(signed.message.bytes)).toEqual(Array.from(fixture.message.serialize()))
+    expect(
+      ed25519.verify(signed.signatures[0] as Uint8Array, signed.message.bytes, base58.decode(external0.address)),
+    ).toBe(true)
+    expect(rpc.sent).toBeUndefined()
+  })
+
+  test("--yes skips the confirmation prompt and no check; --broadcast sends the signed bytes; a refused send is SIGN_BROADCAST_FAILED", async () => {
+    const wire = legacyTransfer(new PublicKey(external0.address))
+    const pre = { [external0.address]: systemPre(50_000), [recipient.toBase58()]: null }
+    const post = { [external0.address]: systemPre(44_000), [recipient.toBase58()]: systemPre(1_000) }
+    const ok = rpcFake({ pre, post })
+    const h = await harness(ok, base64Of(wire))
+    expect(await run(signArgs("--wallet", "trader", "--yes", "--broadcast", "--json"), h.deps)).toBe(0)
+    expect(h.secretPrompts).toBe(1)
+    const body = JSON.parse(h.stdout.text.trim())
+    expect(body.ok).toBe(true)
+    expect(body.broadcast).toMatchObject({ ok: true, signature: body.signature })
+    expect(ok.sent).toBe(body.signedTransaction)
+    expect(body.display.some((line: string) => line.includes("receives"))).toBe(true)
+    expect(ok.calls).toEqual(["getMultipleAccounts", "simulateTransaction", "sendTransaction"])
+
+    const failing = rpcFake({ pre, post, sendFails: true })
+    const k = await harness(failing, base64Of(wire))
+    expect(await run(signArgs("--wallet", "trader", "--yes", "--broadcast"), k.deps)).toBe(1)
+    // The signed transaction is still handed back, so a retry needs no second signature.
+    expect(k.stdout.text.trim().length).toBeGreaterThan(80)
+    expect(humanText(k.stderr.text)).toContain(humanText("Blockhash not found"))
+  })
+
+  test("stdin is the same byte stream contract as --file", async () => {
+    const wire = legacyTransfer(new PublicKey(external0.address))
+    const pre = { [external0.address]: systemPre(50_000), [recipient.toBase58()]: null }
+    const h = await harness(rpcFake({ pre }), base64Of(wire))
+    expect(await run(["sign", "--wallet", "trader", "--rpc-url", RPC, "--yes", "--json"], h.deps)).toBe(0)
+    expect(JSON.parse(h.stdout.text.trim()).ok).toBe(true)
+  })
+})
+
+/**
+ * BE-355 (D4, T11): a rate limit on `--broadcast`'s send is the uncertain outcome: exit 3 (not 1),
+ * `RPC_RATE_LIMITED`, `broadcast.uncertain`, the signature and the signed transaction still in the
+ * document, exactly one send, and the fix line on stderr. Any other send failure is still
+ * `SIGN_BROADCAST_FAILED`, exit 1.
+ */
+describe("BE-355 T11: a rate-limited --broadcast", () => {
+  test("exit 3, RPC_RATE_LIMITED, broadcast.uncertain, one send, the fix on stderr; other send failures stay exit 1", async () => {
+    const wire = legacyTransfer(new PublicKey(external0.address))
+    const pre = { [external0.address]: systemPre(50_000), [recipient.toBase58()]: null }
+    const post = { [external0.address]: systemPre(44_000), [recipient.toBase58()]: systemPre(1_000) }
+
+    const limited = rpcFake({ pre, post, sendRateLimited: true })
+    const h = await harness(limited, base64Of(wire))
+    expect(await run(signArgs("--wallet", "trader", "--yes", "--broadcast", "--json"), h.deps)).toBe(3)
+    const body = JSON.parse(h.stdout.text.trim())
+    expect(body.ok).toBe(false)
+    expect(body.code).toBe("RPC_RATE_LIMITED")
+    expect(body.broadcast).toMatchObject({ ok: false, uncertain: true })
+    expect(typeof body.signature).toBe("string")
+    expect(typeof body.signedTransaction).toBe("string")
+    expect(limited.calls.filter((c) => c === "sendTransaction")).toHaveLength(1)
+    expect(humanText(h.stderr.text)).toContain(
+      humanText(
+        `The RPC rate-limited this CLI after the transaction was signed. It may still land: check ${body.signature} before anything else.\nFix: --rpc-url https://<your-rpc> on this command, or CANDLE_SOLANA_RPC_URL for every command\n     or sign in (candle auth login) to store one per profile\n`,
+      ),
+    )
+    expect(h.stderr.text).not.toContain("profile set")
+
+    const withProfile = await harness(rpcFake({ pre, post, sendRateLimited: true }), base64Of(wire), {
+      ...createFakeConfigStore({ profiles: { work: {} }, activeProfile: "work" }),
+    })
+    expect(await run(signArgs("--wallet", "trader", "--yes", "--broadcast"), withProfile.deps)).toBe(3)
+    // Human mode: the signed transaction is still on stdout, and the fix names the profile.
+    expect(withProfile.stdout.text.trim().length).toBeGreaterThan(80)
+    expect(humanText(withProfile.stderr.text)).toContain(
+      humanText("Fix: candle profile set work --rpc-url https://<your-rpc>\n"),
+    )
+
+    const failing = rpcFake({ pre, post, sendFails: true })
+    const k = await harness(failing, base64Of(wire))
+    expect(await run(signArgs("--wallet", "trader", "--yes", "--broadcast", "--json"), k.deps)).toBe(1)
+    expect(JSON.parse(k.stdout.text.trim()).code).toBe("SIGN_BROADCAST_FAILED")
+  })
+})
+
+/**
+ * SEC-001: a transaction that hands a signer's account to someone else moves no balance, so the
+ * deltas alone said "no other account gains a balance". It is now displayed and refused as
+ * `SIGN_CONTROL_CHANGE`, with `--yes` too, while an ordinary token transfer signs as before.
+ */
+describe("SEC-001: candle sign refuses a change of control over a signer's account", () => {
+  const TOKEN = TOKEN_PROGRAM_ID
+  const mint = Keypair.generate().publicKey
+  const attacker = Keypair.generate().publicKey
+  const ata = Keypair.generate().publicKey
+  const theirAta = Keypair.generate().publicKey
+
+  function tokenData(owner: PublicKey, amount: bigint, delegate?: PublicKey, delegatedAmount = 0n): Uint8Array {
+    const data = new Uint8Array(165)
+    const dv = new DataView(data.buffer)
+    data.set(mint.toBytes(), 0)
+    data.set(owner.toBytes(), 32)
+    dv.setBigUint64(64, amount, true)
+    if (delegate) {
+      dv.setUint32(72, 1, true)
+      data.set(delegate.toBytes(), 76)
+      dv.setBigUint64(121, delegatedAmount, true)
+    }
+    data[108] = 1
+    return data
+  }
+
+  function tokenTx(data: Uint8Array, keys: Array<{ pubkey: PublicKey; isSigner: boolean; isWritable: boolean }>) {
+    const from = new PublicKey(external0.address)
+    const tx = new Transaction({ feePayer: from, recentBlockhash: BLOCKHASH }).add(
+      new TransactionInstruction({ programId: new PublicKey(TOKEN), keys, data: Buffer.from(data) }),
+    )
+    return new Uint8Array(tx.serialize({ requireAllSignatures: false, verifySignatures: false }))
+  }
+
+  const owner = () => new PublicKey(external0.address)
+
+  test("SetAuthority(AccountOwner) to another wallet is refused with --yes, naming the account, both owners and what changed", async () => {
+    // SetAuthority: [6, authority type 2 (AccountOwner), Some, new owner].
+    const data = new Uint8Array([6, 2, 1, ...attacker.toBytes()])
+    const wire = tokenTx(data, [
+      { pubkey: ata, isSigner: false, isWritable: true },
+      { pubkey: owner(), isSigner: true, isWritable: false },
+    ])
+    const pre = {
+      [external0.address]: systemPre(50_000),
+      [ata.toBase58()]: account(TOKEN, 2_039_280, tokenData(owner(), 1_000n)),
+    }
+    const post = {
+      [external0.address]: systemPre(45_000),
+      [ata.toBase58()]: account(TOKEN, 2_039_280, tokenData(attacker, 1_000n)),
+    }
+    for (const json of [true, false]) {
+      const rpc = rpcFake({ pre, post })
+      const h = await harness(rpc, base64Of(wire))
+      expect(await run(signArgs("--wallet", "trader", "--yes", ...(json ? ["--json"] : [])), h.deps)).toBe(1)
+      const text = json ? JSON.parse(h.stdout.text.trim()).message : h.stderr.text
+      if (json) expect(JSON.parse(h.stdout.text.trim()).code).toBe("SIGN_CONTROL_CHANGE")
+      expect(text).toContain(
+        `token account ${ata.toBase58()} (mint ${mint.toBase58()}, owned by ${external0.address}): owner changes from ${external0.address} to ${attacker.toBase58()}`,
+      )
+      if (!json) {
+        expect(humanText(h.stderr.text)).toContain(humanText(`CONTROL     token account ${ata.toBase58()}`))
+        expect(h.stderr.text).not.toContain("no other account gains a balance")
+        expect(humanText(h.stderr.text)).toContain(humanText("control of an account changes hands"))
+        // The signer's own line still lists the account it is about to lose.
+        expect(humanText(h.stderr.text)).toContain(`in ${ata.toBase58()}`)
+      }
+      expect(h.stdout.text).not.toMatch(/^[A-Za-z0-9+/]{80,}={0,2}\n$/)
+      expect(rpc.sent).toBeUndefined()
+      // The unlock only: the refusal comes before the confirmation prompt.
+      expect(h.secretPrompts).toBe(1)
+    }
+  })
+
+  test("Approve to a delegate is refused, naming the delegate and the amount it may move", async () => {
+    const amount = new Uint8Array(8)
+    new DataView(amount.buffer).setBigUint64(0, 1_000n, true)
+    const wire = tokenTx(new Uint8Array([4, ...amount]), [
+      { pubkey: ata, isSigner: false, isWritable: true },
+      { pubkey: attacker, isSigner: false, isWritable: false },
+      { pubkey: owner(), isSigner: true, isWritable: false },
+    ])
+    const pre = {
+      [external0.address]: systemPre(50_000),
+      [ata.toBase58()]: account(TOKEN, 2_039_280, tokenData(owner(), 1_000n)),
+    }
+    const post = { ...pre, [ata.toBase58()]: account(TOKEN, 2_039_280, tokenData(owner(), 1_000n, attacker, 1_000n)) }
+    const h = await harness(rpcFake({ pre, post }), base64Of(wire))
+    expect(await run(signArgs("--wallet", "trader", "--yes", "--json"), h.deps)).toBe(1)
+    const body = JSON.parse(h.stdout.text.trim())
+    expect(body.code).toBe("SIGN_CONTROL_CHANGE")
+    expect(body.message).toContain(
+      `token account ${ata.toBase58()} (mint ${mint.toBase58()}, owned by ${external0.address}): delegate changes from none to ${attacker.toBase58()} (may move up to 1000 raw)`,
+    )
+  })
+
+  test("an ordinary token transfer still previews and signs as before", async () => {
+    const amount = new Uint8Array(8)
+    new DataView(amount.buffer).setBigUint64(0, 400n, true)
+    const wire = tokenTx(new Uint8Array([3, ...amount]), [
+      { pubkey: ata, isSigner: false, isWritable: true },
+      { pubkey: theirAta, isSigner: false, isWritable: true },
+      { pubkey: owner(), isSigner: true, isWritable: false },
+    ])
+    const pre = {
+      [external0.address]: systemPre(50_000),
+      [ata.toBase58()]: account(TOKEN, 2_039_280, tokenData(owner(), 1_000n)),
+      [theirAta.toBase58()]: account(TOKEN, 2_039_280, tokenData(recipient, 0n)),
+    }
+    const post = {
+      [external0.address]: systemPre(45_000),
+      [ata.toBase58()]: account(TOKEN, 2_039_280, tokenData(owner(), 600n)),
+      [theirAta.toBase58()]: account(TOKEN, 2_039_280, tokenData(recipient, 400n)),
+    }
+    const rpc = rpcFake({ pre, post })
+    const h = await harness(rpc, base64Of(wire))
+    expect(await run(signArgs("--wallet", "trader", "--yes"), h.deps)).toBe(0)
+    expect(humanText(h.stderr.text)).toContain(
+      humanText(`${mint.toBase58()}: 1000 raw -> 600 raw (-400 raw) in ${ata.toBase58()}`),
+    )
+    expect(humanText(h.stderr.text)).toContain(
+      humanText(
+        `receives    ${recipient.toBase58()} receives +400 raw of ${mint.toBase58()} (account ${theirAta.toBase58()})`,
+      ),
+    )
+    expect(h.stderr.text).not.toContain("CONTROL")
+    const signed = decodeTransaction(new Uint8Array(Buffer.from(h.stdout.text.trim(), "base64")))
+    expect(
+      ed25519.verify(signed.signatures[0] as Uint8Array, signed.message.bytes, base58.decode(external0.address)),
+    ).toBe(true)
+  })
+})
+
+describe("candle sign message: exact bytes from a file or stdin, a lossless display", () => {
+  async function signBytes(bytes: Uint8Array, args: string[], overrides: Partial<Deps> = {}) {
+    const made = await vaultWithEveryRole()
+    const stdout = createCapture()
+    const stderr = createCapture()
+    const { env: overrideEnv, ...rest } = overrides
+    const deps = createTestDeps({
+      fetch: (async () => {
+        throw new Error("no network")
+      }) as unknown as typeof fetch,
+      stdout,
+      stderr,
+      readBytes: async () => bytes,
+      readStdin: async () => bytes,
+      promptSecret: async () => made.passphrase,
+      ...rest,
+      env: { CANDLE_CONFIG_DIR: made.dir, ...(overrideEnv ?? {}) },
+    })
+    const code = await run(["sign", "message", ...args], deps)
+    return { code, stdout, stderr }
+  }
+
+  test("file and stdin sign byte-identical input to the same signature, which verifies over exactly those bytes", async () => {
+    const bytes = new TextEncoder().encode("Sign in to example\nnonce 42")
+    const viaFile = await signBytes(bytes, ["--wallet", "trader", "--file", "m.txt", "--yes"])
+    const viaStdin = await signBytes(bytes, ["--wallet", "trader", "--yes"])
+    expect(viaFile.code).toBe(0)
+    expect(viaStdin.stdout.text).toBe(viaFile.stdout.text)
+    const signature = base58.decode(viaFile.stdout.text.trim())
+    expect(ed25519.verify(signature, bytes, base58.decode(external0.address))).toBe(true)
+    expect(viaFile.stderr.text).toContain("bytes       27")
+    expect(humanText(viaFile.stderr.text)).toContain(
+      humanText("form        UTF-8 text with no control characters other than newline"),
+    )
+    expect(humanText(viaFile.stderr.text)).toContain(humanText("text        Sign in to example\n            nonce 42"))
+  })
+
+  test("non-UTF-8 bytes, and UTF-8 with a control other than newline, are shown as hex only, with no replacement character", async () => {
+    const controlA = new Uint8Array([0x61, 0x01, 0x62]) // "a", U+0001, "b"
+    const tabbed = new Uint8Array([0x74, 0x61, 0x62, 0x09, 0x68, 0x65, 0x72, 0x65]) // "tab<TAB>here"
+    for (const bytes of [new Uint8Array([0xff, 0xfe, 0x41]), controlA, tabbed]) {
+      const out = await signBytes(bytes, ["--wallet", "trader", "--yes", "--json"])
+      expect(out.code).toBe(0)
+      const body = JSON.parse(out.stdout.text.trim())
+      expect(body.renderedAs).toBe("hex")
+      expect(body.byteLength).toBe(bytes.length)
+      expect(ed25519.verify(base58.decode(body.signature), bytes, base58.decode(external0.address))).toBe(true)
+      expect(out.stdout.text + out.stderr.text).not.toContain("�")
+    }
+    expect(renderableAsText(new TextEncoder().encode("plain\nlines"))).toBe("plain\nlines")
+    expect(renderableAsText(new Uint8Array([0xc2, 0x85]))).toBeUndefined() // U+0085, a C1 control
+    expect(renderableAsText(new Uint8Array([0x7f]))).toBeUndefined()
+  })
+
+  test("a vault key never signs a message; an argv message form does not exist", async () => {
+    const bytes = new TextEncoder().encode("hello")
+    const refused = await signBytes(bytes, ["--wallet", "cold", "--yes", "--json"])
+    expect(refused.code).toBe(1)
+    expect(JSON.parse(refused.stdout.text.trim()).code).toBe("SIGN_SIGNER_NOT_EXTERNAL")
+    const argv = await signBytes(bytes, ["--wallet", "trader", "hello"])
+    expect(argv.code).toBe(2)
+    expect(humanText(argv.stderr.text)).toContain(humanText("never an argument"))
+  })
+
+  test("the message-to-sign heading wraps to stderr's own width, plain and styled (BE-2105)", async () => {
+    const bytes = new TextEncoder().encode("narrow heading check")
+    // stderr is the narrow stream (40) while stdout is wide: the heading must take the width of
+    // the stream it is written to, and every word of it must survive the wrap.
+    const columns = { stdout: 100, stderr: 40 }
+    const narrow = async (env: Record<string, string>) =>
+      signBytes(bytes, ["--wallet", "trader", "--file", "m.txt", "--yes"], { env, columns })
+
+    const plainRun = await narrow({ CANDLE_PLAIN: "1" })
+    expect(plainRun.code).toBe(0)
+    const plainLines = plainRun.stderr.text.split("\n")
+    const plainHeading = plainLines.indexOf("Message to sign (the exact bytes read;")
+    expect(plainHeading).toBeGreaterThan(0)
+    expect(plainLines.slice(plainHeading, plainHeading + 2)).toEqual([
+      "Message to sign (the exact bytes read;",
+      "nothing was trimmed or normalized)",
+    ])
+    expect(humanText(plainRun.stderr.text)).toContain(
+      humanText("Message to sign (the exact bytes read; nothing was trimmed or normalized)"),
+    )
+    // The heading block itself stays within the stream's width; the display lines below it keep
+    // whole copyable tokens (the address, the sha256 hex), which may legitimately run past it.
+    for (const line of plainLines.slice(plainHeading, plainHeading + 2))
+      expect(displayWidth(line)).toBeLessThanOrEqual(40)
+    expect(plainRun.stderr.text).not.toContain("\x1b")
+
+    const styledRun = await narrow({ TERM: "xterm-256color" })
+    expect(styledRun.code).toBe(0)
+    const styledLines = styledRun.stderr.text.split("\n")
+    const styledHeading = styledLines.indexOf("\x1b[1mMessage to sign (the exact bytes read;\x1b[0m")
+    expect(styledHeading).toBeGreaterThan(0)
+    expect(styledLines.slice(styledHeading, styledHeading + 2)).toEqual([
+      "\x1b[1mMessage to sign (the exact bytes read;\x1b[0m",
+      "\x1b[1mnothing was trimmed or normalized)\x1b[0m",
+    ])
+    expect(humanText(styledRun.stderr.text)).toContain(
+      humanText("Message to sign (the exact bytes read; nothing was trimmed or normalized)"),
+    )
+  })
+})

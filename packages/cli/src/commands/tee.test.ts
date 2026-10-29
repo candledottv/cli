@@ -1,0 +1,3585 @@
+/**
+ * `candle tee …` (Ember Phase 1, BE-94): T19, T20 (unit), T23, T24 (fake RPC), T26/T27 (refusals),
+ * T29 (typed states and exit codes). The TEE wallet store lives in a real temp dir (the round-trip check
+ * in `tee new` reads the file back); the API and the Solana RPC are routed fakes. Signed sweep
+ * transactions are decoded and signature-verified with `@solana/web3.js` (hoisted oracle, same as
+ * solana-lite.test.ts) so the test proves what was SIGNED, not what was logged.
+ */
+import { describe, expect, test } from "bun:test"
+import { mkdir, mkdtemp, readFile as realReadFile, rename, rmdir } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { ed25519 } from "@noble/curves/ed25519"
+import { base58 } from "@scure/base"
+import {
+  createAssociatedTokenAccountIdempotentInstruction,
+  getAssociatedTokenAddressSync,
+  TOKEN_PROGRAM_ID as SPL_TOKEN,
+  TOKEN_2022_PROGRAM_ID as SPL_TOKEN_2022,
+} from "@solana/spl-token"
+import {
+  ComputeBudgetProgram,
+  Keypair,
+  PublicKey,
+  Transaction,
+  TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+} from "@solana/web3.js"
+import { humanText } from "../human-output.test-support"
+import { run } from "../index"
+import { DAMM_V2_PROGRAM_ID } from "../lp-close"
+import { SYSTEM_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "../solana-lite"
+import {
+  createCapture,
+  createFakeConfigStore,
+  createFakeStore,
+  createRoutedFetch,
+  createTestDeps,
+  jsonResponse,
+  type RouteHandler,
+  TEST_HOME,
+} from "../test-support"
+import {
+  createKeystore,
+  defaultTeeKeystorePath,
+  type KeystoreEntry,
+  keystoreLockPath,
+  legacyTeeKeystorePath,
+  readKeystore,
+  serializeKeystore,
+  writeKeystoreFile,
+} from "../wallet-keystore"
+import { groupAddress } from "./vault-support"
+
+const PASSPHRASE = "a strong tee-store passphrase"
+const RPC = "https://rpc.test/rpc"
+const ENCRYPTION_PUBLIC_KEY = await (async () => {
+  const receiver = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"])
+  return Buffer.from(await crypto.subtle.exportKey("raw", receiver.publicKey)).toString("base64")
+})()
+
+const teeKey = Keypair.generate()
+const TEE = teeKey.publicKey.toBase58()
+const VAULT = Keypair.generate().publicKey.toBase58()
+const MINT = Keypair.generate().publicKey
+const MINT_2022 = Keypair.generate().publicKey
+const BLOCKHASH = "EkSnNWid2cvwEVnVx9aBqawnmiCNiDgp3gUdkDPTKN1N"
+
+async function tempDir(): Promise<string> {
+  return await mkdtemp(join(tmpdir(), "candle-tee-"))
+}
+
+function prompts(answers: string[]) {
+  const queue = [...answers]
+  return async () => {
+    const next = queue.shift()
+    if (next === undefined) throw new Error("promptSecret asked for more answers than the test scripted")
+    return next
+  }
+}
+
+async function seedTeeStore(dir: string, entries: KeystoreEntry[], passphrase = PASSPHRASE): Promise<string> {
+  const ks = await createKeystore(passphrase)
+  const path = defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME)
+  await writeKeystoreFile(path, await serializeKeystore(entries, ks.key, ks.salt, ks.iterations, "ember-tee"))
+  return path
+}
+
+async function openStore(dir: string, passphrase = PASSPHRASE) {
+  return await readKeystore(
+    await realReadFile(defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME), "utf8"),
+    passphrase,
+    {
+      expectPurpose: "ember-tee",
+    },
+  )
+}
+
+function teeEntry(overrides: Partial<KeystoreEntry> = {}): KeystoreEntry {
+  return {
+    index: 0,
+    chain: "solana",
+    address: TEE,
+    label: "tee-0",
+    createdAt: "2026-09-16T00:00:00.000Z",
+    privateKey: base58.encode(teeKey.secretKey),
+    imported: false,
+    tee: { network: "solana-mainnet" },
+    ...overrides,
+  }
+}
+
+function enabledEntry(overrides: Partial<KeystoreEntry> = {}): KeystoreEntry {
+  return teeEntry({
+    imported: true,
+    linkedWalletId: "lw_tee1",
+    privyWalletId: "pw_tee1",
+    importedAt: "2026-09-16T01:00:00.000Z",
+    tee: {
+      network: "solana-mainnet",
+      vaultDestination: VAULT,
+      boundKeyPrefix: "ck_live_x",
+      remoteAuthority: "verified-active",
+      enabledAt: "2026-09-16T01:00:00.000Z",
+    },
+    ...overrides,
+  })
+}
+
+function depsFor(dir: string, fetch: typeof globalThis.fetch, answers: string[], extra: Record<string, unknown> = {}) {
+  const stdout = createCapture()
+  const stderr = createCapture()
+  // One script for both prompts, in the order asked: the passphrase is hidden, and the typed
+  // `confirm` (BE-1710) is a visible line, recorded so a test can read its wording.
+  const next = prompts(answers)
+  const linePrompts: string[] = []
+  const deps = createTestDeps({
+    fetch,
+    store: createFakeStore({ api_key: "ck_live_x" }),
+    stdout,
+    stderr,
+    env: { CANDLE_CONFIG_DIR: dir },
+    readFile: async (p: string) => realReadFile(p, "utf8"),
+    promptSecret: next,
+    promptLine: async (text: string) => {
+      linePrompts.push(text)
+      return next()
+    },
+    ...extra,
+  })
+  return { deps, stdout, stderr, linePrompts }
+}
+
+interface RpcState {
+  tokenAccounts: Array<{ pubkey: string; mint: string; amount: string; decimals: number; state: string }>
+  token2022Accounts: Array<{ pubkey: string; mint: string; amount: string; decimals: number; state: string }>
+  lamports: number
+  fee: number | null
+  /**
+   * Raw accounts for `getAccountInfo`: mint accounts (whose owner decides the program and whose
+   * TLV carries the extensions), destination ATAs, and a transfer hook's validation account. An
+   * address absent from here does not exist, which is what makes the sweep create the vault's ATA.
+   */
+  accounts: Record<string, { owner: string; data: Uint8Array; lamports?: number }>
+  epoch: number
+  sent: string[]
+  /** Scripted answers, consumed in order; an explicit `null` means "not found". Empty = finalized. */
+  statuses: Array<{ confirmationStatus: string | null; err: unknown } | null>
+  blockhashValid: boolean
+  /**
+   * BE-315 (P3-ED-6): what `simulateTransaction` answers for the accounts it is asked about, over
+   * `accounts`; an explicit `null` is an account the simulated transaction closed. `simulationErr`
+   * makes the simulation fail. `onClose` is the fake chain's state transition for a sent DAMM v2
+   * close (the NFT account gone, the withdrawn tokens in the wallet).
+   */
+  simulated?: Record<string, { owner: string; data: Uint8Array; lamports?: number } | null>
+  simulationErr?: unknown
+  onClose?: () => void
+}
+
+function rawView(account: { owner: string; data: Uint8Array; lamports?: number } | null | undefined) {
+  if (!account) return null
+  return {
+    owner: account.owner,
+    lamports: account.lamports ?? 1,
+    data: [Buffer.from(account.data).toString("base64"), "base64"],
+  }
+}
+
+function rpcHandler(state: RpcState): RouteHandler {
+  return (req) => {
+    const body = JSON.parse(String(req.init.body)) as { id: number; method: string; params: unknown[] }
+    const reply = (result: unknown) => jsonResponse(200, { jsonrpc: "2.0", id: body.id, result })
+    switch (body.method) {
+      case "getLatestBlockhash":
+        return reply({ value: { blockhash: BLOCKHASH } })
+      case "getBalance":
+        return reply({ value: state.lamports })
+      case "getFeeForMessage":
+        return reply({ value: state.fee })
+      case "getAccountInfo": {
+        const account = state.accounts[body.params[0] as string]
+        if (!account) return reply({ value: null })
+        return reply({
+          value: {
+            owner: account.owner,
+            lamports: 1,
+            data: [Buffer.from(account.data).toString("base64"), "base64"],
+          },
+        })
+      }
+      case "getEpochInfo":
+        return reply({ epoch: state.epoch })
+      case "getMultipleAccounts":
+        return reply({ value: (body.params[0] as string[]).map((address) => rawView(state.accounts[address])) })
+      case "simulateTransaction": {
+        const addresses = (body.params[1] as { accounts: { addresses: string[] } }).accounts.addresses
+        return reply({
+          value: {
+            err: state.simulationErr ?? null,
+            logs: [],
+            accounts: addresses.map((address) =>
+              state.simulated && address in state.simulated
+                ? rawView(state.simulated[address])
+                : rawView(state.accounts[address]),
+            ),
+          },
+        })
+      }
+      case "getTokenAccountsByOwner": {
+        const programId = (body.params[1] as { programId: string }).programId
+        const list =
+          programId === "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" ? state.tokenAccounts : state.token2022Accounts
+        return reply({
+          value: list.map((t) => ({
+            pubkey: t.pubkey,
+            account: {
+              data: {
+                parsed: {
+                  info: { mint: t.mint, state: t.state, tokenAmount: { amount: t.amount, decimals: t.decimals } },
+                },
+              },
+            },
+          })),
+        })
+      }
+      case "sendTransaction": {
+        const wire = body.params[0] as string
+        state.sent.push(wire)
+        applySent(state, wire)
+        return reply(sigOf(wire))
+      }
+      case "getSignatureStatuses":
+        return reply({
+          value: [state.statuses.length > 0 ? state.statuses.shift() : { confirmationStatus: "finalized", err: null }],
+        })
+      case "isBlockhashValid":
+        return reply({ value: state.blockhashValid })
+      default:
+        return jsonResponse(200, {
+          jsonrpc: "2.0",
+          id: body.id,
+          error: { code: -32601, message: `unknown ${body.method}` },
+        })
+    }
+  }
+}
+
+/**
+ * The fake chain's state transition for a sent transaction, so the post-finality inventory the
+ * sweep reads afterwards sees what a real chain would: the fee leaves the payer on every
+ * transaction, a System transfer debits its lamports, a Token `TransferChecked` empties the source
+ * account and `CloseAccount` removes it.
+ */
+/** Legacy or v0 (BE-315: a signed position close is v0), as one list of resolved instructions. */
+function instructionsOf(wire: string): Array<{ programId: PublicKey; keys: PublicKey[]; data: Buffer }> {
+  const bytes = Buffer.from(wire, "base64")
+  const versioned = VersionedTransaction.deserialize(bytes)
+  if (versioned.version === "legacy") {
+    return Transaction.from(bytes).instructions.map((ix) => ({
+      programId: ix.programId,
+      keys: ix.keys.map((key) => key.pubkey),
+      data: ix.data,
+    }))
+  }
+  const keys = versioned.message.getAccountKeys()
+  return versioned.message.compiledInstructions.map((ix) => ({
+    programId: keys.get(ix.programIdIndex) as PublicKey,
+    keys: ix.accountKeyIndexes.map((index) => keys.get(index) as PublicKey),
+    data: Buffer.from(ix.data),
+  }))
+}
+
+function applySent(state: RpcState, wire: string): void {
+  const tx = { instructions: instructionsOf(wire) }
+  if (state.fee !== null) state.lamports = Math.max(0, state.lamports - state.fee)
+  for (const ix of tx.instructions) {
+    const program = ix.programId.toBase58()
+    if (program === DAMM_V2_PROGRAM_ID) {
+      state.onClose?.()
+      continue
+    }
+    if (program === "11111111111111111111111111111111" && ix.data.readUInt32LE(0) === 2) {
+      const amount = Number(Buffer.from(ix.data.subarray(4, 12)).readBigUInt64LE())
+      state.lamports = Math.max(0, state.lamports - amount)
+    } else if (program === TOKEN_PROGRAM_ID || program === TOKEN_2022_PROGRAM_ID) {
+      const list = program === TOKEN_PROGRAM_ID ? "tokenAccounts" : "token2022Accounts"
+      const account = ix.keys[0]?.toBase58()
+      if (ix.data[0] === 12) {
+        for (const t of state[list]) if (t.pubkey === account) t.amount = "0"
+      } else if (ix.data[0] === 9) {
+        state[list] = state[list].filter((t) => t.pubkey !== account)
+      }
+    }
+  }
+}
+
+/** The transaction's identity: the first signature of the signed wire, as a node echoes it. */
+function sigOf(wire: string): string {
+  return base58.encode(VersionedTransaction.deserialize(Buffer.from(wire, "base64")).signatures[0] ?? new Uint8Array())
+}
+
+// ── Mint fixtures (BE-218, R5). Same byte layout `token-2022.test.ts` pins against spl-token. ──
+
+function baseMint(decimals: number): Uint8Array {
+  const data = new Uint8Array(82)
+  data[44] = decimals
+  data[45] = 1
+  return data
+}
+
+function extendedMint(decimals: number, extensions: Array<{ type: number; body: Uint8Array }>): Uint8Array {
+  const parts = extensions.flatMap(({ type, body }) => {
+    const header = new Uint8Array(4)
+    const view = new DataView(header.buffer)
+    view.setUint16(0, type, true)
+    view.setUint16(2, body.length, true)
+    return [header, body]
+  })
+  const data = new Uint8Array(166 + parts.reduce((n, p) => n + p.length, 0))
+  data.set(baseMint(decimals), 0)
+  data[165] = 1
+  let at = 166
+  for (const part of parts) {
+    data.set(part, at)
+    at += part.length
+  }
+  return data
+}
+
+function transferFeeBody(bps: number, max: bigint): Uint8Array {
+  const body = new Uint8Array(108)
+  const view = new DataView(body.buffer)
+  view.setBigUint64(80, max, true)
+  view.setUint16(88, bps, true)
+  view.setBigUint64(98, max, true)
+  view.setUint16(106, bps, true)
+  return body
+}
+
+function transferHookBody(program: PublicKey): Uint8Array {
+  const body = new Uint8Array(64)
+  body.set(program.toBytes(), 32)
+  return body
+}
+
+/** A raw SPL token account, for the frozen-state byte the sweep reads at offset 108. */
+function tokenAccountBytes(frozen: boolean): Uint8Array {
+  const data = new Uint8Array(165)
+  data[108] = frozen ? 2 : 1
+  return data
+}
+
+function mint2022(data: Uint8Array) {
+  return { [MINT_2022.toBase58()]: { owner: TOKEN_2022_PROGRAM_ID, data } }
+}
+
+function defaultRpcState(overrides: Partial<RpcState> = {}): RpcState {
+  return {
+    tokenAccounts: [],
+    token2022Accounts: [],
+    lamports: 1_000_000,
+    fee: 5_000,
+    accounts: {},
+    epoch: 100,
+    sent: [],
+    statuses: [],
+    blockhashValid: true,
+    ...overrides,
+  }
+}
+
+const LIFECYCLE = (state: string, extra: Record<string, unknown> = {}) => ({
+  success: true,
+  id: "lw_tee1",
+  state,
+  remoteAuthority: state === "quarantined" ? "verified-denied" : state === "enabled" ? "verified-active" : "unknown",
+  evidenceObservedAt: 1_726_000_000_000,
+  profile: "ember-tee",
+  boundKeyPrefix: "ck_live_x",
+  vaultDestination: VAULT,
+  ...extra,
+})
+
+describe("T27: every tee command refuses while CANDLE_KEYSTORE_PASSPHRASE is set", () => {
+  test("new/enable/fund/status/disable/sweep all exit 1 without touching the store, the network, or the value", async () => {
+    const dir = await tempDir()
+    const { fetch, calls } = createRoutedFetch({})
+    for (const argv of [
+      ["tee", "new"],
+      ["tee", "enable", TEE, "--vault", VAULT],
+      ["tee", "fund", TEE, "--amount", "1"],
+      ["tee", "status", "--verify", TEE],
+      ["tee", "disable", TEE],
+      ["tee", "sweep", TEE, "--rpc-url", RPC],
+    ]) {
+      const { deps, stderr } = depsFor(dir, fetch, [], {
+        env: { CANDLE_CONFIG_DIR: dir, CANDLE_KEYSTORE_PASSPHRASE: "should-never-be-read" },
+      })
+      expect(await run(argv, deps)).toBe(1)
+      expect(humanText(stderr.text)).toContain(humanText("CANDLE_KEYSTORE_PASSPHRASE is set"))
+      expect(stderr.text).not.toContain("should-never-be-read")
+    }
+    expect(calls).toHaveLength(0)
+  })
+})
+
+describe("tee new (T19, HW-01)", () => {
+  test("with no store, refuses and names the vault commands, and writes nothing", async () => {
+    const dir = await tempDir()
+    const { fetch, calls } = createRoutedFetch({})
+    const { deps, stderr } = depsFor(dir, fetch, [PASSPHRASE, PASSPHRASE])
+    const code = await run(["tee", "new", "--label", "scalper"], deps)
+    expect(code).toBe(1)
+    expect(calls).toHaveLength(0)
+    expect(humanText(stderr.text)).toContain(humanText("candle vault new-key --chain solana"))
+    expect(humanText(stderr.text)).toContain(humanText("candle vault promote --from <label> --to-key <prefix>"))
+    await expect(realReadFile(defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME), "utf8")).rejects.toThrow()
+  })
+
+  test("--factor is refused before any prompt and writes nothing", async () => {
+    const dir = await tempDir()
+    const { fetch, calls } = createRoutedFetch({})
+    const { deps, stderr } = depsFor(dir, fetch, [])
+    const code = await run(["tee", "new", "--factor", "yubikey-a"], deps)
+    expect(code).toBe(2)
+    expect(calls).toHaveLength(0)
+    expect(stderr.text).toContain("--factor")
+    expect(humanText(stderr.text)).toContain(humanText("vault new-key --chain solana"))
+    await expect(realReadFile(defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME), "utf8")).rejects.toThrow()
+  })
+
+  test("an existing store still accepts a new key", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const { fetch, calls } = createRoutedFetch({})
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE])
+    const code = await run(["tee", "new", "--label", "scalper"], deps)
+    expect(code).toBe(0)
+    expect(calls).toHaveLength(0)
+    const path = defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME)
+    const raw = await realReadFile(path, "utf8")
+    const opened = await readKeystore(raw, PASSPHRASE, { expectPurpose: "ember-tee" })
+    expect(opened.entries).toHaveLength(2)
+    const entry = opened.entries[1] as KeystoreEntry
+    expect(entry.label).toBe("scalper")
+    expect(stdout.text).toContain(entry.address)
+    expect(stdout.text).not.toContain(entry.privateKey)
+  })
+
+  test("a wrong passphrase leaves the existing store unchanged", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const path = defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME)
+    const before = await realReadFile(path, "utf8")
+    const { fetch } = createRoutedFetch({})
+    const wrong = depsFor(dir, fetch, ["not-the-store-passphrase"])
+    expect(await run(["tee", "new"], wrong.deps)).toBe(1)
+    expect(await realReadFile(path, "utf8")).toBe(before)
+  })
+
+  test("a second `tee new` appends to the existing store under the same passphrase", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const { fetch } = createRoutedFetch({})
+    const second = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "new", "--json"], second.deps)).toBe(0)
+    const parsed = JSON.parse(second.stdout.text.trim())
+    expect(parsed.index).toBe(1)
+    expect(parsed.state).toBe("local-only")
+  })
+})
+
+describe("the store written before the tee rename (hot-wallets.enc)", () => {
+  /** The old file name, header marker and entry field, exactly as a source-built CLI wrote them. */
+  async function seedLegacyStore(dir: string, entry: KeystoreEntry): Promise<string> {
+    const { tee: meta, ...plain } = entry
+    const ks = await createKeystore(PASSPHRASE)
+    const sealed = await serializeKeystore(
+      [{ ...plain, hot: meta } as unknown as KeystoreEntry],
+      ks.key,
+      ks.salt,
+      ks.iterations,
+      "ember-tee",
+    )
+    const file = JSON.parse(sealed)
+    file.purpose = "ember-hot"
+    const path = legacyTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME)
+    await writeKeystoreFile(path, JSON.stringify(file))
+    return path
+  }
+
+  test("with no tee-wallets.enc, a tee command finds it without --keystore", async () => {
+    const dir = await tempDir()
+    await seedLegacyStore(dir, teeEntry())
+    const { fetch, calls } = createRoutedFetch({})
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "status", "--verify", TEE, "--json"], deps)).toBe(0)
+    expect(JSON.parse(stdout.text.trim()).localState).toBe("local-only")
+    // BE-355: the balances are always read, here over the public default (unrouted in this fixture).
+    expect(calls.map((call) => new URL(call.url).host)).toEqual(["api.mainnet-beta.solana.com"])
+  })
+
+  test("the first write keeps the old key and rewrites the file under the current marker", async () => {
+    const dir = await tempDir()
+    const path = await seedLegacyStore(dir, teeEntry())
+    const { fetch } = createRoutedFetch({})
+    const { deps } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "new", "--json"], deps)).toBe(0)
+    const raw = await realReadFile(path, "utf8")
+    expect(JSON.parse(raw).purpose).toBe("ember-tee")
+    const opened = await readKeystore(raw, PASSPHRASE, { expectPurpose: "ember-tee" })
+    expect(opened.entries.map((e) => e.address)[0]).toBe(TEE)
+    expect(opened.entries).toHaveLength(2)
+    expect(opened.entries[0]?.tee?.network).toBe("solana-mainnet")
+    expect(raw).not.toContain("ember-hot")
+  })
+
+  test("when both files exist the current store wins", async () => {
+    const dir = await tempDir()
+    const other = Keypair.generate()
+    const otherAddress = other.publicKey.toBase58()
+    await seedLegacyStore(dir, teeEntry({ address: otherAddress, privateKey: base58.encode(other.secretKey) }))
+    await seedTeeStore(dir, [teeEntry()])
+    const { fetch } = createRoutedFetch({})
+    expect(await run(["tee", "status", "--verify", TEE, "--json"], depsFor(dir, fetch, [PASSPHRASE]).deps)).toBe(0)
+    const legacyOnly = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "status", "--verify", otherAddress, "--json"], legacyOnly.deps)).toBe(1)
+    expect(JSON.parse(legacyOnly.stdout.text.trim()).code).toBe("TEE_WALLET_UNKNOWN")
+  })
+
+  test("with neither file, the missing-store error names the current path", async () => {
+    const dir = await tempDir()
+    const { fetch } = createRoutedFetch({})
+    const { deps, stdout } = depsFor(dir, fetch, [])
+    expect(await run(["tee", "status", "--verify", TEE, "--json"], deps)).toBe(1)
+    const parsed = JSON.parse(stdout.text.trim())
+    expect(parsed.code).toBe("TEE_STORE_MISSING")
+    expect(parsed.message).toContain("tee-wallets.enc")
+  })
+})
+
+describe("tee enable (T19/T20, HW-02/HW-03)", () => {
+  function apiRoutes(submitExtra: Record<string, unknown> = {}) {
+    const submits: Record<string, unknown>[] = []
+    const routes = createRoutedFetch({
+      "/api/v1/agent/wallets/import/init": () =>
+        jsonResponse(200, { success: true, encryptionPublicKey: ENCRYPTION_PUBLIC_KEY }),
+      "/api/v1/agent/wallets/import/submit": (req) => {
+        const body = JSON.parse(String(req.init.body)) as Record<string, unknown>
+        submits.push(body)
+        return jsonResponse(200, {
+          success: true,
+          id: "lw_tee1",
+          address: body.address,
+          chain: "solana",
+          privyWalletId: "pw_tee1",
+          profile: "ember-tee",
+          vaultDestination: body.vaultDestination,
+          boundKeyPrefix: "ck_live_x",
+          remoteAuthority: "verified-active",
+          evidenceObservedAt: 1_726_000_000_000,
+          state: "enabled",
+          ...submitExtra,
+        })
+      },
+    })
+    return { ...routes, submits }
+  }
+
+  test("happy path: confirmation typed, import carries profile + vault, entry records the grant, exit 0", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const api = apiRoutes()
+    const { deps, stdout, linePrompts } = depsFor(dir, api.fetch, [PASSPHRASE, "confirm"])
+    const code = await run(["tee", "enable", TEE, "--vault", VAULT], deps)
+    expect(code).toBe(0)
+    // BE-1710: the vault in fours on its own line, then `confirm` naming the action; no last six.
+    expect(stdout.text).toContain(`vault ${groupAddress(VAULT)}\n`)
+    expect(linePrompts).toEqual([`Type confirm to enable this TEE wallet with sweeps to ${VAULT}: `])
+    expect(api.submits).toHaveLength(1)
+    expect(api.submits[0]).toMatchObject({
+      chain: "solana",
+      address: TEE,
+      profile: "ember-tee",
+      vaultDestination: VAULT,
+    })
+    // The private key never goes over the wire in the clear.
+    expect(JSON.stringify(api.submits[0])).not.toContain(base58.encode(teeKey.secretKey))
+    expect(humanText(stdout.text)).toContain(humanText("Remote authority verified"))
+    const opened = await readKeystore(
+      await realReadFile(defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME), "utf8"),
+      PASSPHRASE,
+      {
+        expectPurpose: "ember-tee",
+      },
+    )
+    expect(opened.entries[0]).toMatchObject({
+      imported: true,
+      linkedWalletId: "lw_tee1",
+      tee: { vaultDestination: VAULT, boundKeyPrefix: "ck_live_x", remoteAuthority: "verified-active" },
+    })
+  })
+
+  test("HW-03: a wrong confirmation refuses before any import call", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const api = apiRoutes()
+    // The vault's last six, the old answer, is now just another wrong word.
+    const { deps, stderr } = depsFor(dir, api.fetch, [PASSPHRASE, VAULT.slice(-6)])
+    expect(await run(["tee", "enable", TEE, "--vault", VAULT], deps)).toBe(1)
+    expect(humanText(stderr.text)).toContain(humanText("vault was not confirmed"))
+    expect(api.calls).toHaveLength(0)
+  })
+
+  test("T20: the vault must be a valid Solana address and not the TEE wallet address; usage errors, no prompt, no network", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const api = apiRoutes()
+    expect(await run(["tee", "enable", TEE, "--vault", "not-an-address"], depsFor(dir, api.fetch, []).deps)).toBe(2)
+    expect(await run(["tee", "enable", TEE, "--vault", TEE], depsFor(dir, api.fetch, []).deps)).toBe(2)
+    expect(await run(["tee", "enable", TEE], depsFor(dir, api.fetch, []).deps)).toBe(2)
+    expect(api.calls).toHaveLength(0)
+  })
+
+  test("an unverified enable read-back exits 3, tells the operator not to fund, and records unknown", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const api = apiRoutes({ remoteAuthority: "unknown", reasonCode: "READ_BACK_UNAVAILABLE" })
+    const { deps, stdout } = depsFor(dir, api.fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "enable", TEE, "--vault", VAULT], deps)).toBe(3)
+    expect(humanText(stdout.text)).toContain(humanText("Do not fund it"))
+    expect(stdout.text).toContain("READ_BACK_UNAVAILABLE")
+  })
+
+  test("an already-enabled or retired TEE wallet is never re-enabled", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const api = apiRoutes()
+    const { deps, stderr } = depsFor(dir, api.fetch, [PASSPHRASE])
+    expect(await run(["tee", "enable", TEE, "--vault", VAULT], deps)).toBe(1)
+    expect(humanText(stderr.text)).toContain(humanText("never re-enabled"))
+    expect(api.calls).toHaveLength(0)
+  })
+})
+
+describe("tee fund (HW-04)", () => {
+  test("prints the raw amount and destination for the vault to sign; signs nothing, calls nothing", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const { fetch, calls } = createRoutedFetch({})
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "fund", TEE, "--amount", "1.5", "--asset", "USDC", "--json"], deps)).toBe(0)
+    const parsed = JSON.parse(stdout.text.trim())
+    expect(parsed).toMatchObject({
+      asset: "USDC",
+      amountRaw: "1500000",
+      destination: TEE,
+      mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    })
+    expect(calls).toHaveLength(0)
+  })
+
+  test("SOL amounts use 9 decimals; too many decimals or zero is a usage error", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const { fetch } = createRoutedFetch({})
+    const ok = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "fund", TEE, "--amount", "0.25", "--json"], ok.deps)).toBe(0)
+    expect(JSON.parse(ok.stdout.text.trim()).amountRaw).toBe("250000000")
+    expect(await run(["tee", "fund", TEE, "--amount", "0.0000000001"], depsFor(dir, fetch, []).deps)).toBe(2)
+    expect(await run(["tee", "fund", TEE, "--amount", "0"], depsFor(dir, fetch, []).deps)).toBe(2)
+  })
+
+  test("refuses to produce a funding instruction for a wallet whose authority is not verified, or that is stopped", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [
+      enabledEntry({ tee: { network: "solana-mainnet", vaultDestination: VAULT, remoteAuthority: "unknown" } }),
+    ])
+    const { fetch } = createRoutedFetch({})
+    const a = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "fund", TEE, "--amount", "1"], a.deps)).toBe(1)
+    expect(humanText(a.stderr.text)).toContain(humanText("do not fund"))
+    const dir2 = await tempDir()
+    await seedTeeStore(dir2, [
+      enabledEntry({
+        tee: {
+          network: "solana-mainnet",
+          vaultDestination: VAULT,
+          remoteAuthority: "verified-active",
+          stopRequestedAt: "2026-09-16T02:00:00.000Z",
+        },
+      }),
+    ])
+    const b = depsFor(dir2, fetch, [PASSPHRASE])
+    expect(await run(["tee", "fund", TEE, "--amount", "1"], b.deps)).toBe(1)
+    expect(humanText(b.stderr.text)).toContain(humanText("never refunded"))
+  })
+})
+
+describe("tee status (T21 partial, T29)", () => {
+  test("reports the server's derived state and on-chain balances with USD unknown, never zero", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState({
+      tokenAccounts: [{ pubkey: "acct1", mint: MINT.toBase58(), amount: "700000", decimals: 6, state: "initialized" }],
+      token2022Accounts: [
+        { pubkey: "acct2", mint: MINT_2022.toBase58(), amount: "5", decimals: 0, state: "initialized" },
+      ],
+    })
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("enabled")),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "status", "--verify", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    const parsed = JSON.parse(stdout.text.trim())
+    expect(parsed.verified).toBe(true)
+    expect(parsed.server.state).toBe("enabled")
+    expect(parsed.balances.lamports).toBe("1000000")
+    expect(parsed.balances.tokens).toHaveLength(2)
+    expect(parsed.balances.tokens[0].usdValue).toBe("unknown")
+    expect(parsed.balances.tokens[1].program).toBe("token-2022")
+    expect(typeof parsed.observedAt).toBe("string")
+  })
+
+  test("a local-only wallet makes no Candle call; its balances are read over the resolved endpoint (BE-355)", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const { fetch, calls } = createRoutedFetch({})
+    const { deps, stdout, stderr } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "status", "--verify", TEE, "--json"], deps)).toBe(0)
+    const report = JSON.parse(stdout.text.trim())
+    expect(report.localState).toBe("local-only")
+    // The only request is the balance read, over the public default, disclosed first on stderr.
+    // Unrouted here, so the report carries the failure and the command still exits 0.
+    expect(calls.map((call) => new URL(call.url).host)).toEqual(["api.mainnet-beta.solana.com"])
+    expect(typeof report.balances.error).toBe("string")
+    expect(humanText(stderr.text)).toContain(humanText("Solana RPC: api.mainnet-beta.solana.com (public default)"))
+  })
+})
+
+describe("tee disable (T23, HW-06)", () => {
+  const PENDING = {
+    success: true,
+    state: "disable-pending",
+    stopAcknowledged: true,
+    remoteAuthority: "unknown",
+    evidenceObservedAt: null,
+    complete: false,
+    retryable: true,
+    reasonCode: "READ_BACK_UNAVAILABLE",
+    policyNeutralized: false,
+  }
+  const QUARANTINED = {
+    ...PENDING,
+    state: "quarantined",
+    remoteAuthority: "verified-denied",
+    complete: true,
+    retryable: false,
+    policyNeutralized: true,
+    reasonCode: undefined,
+  }
+
+  test("202 disable-pending -> exit 3, pending message, stopRequestedAt persisted", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const { fetch, calls } = createRoutedFetch({ "/api/v1/agent/wallets/lw_tee1": () => jsonResponse(202, PENDING) })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "disable", TEE], deps)).toBe(3)
+    expect(calls[0]?.init.method).toBe("DELETE")
+    expect(humanText(stdout.text)).toContain(humanText("verification is pending"))
+    expect(stdout.text).toContain("--emergency")
+    const opened = await readKeystore(
+      await realReadFile(defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME), "utf8"),
+      PASSPHRASE,
+      {
+        expectPurpose: "ember-tee",
+      },
+    )
+    expect(typeof opened.entries[0]?.tee?.stopRequestedAt).toBe("string")
+  })
+
+  test("200 quarantined -> exit 0 and the sweep hint", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const { fetch } = createRoutedFetch({ "/api/v1/agent/wallets/lw_tee1": () => jsonResponse(200, QUARANTINED) })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "disable", TEE], deps)).toBe(0)
+    expect(stdout.text).toContain("quarantined")
+    expect(humanText(stdout.text)).toContain(humanText("tee sweep"))
+  })
+
+  test("Ember 4c: a disable reports a bridge that still lands in the wallet, and is never blocked by it", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1": () =>
+        jsonResponse(200, {
+          ...QUARANTINED,
+          bridges: [{ clientTradeId: "swap-b1", role: "source", state: "open", openedAt: 1, blockingUntil: 7_200_001 }],
+        }),
+    })
+    const { deps, stdout, stderr } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "disable", TEE], deps)).toBe(0)
+    expect(stdout.text).toContain("quarantined")
+    expect(humanText(stderr.text)).toContain(humanText("Bridge swap-b1 out of"))
+    expect(humanText(stderr.text)).toContain(humanText("still lands in this wallet"))
+  })
+
+  test("a never-enabled wallet has nothing to stop", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const { fetch, calls } = createRoutedFetch({})
+    const { deps } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "disable", TEE], deps)).toBe(1)
+    expect(calls).toHaveLength(0)
+  })
+})
+
+describe("tee sweep (T24, HW-07, SC-06)", () => {
+  function decodeSent(b64: string) {
+    const tx = Transaction.from(Buffer.from(b64, "base64"))
+    expect(tx.verifySignatures()).toBe(true)
+    expect(tx.signatures[0]?.publicKey.toBase58()).toBe(TEE)
+    return tx
+  }
+
+  test("quarantined: tokens first (create vault ATA, transferChecked, close), SOL last minus fee, receipts recorded, exit 0", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const source = getAssociatedTokenAddressSync(MINT, teeKey.publicKey)
+    const rpc = defaultRpcState({
+      tokenAccounts: [
+        { pubkey: source.toBase58(), mint: MINT.toBase58(), amount: "700000", decimals: 6, state: "initialized" },
+      ],
+      lamports: 1_000_000,
+      fee: 5_000,
+    })
+    const swept: unknown[] = []
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": (req) => {
+        swept.push(JSON.parse(String(req.init.body)))
+        return jsonResponse(200, {
+          success: true,
+          id: "lw_tee1",
+          state: "swept",
+          sweptAt: 1,
+          signatures: rpc.sent.map(sigOf),
+        })
+      },
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    const code = await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)
+    expect(code).toBe(0)
+    expect(rpc.sent).toHaveLength(2)
+
+    const tokenTx = decodeSent(rpc.sent[0] as string)
+    expect(tokenTx.instructions).toHaveLength(3)
+    const vaultAta = getAssociatedTokenAddressSync(MINT, new PublicKey(VAULT))
+    // create ATA for the VAULT, paid by the TEE wallet
+    expect(tokenTx.instructions[0]?.programId.toBase58()).toBe("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    expect(tokenTx.instructions[0]?.keys[1]?.pubkey.toBase58()).toBe(vaultAta.toBase58())
+    expect(tokenTx.instructions[0]?.keys[2]?.pubkey.toBase58()).toBe(VAULT)
+    // transferChecked of the FULL balance to the vault's ATA
+    const transfer = tokenTx.instructions[1]
+    expect(transfer?.programId.toBase58()).toBe("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+    expect(transfer?.keys[2]?.pubkey.toBase58()).toBe(vaultAta.toBase58())
+    expect(transfer?.data[0]).toBe(12)
+    expect(Buffer.from(transfer?.data.subarray(1, 9) ?? []).readBigUInt64LE()).toBe(700_000n)
+    // close the source account, rent back to the TEE wallet
+    expect(tokenTx.instructions[2]?.data[0]).toBe(9)
+    expect(tokenTx.instructions[2]?.keys[1]?.pubkey.toBase58()).toBe(TEE)
+
+    const solTx = decodeSent(rpc.sent[1] as string)
+    expect(solTx.instructions).toHaveLength(1)
+    expect(solTx.instructions[0]?.programId.toBase58()).toBe("11111111111111111111111111111111")
+    expect(solTx.instructions[0]?.keys[1]?.pubkey.toBase58()).toBe(VAULT)
+    // 1_000_000 minus the token transaction's 5_000 fee, minus this transfer's own 5_000 fee.
+    expect(Buffer.from(solTx.instructions[0]?.data.subarray(4, 12) ?? []).readBigUInt64LE()).toBe(990_000n)
+
+    const parsed = JSON.parse(stdout.text.trim())
+    expect(parsed.state).toBe("swept")
+    expect(parsed.serverState).toBe("quarantined")
+    expect(parsed.receipts.map((r: { kind: string }) => r.kind)).toEqual(["token", "sol"])
+    expect(parsed.residuals).toEqual([])
+    // SC-06: completion was decided from the post-finality inventory, which read an empty wallet.
+    expect(parsed.inventory).toMatchObject({ verified: true, lamports: "0", tokenAccounts: 0 })
+    expect(rpc.lamports).toBe(0)
+    expect(swept).toEqual([{ signatures: rpc.sent.map(sigOf), residuals: [] }])
+    expect(parsed.receipts.map((r: { signature: string }) => r.signature)).toEqual(rpc.sent.map(sigOf))
+    const opened = await readKeystore(
+      await realReadFile(defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME), "utf8"),
+      PASSPHRASE,
+      {
+        expectPurpose: "ember-tee",
+      },
+    )
+    expect(typeof opened.entries[0]?.tee?.sweptAt).toBe("string")
+  })
+
+  // ── Token-2022 (BE-218, R5, Phase 2 ED-10 amendment). Phase 1 listed these as residuals. ──
+
+  test("a Token-2022 balance is SWEPT: TransferChecked then CloseAccount, both under Token-2022", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const source = getAssociatedTokenAddressSync(MINT_2022, teeKey.publicKey, false, SPL_TOKEN_2022)
+    const vaultAta = getAssociatedTokenAddressSync(MINT_2022, new PublicKey(VAULT), false, SPL_TOKEN_2022)
+    const rpc = defaultRpcState({
+      token2022Accounts: [
+        { pubkey: source.toBase58(), mint: MINT_2022.toBase58(), amount: "5", decimals: 0, state: "initialized" },
+      ],
+      accounts: mint2022(baseMint(0)),
+    })
+    const swept: unknown[] = []
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": (req) => {
+        swept.push(JSON.parse(String(req.init.body)))
+        return jsonResponse(200, { success: true, id: "lw_tee1", state: "swept", sweptAt: 1 })
+      },
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    const tx = decodeSent(rpc.sent[0] as string)
+    expect(tx.instructions).toHaveLength(3)
+    // The vault's ATA is derived under Token-2022, and the create names Token-2022 as its program.
+    expect(tx.instructions[0]?.keys[1]?.pubkey.toBase58()).toBe(vaultAta.toBase58())
+    expect(tx.instructions[0]?.keys[5]?.pubkey.toBase58()).toBe(TOKEN_2022_PROGRAM_ID)
+    expect(vaultAta.toBase58()).not.toBe(getAssociatedTokenAddressSync(MINT_2022, new PublicKey(VAULT)).toBase58())
+    // Transfer and close BOTH run under Token-2022, in one transaction.
+    expect(tx.instructions[1]?.programId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID)
+    expect(tx.instructions[1]?.data[0]).toBe(12)
+    expect(tx.instructions[2]?.programId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID)
+    expect(tx.instructions[2]?.data[0]).toBe(9)
+    expect(tx.instructions[2]?.keys[0]?.pubkey.toBase58()).toBe(source.toBase58())
+    expect(tx.instructions[2]?.keys[1]?.pubkey.toBase58()).toBe(TEE)
+
+    const parsed = JSON.parse(stdout.text.trim())
+    expect(parsed.state).toBe("swept")
+    expect(parsed.residuals).toEqual([])
+    expect(parsed.receipts.map((r: { kind: string }) => r.kind)).toEqual(["token", "sol"])
+    expect(swept).toHaveLength(1)
+  })
+
+  test("both programs in one sweep: a classic account and a Token-2022 account each under their own", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const classicSource = getAssociatedTokenAddressSync(MINT, teeKey.publicKey)
+    const source2022 = getAssociatedTokenAddressSync(MINT_2022, teeKey.publicKey, false, SPL_TOKEN_2022)
+    const rpc = defaultRpcState({
+      tokenAccounts: [
+        {
+          pubkey: classicSource.toBase58(),
+          mint: MINT.toBase58(),
+          amount: "700000",
+          decimals: 6,
+          state: "initialized",
+        },
+      ],
+      token2022Accounts: [
+        { pubkey: source2022.toBase58(), mint: MINT_2022.toBase58(), amount: "5", decimals: 0, state: "initialized" },
+      ],
+      accounts: mint2022(baseMint(0)),
+    })
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": () => jsonResponse(200, { success: true, state: "swept", sweptAt: 1 }),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    expect(rpc.sent).toHaveLength(3)
+    // Classic first (the order the inventory reads the two programs), then Token-2022, then SOL.
+    expect(decodeSent(rpc.sent[0] as string).instructions[1]?.programId.toBase58()).toBe(TOKEN_PROGRAM_ID)
+    expect(decodeSent(rpc.sent[1] as string).instructions[1]?.programId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID)
+    const parsed = JSON.parse(stdout.text.trim())
+    expect(parsed.state).toBe("swept")
+    expect(parsed.residuals).toEqual([])
+  })
+
+  test("a transfer-fee mint: the post-fee amount is shown, and the full raw balance still moves", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const source = getAssociatedTokenAddressSync(MINT_2022, teeKey.publicKey, false, SPL_TOKEN_2022)
+    const rpc = defaultRpcState({
+      token2022Accounts: [
+        {
+          pubkey: source.toBase58(),
+          mint: MINT_2022.toBase58(),
+          amount: "100000000",
+          decimals: 6,
+          state: "initialized",
+        },
+      ],
+      accounts: mint2022(extendedMint(6, [{ type: 1, body: transferFeeBody(150, 1_000_000n) }])),
+      epoch: 42,
+    })
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": () => jsonResponse(200, { success: true, state: "swept", sweptAt: 1 }),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC], deps)).toBe(0)
+    // The instruction carries the full raw amount; the mint withholds its own cut on the way.
+    const transfer = decodeSent(rpc.sent[0] as string).instructions[1]
+    expect(Buffer.from(transfer?.data.subarray(1, 9) ?? []).readBigUInt64LE()).toBe(100_000_000n)
+    expect(humanText(stdout.text)).toContain(
+      humanText("Raw amount arriving 99000000 Raw mint fee withheld 1000000 Epoch 42"),
+    )
+    expect(humanText(stdout.text)).toContain(humanText("Transfer fee: 1.5% capped at 1000000 raw units"))
+  })
+
+  test("a transfer hook's extra accounts are resolved and appended before the TEE key signs", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const source = getAssociatedTokenAddressSync(MINT_2022, teeKey.publicKey, false, SPL_TOKEN_2022)
+    const hookProgram = Keypair.generate().publicKey
+    const literal = Keypair.generate().publicKey
+    const validateState = PublicKey.findProgramAddressSync(
+      [Buffer.from("extra-account-metas"), MINT_2022.toBuffer()],
+      hookProgram,
+    )[0]
+    const validation = new Uint8Array(16 + 35)
+    validation.set([105, 37, 101, 197, 75, 251, 102, 26], 0)
+    const view = new DataView(validation.buffer)
+    view.setUint32(8, 39, true)
+    view.setUint32(12, 1, true)
+    validation.set(literal.toBytes(), 17)
+    validation[50] = 1
+    const rpc = defaultRpcState({
+      token2022Accounts: [
+        { pubkey: source.toBase58(), mint: MINT_2022.toBase58(), amount: "5", decimals: 0, state: "initialized" },
+      ],
+      accounts: {
+        ...mint2022(extendedMint(0, [{ type: 14, body: transferHookBody(hookProgram) }])),
+        [validateState.toBase58()]: { owner: hookProgram.toBase58(), data: validation },
+      },
+    })
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": () => jsonResponse(200, { success: true, state: "swept", sweptAt: 1 }),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    const transfer = decodeSent(rpc.sent[0] as string).instructions[1]
+    expect(transfer?.keys.slice(4).map((k) => k.pubkey.toBase58())).toEqual([
+      literal.toBase58(),
+      hookProgram.toBase58(),
+      validateState.toBase58(),
+    ])
+  })
+
+  test("R5's four names: a failed Token-2022 send is a NAMED leftover, and the rest of the sweep runs", async () => {
+    const cases: Array<{
+      name: string
+      mint: Uint8Array
+      extra?: Record<string, { owner: string; data: Uint8Array }>
+    }> = [
+      { name: "TOKEN_2022_NOT_TRANSFERABLE", mint: extendedMint(0, [{ type: 9, body: new Uint8Array(0) }]) },
+      { name: "TOKEN_2022_FROZEN", mint: extendedMint(0, [{ type: 6, body: new Uint8Array([2]) }]) },
+      {
+        name: "TOKEN_2022_HOOK_REFUSED",
+        mint: extendedMint(0, [{ type: 14, body: transferHookBody(Keypair.generate().publicKey) }]),
+      },
+      {
+        // Nothing wrong with the mint: the vault's EXISTING destination account is frozen.
+        name: "TOKEN_2022_FROZEN",
+        mint: baseMint(0),
+        extra: {
+          [getAssociatedTokenAddressSync(MINT_2022, new PublicKey(VAULT), false, SPL_TOKEN_2022).toBase58()]: {
+            owner: TOKEN_2022_PROGRAM_ID,
+            data: tokenAccountBytes(true),
+          },
+        },
+      },
+    ]
+    for (const { name, mint, extra } of cases) {
+      const dir = await tempDir()
+      await seedTeeStore(dir, [enabledEntry()])
+      const source = getAssociatedTokenAddressSync(MINT_2022, teeKey.publicKey, false, SPL_TOKEN_2022)
+      // Amount 7, not 1: raw amount 1 with decimals 0 is a DAMM v2 position NFT candidate since
+      // BE-315 (P3-ED-6) and takes the close-build path, not the generic transfer this test pins.
+      const rpc = defaultRpcState({
+        token2022Accounts: [
+          { pubkey: source.toBase58(), mint: MINT_2022.toBase58(), amount: "7", decimals: 0, state: "initialized" },
+        ],
+        accounts: { ...mint2022(mint), ...extra },
+        lamports: 1_000_000,
+      })
+      const { fetch } = createRoutedFetch({
+        "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+        "/rpc": (req) => {
+          const body = JSON.parse(String(req.init.body)) as { method: string; id: number }
+          // The token transaction finalizes WITH an error: the one unambiguous failed send.
+          if (body.method === "getSignatureStatuses" && rpc.sent.length === 1) {
+            return jsonResponse(200, {
+              jsonrpc: "2.0",
+              id: body.id,
+              result: { value: [{ confirmationStatus: "finalized", err: { InstructionError: [1, "Custom"] } }] },
+            })
+          }
+          return rpcHandler(rpc)(req)
+        },
+      })
+      const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+      expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+      const parsed = JSON.parse(stdout.text.trim())
+      const named = parsed.residuals.find((r: { kind: string }) => r.kind === name)
+      expect(`${name}: ${JSON.stringify(named ?? parsed.residuals)}`).toContain(`${name}: {`)
+      expect(named.mint).toBe(MINT_2022.toBase58())
+      expect(named.amountRaw).toBe("7")
+      // The leftover does not abort the sweep: SOL still moved.
+      expect(parsed.receipts.map((r: { kind: string }) => r.kind)).toContain("sol")
+    }
+  })
+
+  test("a frozen Token-2022 account is named TOKEN_2022_FROZEN before anything is signed for it", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState({
+      token2022Accounts: [
+        { pubkey: "frozen2022", mint: MINT_2022.toBase58(), amount: "9", decimals: 0, state: "frozen" },
+      ],
+      tokenAccounts: [{ pubkey: "frozenClassic", mint: MINT.toBase58(), amount: "9", decimals: 6, state: "frozen" }],
+      accounts: mint2022(baseMint(0)),
+    })
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const parsed = JSON.parse(stdout.text.trim())
+    // The classic account keeps Phase 1's kind; the Token-2022 one earns R5's name.
+    expect(parsed.residuals.map((r: { kind: string }) => r.kind)).toContain("frozen-or-uninitialized")
+    expect(parsed.residuals.map((r: { kind: string }) => r.kind)).toContain("TOKEN_2022_FROZEN")
+  })
+
+  test("--emergency sweeps Token-2022 locally, with no API call at all", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const source = getAssociatedTokenAddressSync(MINT_2022, teeKey.publicKey, false, SPL_TOKEN_2022)
+    const rpc = defaultRpcState({
+      token2022Accounts: [
+        { pubkey: source.toBase58(), mint: MINT_2022.toBase58(), amount: "1", decimals: 0, state: "initialized" },
+      ],
+      accounts: mint2022(baseMint(0)),
+    })
+    const apiCalls: string[] = []
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => {
+        apiCalls.push("lifecycle")
+        return jsonResponse(200, LIFECYCLE("disable-pending"))
+      },
+      "/api/v1/agent/wallets/lw_tee1/swept": () => {
+        apiCalls.push("swept")
+        return jsonResponse(200, { success: true })
+      },
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--emergency", "--json"], deps)).toBe(3)
+    // The NFT moved to the pinned vault under Token-2022, signed by the local key alone.
+    const tx = decodeSent(rpc.sent[0] as string)
+    expect(tx.instructions[1]?.programId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID)
+    expect(tx.instructions[1]?.keys[2]?.pubkey.toBase58()).toBe(
+      getAssociatedTokenAddressSync(MINT_2022, new PublicKey(VAULT), false, SPL_TOKEN_2022).toBase58(),
+    )
+    // Emergency never records a sweep: the authority is still unverified.
+    expect(apiCalls).not.toContain("swept")
+  })
+
+  test("a frozen token account and SOL dust are residuals, listed with amounts, never touched", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState({
+      tokenAccounts: [{ pubkey: "frozenAcct", mint: MINT.toBase58(), amount: "9", decimals: 6, state: "frozen" }],
+      lamports: 4_000,
+      fee: 5_000,
+    })
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const parsed = JSON.parse(stdout.text.trim())
+    expect(rpc.sent).toHaveLength(0)
+    expect(parsed.residuals.map((r: { kind: string }) => r.kind).sort()).toEqual([
+      "frozen-or-uninitialized",
+      "sol-dust",
+    ])
+    expect(parsed.residuals.find((r: { kind: string }) => r.kind === "sol-dust").amountRaw).toBe("4000")
+  })
+
+  test("disable-pending without --emergency refuses to sign (exit 3); with --emergency it sweeps, warns, and stays pending", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const swept: unknown[] = []
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("disable-pending")),
+      "/api/v1/agent/wallets/lw_tee1/swept": () => {
+        swept.push(true)
+        return jsonResponse(200, { success: true })
+      },
+      "/rpc": rpcHandler(rpc),
+    })
+    const refused = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC], refused.deps)).toBe(3)
+    expect(refused.stderr.text).toContain("--emergency")
+    expect(rpc.sent).toHaveLength(0)
+
+    const emergency = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--emergency"], emergency.deps)).toBe(3)
+    expect(humanText(emergency.stdout.text)).toContain(humanText("EMERGENCY SWEEP"))
+    expect(emergency.stdout.text).toContain("race")
+    expect(rpc.sent).toHaveLength(1)
+    expect(swept).toEqual([])
+    expect(humanText(emergency.stdout.text)).toContain(humanText("remote authority is still pending"))
+  })
+
+  test("an enabled wallet is refused: disable first", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("enabled")),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stderr } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC], deps)).toBe(1)
+    expect(humanText(stderr.text)).toContain(humanText("tee disable"))
+    expect(rpc.sent).toHaveLength(0)
+  })
+
+  // Ember 4c (R4, T5): the open-bridge state on the lifecycle read gates an ordinary sweep.
+  const OPEN_BRIDGE = {
+    clientTradeId: "swap-b1",
+    role: "recipient",
+    state: "open",
+    openedAt: 1,
+    blockingUntil: 7_200_001,
+  }
+  const UNCERTAIN_BRIDGE = { clientTradeId: "swap-b0", role: "source", state: "uncertain", openedAt: 1 }
+
+  test("Ember 4c: an open bridge into the wallet refuses the sweep BRIDGE_IN_FLIGHT before anything is signed", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const { fetch, calls } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () =>
+        jsonResponse(200, LIFECYCLE("quarantined", { bridges: [OPEN_BRIDGE] })),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(1)
+    const parsed = JSON.parse(stdout.text.trim().split("\n").at(-1) ?? "")
+    expect(parsed.code).toBe("BRIDGE_IN_FLIGHT")
+    expect(parsed.message).toContain("into")
+    expect(parsed.suggestion).toContain("candle swap status swap-b1")
+    expect(parsed.details.bridges[0].clientTradeId).toBe("swap-b1")
+    expect(rpc.sent).toHaveLength(0)
+    expect(calls.some((call) => call.url.includes("/swept"))).toBe(false)
+  })
+
+  test("Ember 4c: an uncertain bridge (past two hours) is a warning, and the sweep goes ahead", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () =>
+        jsonResponse(200, LIFECYCLE("quarantined", { bridges: [UNCERTAIN_BRIDGE] })),
+      "/rpc": rpcHandler(rpc),
+    })
+    // A wrong vault confirmation stops it right after the gate, so the warning is the proof it passed.
+    const { deps, stdout, stderr } = depsFor(dir, fetch, [PASSPHRASE, "wrong!"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC], deps)).toBe(1)
+    expect(humanText(stdout.text)).toContain(humanText("bridge swap-b0 out of"))
+    expect(humanText(stdout.text)).toContain(humanText("sweep this wallet again"))
+    expect(stderr.text).not.toContain("BRIDGE_IN_FLIGHT")
+    expect(humanText(stderr.text)).toContain(humanText("vault was not confirmed"))
+  })
+
+  test("Ember 4c: an unread bridge state warns and does not refuse", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined", { bridges: null })),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout, stderr } = depsFor(dir, fetch, [PASSPHRASE, "wrong!"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC], deps)).toBe(1)
+    expect(humanText(stdout.text)).toContain(humanText("could not say whether a bridge"))
+    expect(humanText(stderr.text)).toContain(humanText("vault was not confirmed"))
+  })
+
+  test("Ember 4c: --emergency is never blocked by an open bridge, and says a later fill needs a second sweep", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () =>
+        jsonResponse(200, LIFECYCLE("quarantined", { bridges: [OPEN_BRIDGE] })),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout, stderr } = depsFor(dir, fetch, [PASSPHRASE, "wrong!"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--emergency"], deps)).toBe(1)
+    expect(humanText(stdout.text)).toContain(humanText("cannot see an open bridge"))
+    expect(humanText(stdout.text)).toContain(humanText("Warning: A bridge into"))
+    expect(humanText(stderr.text)).toContain(humanText("vault was not confirmed"))
+  })
+
+  test("a wrong vault confirmation signs nothing", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, linePrompts } = depsFor(dir, fetch, [PASSPHRASE, VAULT.slice(-6)])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC], deps)).toBe(1)
+    expect(linePrompts).toEqual([`Type confirm to sweep everything to ${VAULT}: `])
+    expect(rpc.sent).toHaveLength(0)
+  })
+
+  test("a transaction that never finalizes is a residual, not a success", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState({
+      statuses: Array.from({ length: 60 }, () => ({ confirmationStatus: "processed", err: null })),
+    })
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const parsed = JSON.parse(stdout.text.trim())
+    expect(parsed.residuals[0].kind).toBe("finality-uncertain")
+    expect(parsed.residuals[0].detail).toContain("not finalized")
+    expect(parsed.residuals[0].detail).toContain("may still land")
+    expect(parsed.pending).toHaveLength(1)
+    expect(parsed.pending[0].kind).toBe("sol")
+    // The pending record was written BEFORE the broadcast and survives the deadline.
+    const stored = (await openStore(dir)).entries[0]
+    expect(stored?.tee?.sweepPending?.map((p) => p.signature)).toEqual([parsed.pending[0].signature])
+    expect(stored?.tee?.sweepReceipts ?? []).toEqual([])
+  })
+
+  test("a plain-http RPC URL to a remote host is a usage error", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const { fetch, calls } = createRoutedFetch({})
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", "http://rpc.example/"], depsFor(dir, fetch, []).deps)).toBe(2)
+    expect(calls).toHaveLength(0)
+  })
+})
+
+/**
+ * BE-355 (T10, T11). `tee status` reports a rate limit that survived the retry in `balances.error`
+ * with the fix (D3's partial-read shape). `tee sweep`'s pre-signature reads keep D3's "uncertain"
+ * classification: with every read rate-limited it signs nothing and exits 3. A rate limit on the
+ * send is D4's uncertain outcome: exit 3, exactly one send, the pending record kept in the sealed
+ * entry, and the fix line on stderr, in the pre-profile form and in the profile form.
+ */
+describe("BE-355: rate limits (T10, T11)", () => {
+  const PRE_PROFILE_FIX = [
+    "--rpc-url https://<your-rpc> on this command, or CANDLE_SOLANA_RPC_URL for every command",
+    "or sign in (candle auth login) to store one per profile",
+  ]
+  const limitedRpc = (seen: string[]) => (req: { init: { body?: BodyInit | null } }) => {
+    seen.push((JSON.parse(String(req.init.body)) as { method: string }).method)
+    return new Response("rate limited", { status: 429 })
+  }
+
+  test("T10: tee status carries RPC_RATE_LIMITED and the fix in balances.error, after one retry, exit 0", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const seen: string[] = []
+    const { fetch } = createRoutedFetch({ "/rpc": limitedRpc(seen) })
+    const { deps, stdout, stderr } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "status", "--verify", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    const report = JSON.parse(stdout.text.trim())
+    expect(report.balances.error).toBe(`RPC_RATE_LIMITED (HTTP 429, retried once). Fix: ${PRE_PROFILE_FIX.join(", ")}`)
+    expect(seen).toEqual(["getBalance", "getBalance"])
+    expect(humanText(stderr.text)).toContain(humanText("Solana RPC: rpc.test (--rpc-url)"))
+    expect(stderr.text).not.toContain(RPC)
+  })
+
+  test("T10: tee sweep with every read rate-limited signs nothing: no send, exit 3, no pending record", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const seen: string[] = []
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/rpc": limitedRpc(seen),
+    })
+    const { deps } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen).not.toContain("sendTransaction")
+    expect((await openStore(dir)).entries[0]?.tee?.sweepPending ?? []).toEqual([])
+  })
+
+  async function rateLimitedSend(extra: Record<string, unknown> = {}) {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState({ lamports: 1_000_000, fee: 5_000 })
+    const base = rpcHandler(rpc)
+    const seen: string[] = []
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/rpc": (req) => {
+        const body = JSON.parse(String(req.init.body)) as { method: string }
+        seen.push(body.method)
+        if (body.method === "sendTransaction") return new Response("rate limited", { status: 429 })
+        return base(req)
+      },
+    })
+    const { deps, stderr } = depsFor(dir, fetch, [PASSPHRASE, "confirm"], extra)
+    const code = await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)
+    const pending = (await openStore(dir)).entries[0]?.tee?.sweepPending ?? []
+    return { code, seen, stderr, pending }
+  }
+
+  test("T11: a rate-limited send exits 3 with one send, the pending record kept, and D3's pre-profile fix", async () => {
+    const t = await rateLimitedSend()
+    expect(t.code).toBe(3)
+    expect(t.seen.filter((m) => m === "sendTransaction")).toHaveLength(1)
+    expect(t.pending).toHaveLength(1)
+    const signature = t.pending[0]?.signature
+    expect(humanText(t.stderr.text)).toContain(
+      humanText(
+        `The RPC rate-limited this CLI after the transaction was signed. It may still land: check ${signature} before anything else.\nFix: ${PRE_PROFILE_FIX[0]}\n     ${PRE_PROFILE_FIX[1]}\n`,
+      ),
+    )
+    expect(t.stderr.text).not.toContain("profile set")
+    expect(t.stderr.text).not.toContain("<name>")
+  })
+
+  test("T11: with acting profile work the fix names candle profile set work", async () => {
+    const t = await rateLimitedSend({
+      store: createFakeStore({ "profile:work:api_key": "ck_live_x" }),
+      ...createFakeConfigStore({ profiles: { work: {} }, activeProfile: "work" }),
+    })
+    expect(t.code).toBe(3)
+    expect(t.seen.filter((m) => m === "sendTransaction")).toHaveLength(1)
+    expect(t.pending).toHaveLength(1)
+    expect(humanText(t.stderr.text)).toContain(
+      humanText(
+        `check ${t.pending[0]?.signature} before anything else.\nFix: candle profile set work --rpc-url https://<your-rpc>\n`,
+      ),
+    )
+  })
+})
+
+describe("T28: two writers cannot lose keys (TEE wallet store lock + merge on commit)", () => {
+  test("overlapping `tee new` commands both succeed and BOTH keys are in the store", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [teeEntry()])
+    const { fetch, calls } = createRoutedFetch({})
+    // B opens the store first and stalls on that read; A runs to completion in between; B then
+    // commits against the file A wrote, not the copy B opened.
+    let releaseB!: () => void
+    const waitB = new Promise<void>((resolve) => {
+      releaseB = resolve
+    })
+    let readB!: () => void
+    const startedB = new Promise<void>((resolve) => {
+      readB = resolve
+    })
+    let firstRead = true
+    const b = depsFor(dir, fetch, [PASSPHRASE], {
+      readFile: async (p: string) => {
+        const raw = await realReadFile(p, "utf8")
+        if (firstRead) {
+          firstRead = false
+          readB()
+          await waitB
+        }
+        return raw
+      },
+    })
+    const taskB = run(["tee", "new", "--json", "--label", "b"], b.deps)
+    await startedB
+    const a = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "new", "--json", "--label", "a"], a.deps)).toBe(0)
+    releaseB()
+    expect(await taskB).toBe(0)
+    expect(calls).toHaveLength(0)
+
+    const addressA = JSON.parse(a.stdout.text).address
+    const addressB = JSON.parse(b.stdout.text).address
+    const stored = await openStore(dir)
+    expect(stored.entries.map((e) => e.address)).toEqual([TEE, addressA, addressB])
+    expect(stored.entries.map((e) => e.index)).toEqual([0, 1, 2])
+    expect(stored.entries.map((e) => e.label)).toEqual(["tee-0", "a", "b"])
+    // B's printed index is the one it actually got after the merge, not the stale one.
+    expect(JSON.parse(b.stdout.text).index).toBe(2)
+    for (const e of stored.entries.slice(1)) {
+      expect(base58.decode(e.privateKey)).toHaveLength(64)
+    }
+  })
+
+  test("a lock left behind fails closed: nothing is written and the message names the lock", async () => {
+    const dir = await tempDir()
+    const path = await seedTeeStore(dir, [teeEntry()])
+    await mkdir(keystoreLockPath(path))
+    const before = await realReadFile(path, "utf8")
+    const { fetch } = createRoutedFetch({})
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "new", "--json"], deps)).toBe(1)
+    const failure = JSON.parse(stdout.text)
+    expect(failure.code).toBe("TEE_STORE_LOCKED")
+    expect(failure.message).toContain(keystoreLockPath(path))
+    expect(await realReadFile(path, "utf8")).toBe(before)
+  })
+
+  test("a store replaced under a different passphrase between open and commit is never overwritten", async () => {
+    const dir = await tempDir()
+    const path = await seedTeeStore(dir, [teeEntry()])
+    let reads = 0
+    const { fetch } = createRoutedFetch({})
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE], {
+      readFile: async (p: string) => {
+        const raw = await realReadFile(p, "utf8")
+        reads += 1
+        // Another operator (or a restore) replaces the file after this command opened it.
+        if (reads === 1) await seedTeeStore(dir, [teeEntry({ label: "restored" })], "a different passphrase!")
+        return raw
+      },
+    })
+    expect(await run(["tee", "new", "--json"], deps)).toBe(1)
+    expect(JSON.parse(stdout.text).code).toBe("TEE_STORE_CHANGED")
+    const stored = await openStore(dir, "a different passphrase!")
+    expect(stored.entries.map((e) => e.label)).toEqual(["restored"])
+    expect(await realReadFile(path, "utf8")).toContain("ember-tee")
+  })
+
+  test("enable and disable commit against the current file: a key appended meanwhile survives", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const other = Keypair.generate()
+    let reads = 0
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1": () =>
+        jsonResponse(202, { success: true, state: "disable-pending", complete: false }),
+    })
+    const { deps } = depsFor(dir, fetch, [PASSPHRASE], {
+      readFile: async (p: string) => {
+        const raw = await realReadFile(p, "utf8")
+        reads += 1
+        if (reads === 1) {
+          // A concurrent `tee new` lands after this command opened the store.
+          const current = await openStore(dir)
+          current.entries.push({
+            index: 1,
+            chain: "solana",
+            address: other.publicKey.toBase58(),
+            label: "concurrent",
+            createdAt: "2026-09-16T02:00:00.000Z",
+            privateKey: base58.encode(other.secretKey),
+            imported: false,
+            tee: { network: "solana-mainnet" },
+          })
+          await writeKeystoreFile(
+            defaultTeeKeystorePath({ CANDLE_CONFIG_DIR: dir }, TEST_HOME),
+            await serializeKeystore(current.entries, current.key, current.salt, current.iterations, "ember-tee"),
+          )
+        }
+        return raw
+      },
+    })
+    expect(await run(["tee", "disable", TEE], deps)).toBe(3)
+    const stored = await openStore(dir)
+    expect(stored.entries.map((e) => e.label)).toEqual(["tee-0", "concurrent"])
+    expect(typeof stored.entries[0]?.tee?.stopRequestedAt).toBe("string")
+  })
+})
+
+describe("HW-06: the stop intent is durable before the server is asked", () => {
+  test("a failed stop request (503) still persists stopRequestedAt, exits 1, and reports remote enforcement UNCONFIRMED; fund then refuses", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const { fetch, calls } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1": () => jsonResponse(503, { error: "unavailable" }),
+    })
+    const { deps, stderr } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "disable", TEE], deps)).toBe(1)
+    expect(calls[0]?.init.method).toBe("DELETE")
+    expect(stderr.text).toContain("UNCONFIRMED")
+    expect(humanText(stderr.text)).toContain(humanText("tee disable"))
+    const stored = await openStore(dir)
+    expect(typeof stored.entries[0]?.tee?.stopRequestedAt).toBe("string")
+    expect(stored.entries[0]?.tee?.remoteAuthority).toBe("verified-active")
+
+    const fund = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "fund", TEE, "--amount", "1", "--json"], fund.deps)).toBe(1)
+    expect(JSON.parse(fund.stdout.text).code).toBe("TEE_WALLET_STOPPED")
+  })
+
+  test("--json: the unconfirmed stop is one typed object carrying the local marker", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1": () => jsonResponse(401, { error: { code: "UNAUTHORIZED", message: "revoked" } }),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "disable", TEE, "--json"], deps)).toBe(1)
+    const body = JSON.parse(stdout.text)
+    expect(body).toMatchObject({
+      ok: false,
+      code: "STOP_UNCONFIRMED",
+      remoteEnforcement: "unconfirmed",
+      linkedWalletId: "lw_tee1",
+    })
+    expect(typeof body.stopRequestedAt).toBe("string")
+    expect(body.message).toContain("no longer works")
+  })
+
+  test("no API key: the stop intent is persisted, no request is made, and the session path is named", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const { fetch, calls } = createRoutedFetch({})
+    const { deps, stderr } = depsFor(dir, fetch, [PASSPHRASE], { store: createFakeStore({}) })
+    expect(await run(["tee", "disable", TEE], deps)).toBe(1)
+    expect(calls).toHaveLength(0)
+    expect(stderr.text).toContain("session")
+    expect(stderr.text).toContain("lw_tee1")
+    expect(typeof (await openStore(dir)).entries[0]?.tee?.stopRequestedAt).toBe("string")
+  })
+
+  test("a repeat disable keeps the FIRST stopRequestedAt", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [
+      enabledEntry({
+        tee: {
+          network: "solana-mainnet",
+          vaultDestination: VAULT,
+          boundKeyPrefix: "ck_live_x",
+          remoteAuthority: "verified-active",
+          enabledAt: "2026-09-16T01:00:00.000Z",
+          stopRequestedAt: "2026-09-16T03:00:00.000Z",
+        },
+      }),
+    ])
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1": () =>
+        jsonResponse(202, { success: true, state: "disable-pending", complete: false }),
+    })
+    const { deps } = depsFor(dir, fetch, [PASSPHRASE])
+    expect(await run(["tee", "disable", TEE], deps)).toBe(3)
+    expect((await openStore(dir)).entries[0]?.tee?.stopRequestedAt).toBe("2026-09-16T03:00:00.000Z")
+  })
+})
+
+describe("HW-08 / T25: recovery does not depend on the operational credential", () => {
+  test("no API key + --emergency: the sweep signs and sends with only the local key and the pinned vault; authority stays pending", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const { fetch, calls } = createRoutedFetch({ "/rpc": rpcHandler(rpc) })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"], { store: createFakeStore({}) })
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--emergency"], deps)).toBe(3)
+    expect(rpc.sent).toHaveLength(1)
+    const tx = Transaction.from(Buffer.from(rpc.sent[0] as string, "base64"))
+    expect(tx.verifySignatures()).toBe(true)
+    expect(tx.instructions[0]?.keys[1]?.pubkey.toBase58()).toBe(VAULT)
+    expect(Buffer.from(tx.instructions[0]?.data.subarray(4, 12) ?? []).readBigUInt64LE()).toBe(995_000n)
+    // Only the RPC was called: no lifecycle read, no sweep record, nothing that needs a key.
+    expect(calls.every((c) => c.url.includes("/rpc"))).toBe(true)
+    expect(humanText(stdout.text)).toContain(humanText("EMERGENCY SWEEP"))
+    expect(humanText(stdout.text)).toContain(humanText("NOT read"))
+    expect(humanText(stdout.text)).toContain(humanText("no API key available"))
+    expect(humanText(stdout.text)).toContain(humanText("remote authority is still pending"))
+    const stored = await openStore(dir)
+    expect(stored.entries[0]?.tee?.sweptAt).toBeUndefined()
+    expect(typeof stored.entries[0]?.tee?.stopRequestedAt).toBe("string")
+  })
+
+  test("no API key without --emergency: refuses (exit 3), signs nothing, and names the emergency path", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const { fetch } = createRoutedFetch({ "/rpc": rpcHandler(rpc) })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE], { store: createFakeStore({}) })
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    expect(rpc.sent).toHaveLength(0)
+    const body = JSON.parse(stdout.text)
+    expect(body.code).toBe("TEE_WALLET_STATE_UNREAD")
+    expect(body.suggestion).toContain("--emergency")
+  })
+
+  test("a revoked key (401 on the lifecycle read) + --emergency: recovers locally and never posts a sweep record with that key", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const { fetch, calls } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () =>
+        jsonResponse(401, { error: { code: "UNAUTHORIZED", message: "API key revoked" } }),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--emergency", "--json"], deps)).toBe(3)
+    expect(rpc.sent).toHaveLength(1)
+    expect(calls.some((c) => c.url.includes("/swept"))).toBe(false)
+    const body = JSON.parse(stdout.text)
+    expect(body.state).toBe("disable-pending")
+    expect(body.serverState).toBe("unread")
+    expect(body.recordedOnServer).toBe(false)
+  })
+})
+
+describe("SC-06: completion needs a post-finality inventory", () => {
+  test("SOL deposited while the sweep finalized is a residual: exit 3, not swept, nothing recorded anywhere", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const base = rpcHandler(rpc)
+    let balanceReadsAfterSend = 0
+    const swept: unknown[] = []
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": () => {
+        swept.push(true)
+        return jsonResponse(200, { success: true, state: "swept" })
+      },
+      "/rpc": (req) => {
+        const body = JSON.parse(String(req.init.body)) as { method: string }
+        // A deposit lands while the transfer is being confirmed.
+        if (body.method === "getSignatureStatuses") rpc.lamports = 123_456
+        if (body.method === "getBalance" && rpc.sent.length > 0) balanceReadsAfterSend += 1
+        return base(req)
+      },
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    expect(balanceReadsAfterSend).toBeGreaterThan(0)
+    const body = JSON.parse(stdout.text)
+    expect(body.state).toBe("quarantined")
+    expect(body.receipts).toHaveLength(1)
+    expect(body.residuals).toEqual([expect.objectContaining({ kind: "sol-remaining", amountRaw: "123456" })])
+    expect(body.inventory).toMatchObject({ verified: true, lamports: "123456" })
+    expect(body.recordedOnServer).toBe(false)
+    expect(swept).toEqual([])
+    expect((await openStore(dir)).entries[0]?.tee?.sweptAt).toBeUndefined()
+  })
+
+  test("a token account that appears after finality is a residual too", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const base = rpcHandler(rpc)
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/rpc": (req) => {
+        const body = JSON.parse(String(req.init.body)) as { method: string }
+        if (body.method === "getSignatureStatuses" && rpc.tokenAccounts.length === 0) {
+          rpc.tokenAccounts.push({
+            pubkey: "lateAcct",
+            mint: MINT.toBase58(),
+            amount: "9",
+            decimals: 6,
+            state: "initialized",
+          })
+        }
+        return base(req)
+      },
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const body = JSON.parse(stdout.text)
+    expect(body.state).not.toBe("swept")
+    expect(body.residuals).toEqual([expect.objectContaining({ kind: "token-account-remaining", account: "lateAcct" })])
+  })
+
+  test("an inventory that cannot be read after the transfers keeps the address quarantined", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const base = rpcHandler(rpc)
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/rpc": (req) => {
+        const body = JSON.parse(String(req.init.body)) as { method: string }
+        if (body.method === "getBalance" && rpc.sent.length > 0) return jsonResponse(503, {})
+        return base(req)
+      },
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const body = JSON.parse(stdout.text)
+    expect(body.state).toBe("quarantined")
+    expect(body.inventory.verified).toBe(false)
+    expect(body.residuals).toEqual([expect.objectContaining({ kind: "inventory-unverified" })])
+  })
+
+  test("the server refusing the record (409: authority pending) REPLACES the earlier quarantined read: state disable-pending, receipts retained, no local swept mark", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": () =>
+        jsonResponse(409, {
+          success: false,
+          error: {
+            code: "VALIDATION_FAILED",
+            message: "Remote signing authority is not verified denied",
+            state: "disable-pending",
+            retryable: true,
+          },
+        }),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const body = JSON.parse(stdout.text)
+    expect(body.state).toBe("disable-pending")
+    expect(body.serverState).toBe("disable-pending")
+    expect(body.residuals).toEqual([expect.objectContaining({ kind: "server-record-refused" })])
+    expect(body.recordedOnServer).toBe(false)
+    const stored = (await openStore(dir)).entries[0]
+    expect(stored?.tee?.sweptAt).toBeUndefined()
+    expect(stored?.tee?.sweepReceipts?.map((r) => r.signature)).toEqual(rpc.sent.map(sigOf))
+
+    // Text output says the same thing: the address is pending, not quarantined.
+    const text = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC], text.deps)).toBe(3)
+    expect(humanText(text.stdout.text)).toContain(humanText("stays disable-pending"))
+    expect(humanText(text.stdout.text)).toContain(humanText("not verified denied"))
+    expect(text.stdout.text).not.toContain("stays quarantined")
+  })
+})
+
+describe("HW-07: finalized receipts are retained and reconciled on retry", () => {
+  function recordingServer(opts: { available: () => boolean; lifecycle: () => string }) {
+    let recordCalls = 0
+    const records: unknown[] = []
+    const rpc = defaultRpcState()
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE(opts.lifecycle())),
+      "/api/v1/agent/wallets/lw_tee1/swept": (req) => {
+        recordCalls += 1
+        records.push(JSON.parse(String(req.init.body)))
+        return opts.available()
+          ? jsonResponse(200, { success: true, id: "lw_tee1", state: "swept", sweptAt: 1 })
+          : jsonResponse(503, { error: "temporary outage" })
+      },
+      "/rpc": rpcHandler(rpc),
+    })
+    return { fetch, rpc, records, recordCalls: () => recordCalls }
+  }
+
+  test("a recording outage: the second run records the retained receipt with no new transfer and exits 0", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    let available = false
+    const server = recordingServer({ available: () => available, lifecycle: () => "quarantined" })
+    const first = depsFor(dir, server.fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], first.deps)).toBe(3)
+    const one = JSON.parse(first.stdout.text)
+    expect(one.receipts).toHaveLength(1)
+    expect(one.residuals).toEqual([expect.objectContaining({ kind: "server-record-failed" })])
+    expect(one.residuals[0].detail).toContain("retained")
+    expect(server.rpc.lamports).toBe(0)
+    expect((await openStore(dir)).entries[0]?.tee?.sweepReceipts?.map((r) => r.signature)).toEqual(
+      server.rpc.sent.map(sigOf),
+    )
+
+    available = true
+    const second = depsFor(dir, server.fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], second.deps)).toBe(0)
+    const two = JSON.parse(second.stdout.text)
+    expect(two.state).toBe("swept")
+    expect(two.newReceipts).toBe(0)
+    expect(two.retainedReceipts).toBe(1)
+    expect(two.receipts.map((r: { signature: string }) => r.signature)).toEqual(server.rpc.sent.map(sigOf))
+    expect(server.rpc.sent).toHaveLength(1)
+    expect(server.recordCalls()).toBe(2)
+    expect(server.records[1]).toEqual({ signatures: server.rpc.sent.map(sigOf), residuals: [] })
+    expect(typeof (await openStore(dir)).entries[0]?.tee?.sweptAt).toBe("string")
+  })
+
+  test("emergency sweep, then a verified disable, then a plain sweep: the emergency receipts are recorded, nothing is re-signed", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    let lifecycle = "disable-pending"
+    const server = recordingServer({ available: () => true, lifecycle: () => lifecycle })
+    const emergency = depsFor(dir, server.fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--emergency", "--json"], emergency.deps)).toBe(3)
+    expect(JSON.parse(emergency.stdout.text).state).toBe("disable-pending")
+    expect(server.recordCalls()).toBe(0)
+    expect(server.rpc.sent).toHaveLength(1)
+
+    lifecycle = "quarantined" // a later `tee disable` read back the denial
+    const reconcile = depsFor(dir, server.fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], reconcile.deps)).toBe(0)
+    const body = JSON.parse(reconcile.stdout.text)
+    expect(body.state).toBe("swept")
+    expect(body.emergency).toBe(false)
+    expect(body.retainedReceipts).toBe(1)
+    expect(body.newReceipts).toBe(0)
+    expect(server.rpc.sent).toHaveLength(1)
+    expect(server.records).toEqual([{ signatures: server.rpc.sent.map(sigOf), residuals: [] }])
+  })
+
+  test("a repeat after success is idempotent: exit 0, no transfer, no second record, and a late deposit still reopens residuals", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const server = recordingServer({ available: () => true, lifecycle: () => "quarantined" })
+    const first = depsFor(dir, server.fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], first.deps)).toBe(0)
+    expect(server.recordCalls()).toBe(1)
+
+    const again = depsFor(dir, server.fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], again.deps)).toBe(0)
+    const body = JSON.parse(again.stdout.text)
+    expect(body.state).toBe("swept")
+    expect(body.recordedOnServer).toBe(true)
+    expect(body.newReceipts).toBe(0)
+    expect(server.rpc.sent).toHaveLength(1)
+    expect(server.recordCalls()).toBe(1)
+
+    // A deposit after the sweep: the address is residual-present again (SC-06), and the next run
+    // moves it and reports the new receipt alongside the retained one.
+    server.rpc.lamports = 50_000
+    const late = depsFor(dir, server.fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], late.deps)).toBe(0)
+    const moved = JSON.parse(late.stdout.text)
+    expect(moved.newReceipts).toBe(1)
+    expect(moved.retainedReceipts).toBe(1)
+    expect(server.rpc.sent).toHaveLength(2)
+    expect(server.rpc.lamports).toBe(0)
+  })
+
+  test("an interrupted run keeps the token receipt: the retry only moves what is left", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const source = getAssociatedTokenAddressSync(MINT, teeKey.publicKey)
+    const rpc = defaultRpcState({
+      tokenAccounts: [
+        { pubkey: source.toBase58(), mint: MINT.toBase58(), amount: "700000", decimals: 6, state: "initialized" },
+      ],
+      // The token transaction finalizes; the SOL transfer never does on the first run.
+      statuses: [
+        { confirmationStatus: "finalized", err: null },
+        ...Array.from({ length: 60 }, () => ({ confirmationStatus: "processed", err: null })),
+      ],
+    })
+    const records: unknown[] = []
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": (req) => {
+        records.push(JSON.parse(String(req.init.body)))
+        return jsonResponse(200, { success: true, state: "swept" })
+      },
+      "/rpc": rpcHandler(rpc),
+    })
+    const first = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], first.deps)).toBe(3)
+    const one = JSON.parse(first.stdout.text)
+    expect(one.receipts.map((r: { kind: string }) => r.kind)).toEqual(["token"])
+    expect(one.residuals.map((r: { kind: string }) => r.kind)).toContain("finality-uncertain")
+    expect(one.pending).toHaveLength(1)
+    expect(rpc.sent).toHaveLength(2)
+
+    // The unfinalized SOL transfer never landed and its blockhash expired: put its lamports back,
+    // answer "not found" for that signature on both reads around the validity check, and report
+    // the blockhash as no longer valid.
+    rpc.lamports = 990_000
+    rpc.statuses = [null, null]
+    rpc.blockhashValid = false
+    const second = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], second.deps)).toBe(0)
+    const two = JSON.parse(second.stdout.text)
+    expect(two.retainedReceipts).toBe(1)
+    expect(two.newReceipts).toBe(1)
+    expect(two.receipts.map((r: { kind: string }) => r.kind)).toEqual(["token", "sol"])
+    // The retained token receipt (first send) plus the retried SOL transfer (third send); the
+    // second send never landed and was dropped as expired.
+    expect(records).toEqual([
+      { signatures: [sigOf(rpc.sent[0] as string), sigOf(rpc.sent[2] as string)], residuals: [] },
+    ])
+  })
+})
+
+describe("HW-07: ambiguous finality is persisted before broadcast and reconciled", () => {
+  test("a transfer that finalizes AFTER the polling deadline: the next run turns the pending record into a receipt, signs nothing, records, exit 0", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState({
+      statuses: Array.from({ length: 45 }, () => ({ confirmationStatus: "processed", err: null })),
+    })
+    const base = rpcHandler(rpc)
+    let finalized = false
+    let statusReads = 0
+    const records: unknown[] = []
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": (req) => {
+        records.push(JSON.parse(String(req.init.body)))
+        return jsonResponse(200, { success: true, state: "swept" })
+      },
+      "/rpc": (req) => {
+        const body = JSON.parse(String(req.init.body)) as { method: string; id: number }
+        if (body.method === "getSignatureStatuses") statusReads += 1
+        // Until the transfer finalizes, finalized-commitment balance reads still show the old balance.
+        if (body.method === "getBalance" && rpc.sent.length > 0 && !finalized)
+          return jsonResponse(200, { jsonrpc: "2.0", id: body.id, result: { value: 1_000_000 } })
+        return base(req)
+      },
+    })
+    const first = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], first.deps)).toBe(3)
+    const one = JSON.parse(first.stdout.text)
+    expect(rpc.sent).toHaveLength(1)
+    expect(one.pending).toHaveLength(1)
+    const pendingSig = one.pending[0].signature
+    expect(one.residuals.map((r: { kind: string }) => r.kind)).toContain("finality-uncertain")
+    expect(records).toEqual([])
+    const afterFirst = (await openStore(dir)).entries[0]
+    expect(afterFirst?.tee?.sweepPending?.map((p) => p.signature)).toEqual([pendingSig])
+    expect(afterFirst?.tee?.sweepPending?.[0]?.blockhash).toBe(BLOCKHASH)
+
+    finalized = true
+    rpc.statuses = []
+    const before = statusReads
+    const second = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], second.deps)).toBe(0)
+    const two = JSON.parse(second.stdout.text)
+    expect(statusReads - before).toBeGreaterThan(0)
+    expect(rpc.sent).toHaveLength(1)
+    expect(two.state).toBe("swept")
+    expect(two.newReceipts).toBe(1)
+    expect(two.receipts.map((r: { signature: string }) => r.signature)).toEqual([pendingSig])
+    expect(two.pending).toEqual([])
+    expect(records).toEqual([{ signatures: [pendingSig], residuals: [] }])
+    const stored = (await openStore(dir)).entries[0]
+    expect(stored?.tee?.sweepPending).toEqual([])
+    expect(stored?.tee?.sweepReceipts?.map((r) => r.signature)).toEqual([pendingSig])
+    expect(typeof stored?.tee?.sweptAt).toBe("string")
+  })
+
+  test("a send that throws is uncertain, not failed: the record survives and the next run resolves it", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState()
+    const base = rpcHandler(rpc)
+    let sendThrows = true
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": () => jsonResponse(200, { success: true, state: "swept" }),
+      "/rpc": (req) => {
+        const body = JSON.parse(String(req.init.body)) as { method: string }
+        if (body.method === "sendTransaction" && sendThrows) {
+          // The RPC relays it and then the connection drops before the answer arrives.
+          base(req)
+          return new Response("", { status: 502 })
+        }
+        return base(req)
+      },
+    })
+    const first = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], first.deps)).toBe(3)
+    const one = JSON.parse(first.stdout.text)
+    expect(one.pending).toHaveLength(1)
+    expect(one.residuals[0].kind).toBe("finality-uncertain")
+    expect(one.residuals[0].detail).toContain("may still land")
+    expect(rpc.sent).toHaveLength(1)
+
+    sendThrows = false
+    const second = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], second.deps)).toBe(0)
+    expect(rpc.sent).toHaveLength(1)
+    expect(JSON.parse(second.stdout.text).receipts).toHaveLength(1)
+  })
+
+  test("a still-unconfirmed pending transaction with a valid blockhash blocks new signing and stays residual", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState({
+      statuses: Array.from({ length: 45 }, () => ({ confirmationStatus: "processed", err: null })),
+    })
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/rpc": rpcHandler(rpc),
+    })
+    const first = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], first.deps)).toBe(3)
+    expect(rpc.sent).toHaveLength(1)
+
+    // Still nothing known about it, and it can still land: do not race it.
+    rpc.lamports = 1_000_000
+    rpc.statuses = [null]
+    rpc.blockhashValid = true
+    const second = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC], second.deps)).toBe(3)
+    expect(rpc.sent).toHaveLength(1)
+    expect(humanText(second.stdout.text)).toContain(humanText("still in flight"))
+    expect(humanText(second.stdout.text)).toContain(humanText("stays quarantined"))
+    expect((await openStore(dir)).entries[0]?.tee?.sweepPending).toHaveLength(1)
+
+    // Now it is gone for good (blockhash expired): the balance is swept again and recorded.
+    const records: unknown[] = []
+    const { fetch: fetch3 } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": (req) => {
+        records.push(JSON.parse(String(req.init.body)))
+        return jsonResponse(200, { success: true, state: "swept" })
+      },
+      "/rpc": rpcHandler(rpc),
+    })
+    rpc.statuses = [null, null]
+    rpc.blockhashValid = false
+    const third = depsFor(dir, fetch3, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], third.deps)).toBe(0)
+    expect(rpc.sent).toHaveLength(2)
+    const body = JSON.parse(third.stdout.text)
+    // The fake chain hands out one constant blockhash, so the re-signed transfer is byte-identical
+    // to the expired one (a real chain's fresh blockhash gives a fresh signature); what matters is
+    // that it was signed and sent AGAIN, finalized, and recorded, with no pending record left.
+    expect(body.receipts).toHaveLength(1)
+    expect(body.receipts[0].signature).toBe(sigOf(rpc.sent[1] as string))
+    expect(records).toEqual([{ signatures: [body.receipts[0].signature], residuals: [] }])
+    expect((await openStore(dir)).entries[0]?.tee?.sweepPending).toEqual([])
+  })
+
+  test("a pending transaction that failed on chain is dropped and its balance swept again", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [
+      enabledEntry({
+        tee: {
+          network: "solana-mainnet",
+          vaultDestination: VAULT,
+          boundKeyPrefix: "ck_live_x",
+          remoteAuthority: "verified-active",
+          enabledAt: "2026-09-16T01:00:00.000Z",
+          stopRequestedAt: "2026-09-16T03:00:00.000Z",
+          sweepPending: [
+            {
+              kind: "sol",
+              amountRaw: "995000",
+              signature: "oldsig",
+              blockhash: BLOCKHASH,
+              submittedAt: "2026-09-16T03:01:00.000Z",
+            },
+          ],
+        },
+      }),
+    ])
+    const rpc = defaultRpcState({
+      statuses: [{ confirmationStatus: "finalized", err: { InstructionError: [0, "Custom"] } }],
+    })
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": () => jsonResponse(200, { success: true, state: "swept" }),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    const body = JSON.parse(stdout.text)
+    expect(rpc.sent).toHaveLength(1)
+    expect(body.receipts.map((r: { signature: string }) => r.signature)).not.toContain("oldsig")
+    expect(body.pending).toEqual([])
+  })
+})
+
+describe("HW-07: pending evidence is preserved until conclusive", () => {
+  const withPending = (blockhash = BLOCKHASH) =>
+    enabledEntry({
+      tee: {
+        network: "solana-mainnet",
+        vaultDestination: VAULT,
+        boundKeyPrefix: "ck_live_x",
+        remoteAuthority: "verified-active",
+        enabledAt: "2026-09-16T01:00:00.000Z",
+        stopRequestedAt: "2026-09-16T03:00:00.000Z",
+        sweepPending: [
+          {
+            kind: "sol",
+            amountRaw: "995000",
+            signature: "original-signature",
+            blockhash,
+            submittedAt: "2026-09-16T03:01:00.000Z",
+          },
+        ],
+      },
+    })
+  const quarantined = (rpc: RpcState, extra: Record<string, RouteHandler> = {}) =>
+    createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": () => jsonResponse(200, { success: true, state: "swept" }),
+      "/rpc": rpcHandler(rpc),
+      ...extra,
+    })
+
+  test("a confirmed observation is kept even though its admission blockhash expired; nothing new is signed", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [withPending()])
+    const rpc = defaultRpcState({
+      lamports: 0,
+      statuses: [{ confirmationStatus: "confirmed", err: null }],
+      blockhashValid: false,
+    })
+    const { fetch } = quarantined(rpc)
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const body = JSON.parse(stdout.text)
+    expect(body.pending.map((p: { signature: string }) => p.signature)).toEqual(["original-signature"])
+    expect(body.residuals[0]).toMatchObject({ kind: "finality-uncertain" })
+    expect(body.residuals[0].detail).toContain("confirmed")
+    expect(rpc.sent).toHaveLength(0)
+    expect((await openStore(dir)).entries[0]?.tee?.sweepPending).toHaveLength(1)
+  })
+
+  test("a nonfinal ERROR is not a failure: kept pending, nothing new signed", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [withPending()])
+    const rpc = defaultRpcState({
+      lamports: 995_000,
+      statuses: [{ confirmationStatus: "processed", err: { InstructionError: [0, "Custom"] } }],
+    })
+    const { fetch } = quarantined(rpc)
+    const { deps } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    expect(rpc.sent).toHaveLength(0)
+    expect((await openStore(dir)).entries[0]?.tee?.sweepPending?.map((p) => p.signature)).toEqual([
+      "original-signature",
+    ])
+  })
+
+  test("a malformed isBlockhashValid answer is unknown, not expiry: kept pending, nothing new signed", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [withPending()])
+    const rpc = defaultRpcState({ lamports: 0, statuses: [null] })
+    const base = rpcHandler(rpc)
+    const { fetch } = quarantined(rpc, {
+      "/rpc": (req) => {
+        const body = JSON.parse(String(req.init.body)) as { method: string; id: number }
+        if (body.method === "isBlockhashValid") return jsonResponse(200, { jsonrpc: "2.0", id: body.id, result: {} })
+        return base(req)
+      },
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    expect(humanText(JSON.parse(stdout.text).residuals[0].detail)).toContain(humanText("validity is unknown"))
+    expect(rpc.sent).toHaveLength(0)
+    expect((await openStore(dir)).entries[0]?.tee?.sweepPending).toHaveLength(1)
+  })
+
+  test("the status/expiry race: not found, blockhash expired, then finalized on the confirming re-read becomes a receipt", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [withPending()])
+    const rpc = defaultRpcState({
+      lamports: 0,
+      statuses: [null, { confirmationStatus: "finalized", err: null }],
+      blockhashValid: false,
+    })
+    let statusReads = 0
+    const base = rpcHandler(rpc)
+    const records: unknown[] = []
+    const { fetch } = quarantined(rpc, {
+      "/api/v1/agent/wallets/lw_tee1/swept": (req) => {
+        records.push(JSON.parse(String(req.init.body)))
+        return jsonResponse(200, { success: true, state: "swept" })
+      },
+      "/rpc": (req) => {
+        if ((JSON.parse(String(req.init.body)) as { method: string }).method === "getSignatureStatuses")
+          statusReads += 1
+        return base(req)
+      },
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    expect(statusReads).toBe(2)
+    expect(rpc.sent).toHaveLength(0)
+    expect(JSON.parse(stdout.text).receipts.map((r: { signature: string }) => r.signature)).toEqual([
+      "original-signature",
+    ])
+    expect(records).toEqual([{ signatures: ["original-signature"], residuals: [] }])
+  })
+
+  test("validated expiry needs TWO missing reads around the invalid blockhash; only then is the balance swept again", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [withPending()])
+    const rpc = defaultRpcState({ lamports: 995_000, statuses: [null, null], blockhashValid: false })
+    const { fetch } = quarantined(rpc)
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    const body = JSON.parse(stdout.text)
+    expect(rpc.sent).toHaveLength(1)
+    expect(body.receipts.map((r: { signature: string }) => r.signature)).toEqual([sigOf(rpc.sent[0] as string)])
+    expect(body.pending).toEqual([])
+  })
+
+  test("a mismatched RPC echo never replaces the locally signed identity; the send stays uncertain under that identity", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState({
+      statuses: Array.from({ length: 45 }, () => ({ confirmationStatus: "processed", err: null })),
+    })
+    const base = rpcHandler(rpc)
+    const { fetch } = quarantined(rpc, {
+      "/rpc": (req) => {
+        const body = JSON.parse(String(req.init.body)) as { method: string; id: number }
+        if (body.method === "sendTransaction") {
+          base(req)
+          return jsonResponse(200, { jsonrpc: "2.0", id: body.id, result: "sig1" })
+        }
+        return base(req)
+      },
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const actual = sigOf(rpc.sent[0] as string)
+    const body = JSON.parse(stdout.text)
+    expect(body.pending[0].signature).toBe(actual)
+    expect(body.residuals[0].detail).toContain("echoed a different signature")
+    expect((await openStore(dir)).entries[0]?.tee?.sweepPending?.[0]?.signature).toBe(actual)
+  })
+
+  test("in-run polling: a nonfinal error keeps polling and ends uncertain; only a finalized error is a failure", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = defaultRpcState({
+      statuses: Array.from({ length: 45 }, () => ({
+        confirmationStatus: "confirmed",
+        err: { InstructionError: [0, "Custom"] },
+      })),
+    })
+    const { fetch } = quarantined(rpc)
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    expect(JSON.parse(stdout.text).pending).toHaveLength(1)
+    expect((await openStore(dir)).entries[0]?.tee?.sweepPending).toHaveLength(1)
+
+    const dir2 = await tempDir()
+    await seedTeeStore(dir2, [enabledEntry()])
+    const rpc2 = defaultRpcState({
+      statuses: [{ confirmationStatus: "finalized", err: { InstructionError: [0, "Custom"] } }],
+    })
+    const { fetch: fetch2 } = quarantined(rpc2)
+    const second = depsFor(dir2, fetch2, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], second.deps)).toBe(3)
+    const body = JSON.parse(second.stdout.text)
+    expect(body.pending).toEqual([])
+    expect(body.residuals.map((r: { kind: string }) => r.kind)).toContain("sol-transfer-failed")
+    expect((await openStore(dir2)).entries[0]?.tee?.sweepPending).toEqual([])
+  })
+})
+
+/**
+ * BE-315 (Ember Phase 3 PR D, CLI half; spec P3-ED-6, test matrix "DAMM v2"): LP positions in an
+ * ordinary sweep. The position NFT is discovered LOCALLY (Token-2022, raw amount 1, decimals 0),
+ * one close-build is fetched per candidate mint under the bound key, every artifact is verified
+ * before any is signed, and a close that cannot be obtained or fails a check is a named leftover
+ * that does not stop the token and SOL moves. `--emergency` never calls the API (pinned above,
+ * "--emergency sweeps Token-2022 locally, with no API call at all").
+ */
+describe("BE-315: DAMM v2 positions in tee sweep (P3-ED-6)", () => {
+  const DAMM = new PublicKey(DAMM_V2_PROGRAM_ID)
+  const POOL = Keypair.generate().publicKey
+  const POSITION = Keypair.generate().publicKey
+  const NFT_MINT = Keypair.generate().publicKey
+  const POOL_VAULT_A = Keypair.generate().publicKey
+  const NFT_ACCOUNT = getAssociatedTokenAddressSync(NFT_MINT, teeKey.publicKey, false, SPL_TOKEN_2022)
+  const TEE_ATA_A = getAssociatedTokenAddressSync(MINT, teeKey.publicKey, false, SPL_TOKEN)
+
+  function tokenAccountFull(mint: PublicKey, owner: PublicKey, amount: bigint): Uint8Array {
+    const data = new Uint8Array(165)
+    data.set(mint.toBytes(), 0)
+    data.set(owner.toBytes(), 32)
+    new DataView(data.buffer).setBigUint64(64, amount, true)
+    data[108] = 1
+    return data
+  }
+
+  /** The chain with one open position: the NFT in the wallet, the pool's vault holding token A. */
+  function positionAccounts(): RpcState["accounts"] {
+    return {
+      [TEE]: { owner: SYSTEM_PROGRAM_ID, data: new Uint8Array(0), lamports: 1_000_000 },
+      [POOL.toBase58()]: { owner: DAMM_V2_PROGRAM_ID, data: new Uint8Array(100) },
+      [POSITION.toBase58()]: { owner: DAMM_V2_PROGRAM_ID, data: new Uint8Array(100) },
+      [MINT.toBase58()]: { owner: TOKEN_PROGRAM_ID, data: baseMint(6) },
+      [NFT_MINT.toBase58()]: { owner: TOKEN_2022_PROGRAM_ID, data: baseMint(0) },
+      [POOL_VAULT_A.toBase58()]: { owner: TOKEN_PROGRAM_ID, data: tokenAccountFull(MINT, POOL, 5_000_000n) },
+      [NFT_ACCOUNT.toBase58()]: {
+        owner: TOKEN_2022_PROGRAM_ID,
+        data: tokenAccountFull(NFT_MINT, teeKey.publicKey, 1n),
+      },
+    }
+  }
+
+  /** The honest simulation: NFT account and position gone, token A withdrawn into a new TEE ATA. */
+  function honestSimulation(): NonNullable<RpcState["simulated"]> {
+    return {
+      [TEE]: { owner: SYSTEM_PROGRAM_ID, data: new Uint8Array(0), lamports: 3_000_000 },
+      [POSITION.toBase58()]: null,
+      [NFT_ACCOUNT.toBase58()]: null,
+      [POOL_VAULT_A.toBase58()]: { owner: TOKEN_PROGRAM_ID, data: tokenAccountFull(MINT, POOL, 4_300_000n) },
+      [TEE_ATA_A.toBase58()]: { owner: TOKEN_PROGRAM_ID, data: tokenAccountFull(MINT, teeKey.publicKey, 700_000n) },
+    }
+  }
+
+  /** What close-build returns for this position: one unsigned v0 close and its keys in compiled order. */
+  function closeArtifact(mutate?: (keys: string[]) => string[]) {
+    const message = new TransactionMessage({
+      payerKey: teeKey.publicKey,
+      recentBlockhash: BLOCKHASH,
+      instructions: [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }),
+        createAssociatedTokenAccountIdempotentInstruction(teeKey.publicKey, TEE_ATA_A, teeKey.publicKey, MINT),
+        new TransactionInstruction({
+          programId: DAMM,
+          data: Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]),
+          keys: [
+            { pubkey: teeKey.publicKey, isSigner: true, isWritable: true },
+            { pubkey: POOL, isSigner: false, isWritable: true },
+            { pubkey: POSITION, isSigner: false, isWritable: true },
+            { pubkey: POOL_VAULT_A, isSigner: false, isWritable: true },
+            { pubkey: TEE_ATA_A, isSigner: false, isWritable: true },
+            { pubkey: NFT_ACCOUNT, isSigner: false, isWritable: true },
+            { pubkey: NFT_MINT, isSigner: false, isWritable: true },
+            { pubkey: MINT, isSigner: false, isWritable: false },
+            { pubkey: SPL_TOKEN, isSigner: false, isWritable: false },
+            { pubkey: SPL_TOKEN_2022, isSigner: false, isWritable: false },
+          ],
+        }),
+      ],
+    }).compileToV0Message()
+    const keys = message.staticAccountKeys.map((key) => key.toBase58())
+    return {
+      transaction: Buffer.from(new VersionedTransaction(message).serialize()).toString("base64"),
+      accountKeys: mutate ? mutate(keys) : keys,
+    }
+  }
+
+  const candidate = () => ({
+    pubkey: NFT_ACCOUNT.toBase58(),
+    mint: NFT_MINT.toBase58(),
+    amount: "1",
+    decimals: 0,
+    state: "initialized",
+  })
+
+  function positionState(overrides: Partial<RpcState> = {}): RpcState {
+    const rpc = defaultRpcState({
+      token2022Accounts: [candidate()],
+      accounts: positionAccounts(),
+      simulated: honestSimulation(),
+      lamports: 1_000_000,
+      fee: 5_000,
+      ...overrides,
+    })
+    rpc.onClose = () => {
+      rpc.token2022Accounts = rpc.token2022Accounts.filter((t) => t.pubkey !== NFT_ACCOUNT.toBase58())
+      rpc.tokenAccounts.push({
+        pubkey: TEE_ATA_A.toBase58(),
+        mint: MINT.toBase58(),
+        amount: "700000",
+        decimals: 6,
+        state: "initialized",
+      })
+    }
+    return rpc
+  }
+
+  function sweptRoute(rpc: RpcState): RouteHandler {
+    return () =>
+      jsonResponse(200, { success: true, id: "lw_tee1", state: "swept", sweptAt: 1, signatures: rpc.sent.map(sigOf) })
+  }
+
+  test("ordinary quarantined sweep: local inventory, one close-build per candidate, verified, signed locally, then the withdrawn tokens and SOL", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = positionState()
+    const closeBuilds: Array<{ method: string | undefined; auth: string | null; body: string }> = []
+    const { fetch, calls, unmatched } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      [`/api/v1/agent/lp/positions/${NFT_MINT.toBase58()}/close-build`]: (req) => {
+        closeBuilds.push({
+          method: req.init.method,
+          auth: new Headers(req.init.headers).get("x-api-key"),
+          body: String(req.init.body),
+        })
+        return jsonResponse(200, closeArtifact())
+      },
+      "/api/v1/agent/wallets/lw_tee1/swept": sweptRoute(rpc),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    const parsed = JSON.parse(stdout.text.trim())
+
+    // Close-build was called exactly once, for the NFT MINT in the path, with the bound key, and
+    // no live positions listing was read (every unregistered route would be recorded here).
+    expect(closeBuilds).toHaveLength(1)
+    expect(closeBuilds[0]?.method).toBe("POST")
+    expect(closeBuilds[0]?.auth).toBe("ck_live_x")
+    expect(unmatched).toEqual([])
+    expect(calls.map((c) => new URL(c.url).pathname).filter((p) => p.includes("/lp/positions"))).toEqual([
+      `/api/v1/agent/lp/positions/${NFT_MINT.toBase58()}/close-build`,
+    ])
+
+    // Three transactions: the close (v0, signed by the TEE key), the withdrawn token A, then SOL.
+    expect(rpc.sent).toHaveLength(3)
+    const close = VersionedTransaction.deserialize(Buffer.from(rpc.sent[0] as string, "base64"))
+    expect(close.version).toBe(0)
+    expect(close.message.staticAccountKeys[0]?.toBase58()).toBe(TEE)
+    expect(close.signatures).toHaveLength(1)
+    expect(
+      ed25519.verify(close.signatures[0] as Uint8Array, close.message.serialize(), teeKey.publicKey.toBytes()),
+    ).toBe(true)
+    // The close's message bytes are the server's, untouched.
+    expect(Buffer.from(close.message.serialize()).toString("base64")).toBe(
+      Buffer.from(
+        VersionedTransaction.deserialize(Buffer.from(closeArtifact().transaction, "base64")).message.serialize(),
+      ).toString("base64"),
+    )
+    const tokenTx = Transaction.from(Buffer.from(rpc.sent[1] as string, "base64"))
+    expect(tokenTx.instructions.map((ix) => ix.programId.toBase58())).toContain(TOKEN_PROGRAM_ID)
+    expect(parsed.receipts.map((r: { kind: string }) => r.kind)).toEqual(["lp-close", "token", "sol"])
+    expect(parsed.residuals).toEqual([])
+
+    // Simulation and every account read happened BEFORE the first send.
+    const rpcMethods = calls
+      .filter((c) => new URL(c.url).pathname === "/rpc")
+      .map((c) => (JSON.parse(String(c.init.body)) as { method: string }).method)
+    expect(rpcMethods.indexOf("simulateTransaction")).toBeLessThan(rpcMethods.indexOf("sendTransaction"))
+  })
+
+  test("raw amount 1 with decimals 6 is not a candidate: no close-build, swept as an ordinary Token-2022 token", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const source = getAssociatedTokenAddressSync(MINT_2022, teeKey.publicKey, false, SPL_TOKEN_2022)
+    const rpc = defaultRpcState({
+      token2022Accounts: [
+        { pubkey: source.toBase58(), mint: MINT_2022.toBase58(), amount: "1", decimals: 6, state: "initialized" },
+      ],
+      accounts: mint2022(baseMint(6)),
+    })
+    const { fetch, unmatched } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": sweptRoute(rpc),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    expect(unmatched).toEqual([])
+    const tx = Transaction.from(Buffer.from(rpc.sent[0] as string, "base64"))
+    expect(tx.instructions[1]?.programId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID)
+    expect(tx.instructions[1]?.data[0]).toBe(12) // TransferChecked
+  })
+
+  test("an unknown decimals-0 mint (close-build 404) is leftover DAMM_POSITION_CLOSE_UNAVAILABLE, never transferred; a classic token and SOL still sweep", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const classic = getAssociatedTokenAddressSync(MINT, teeKey.publicKey)
+    const rpc = positionState({
+      tokenAccounts: [
+        { pubkey: classic.toBase58(), mint: MINT.toBase58(), amount: "700000", decimals: 6, state: "initialized" },
+      ],
+    })
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      [`/api/v1/agent/lp/positions/${NFT_MINT.toBase58()}/close-build`]: () =>
+        jsonResponse(404, { success: false, error: { code: "LP_POSITION_NOT_FOUND", message: "Not a position NFT" } }),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const parsed = JSON.parse(stdout.text.trim())
+    const leftover = parsed.residuals.find((r: { kind: string }) => r.kind === "DAMM_POSITION_CLOSE_UNAVAILABLE")
+    expect(leftover).toMatchObject({ mint: NFT_MINT.toBase58(), account: NFT_ACCOUNT.toBase58(), amountRaw: "1" })
+    expect(leftover.detail).toContain("LP_POSITION_NOT_FOUND")
+    // Not reported a second time as a leftover token account, and never moved as a token.
+    expect(parsed.residuals.filter((r: { account?: string }) => r.account === NFT_ACCOUNT.toBase58())).toHaveLength(1)
+    for (const wire of rpc.sent) {
+      for (const ix of instructionsOf(wire)) {
+        expect(ix.programId.toBase58()).not.toBe(TOKEN_2022_PROGRAM_ID)
+        expect(ix.programId.toBase58()).not.toBe(DAMM_V2_PROGRAM_ID)
+      }
+    }
+    expect(parsed.receipts.map((r: { kind: string }) => r.kind)).toEqual(["token", "sol"])
+  })
+
+  test("a close that fails a check is leftover DAMM_CLOSE_TRANSACTION_REFUSED before it is signed, and the rest still sweeps", async () => {
+    const cases: Array<{ name: string; artifact: () => unknown; state?: Partial<RpcState>; reason: RegExp }> = [
+      {
+        name: "permuted key array",
+        artifact: () => closeArtifact((keys) => [...keys].reverse()),
+        reason: /account key 0 is/,
+      },
+      {
+        name: "simulation failure",
+        artifact: () => closeArtifact(),
+        state: { simulationErr: { InstructionError: [2, "Custom"] } },
+        reason: /simulation failed/,
+      },
+      {
+        name: "still-held NFT",
+        artifact: () => closeArtifact(),
+        state: {
+          simulated: {
+            ...honestSimulation(),
+            [NFT_ACCOUNT.toBase58()]: {
+              owner: TOKEN_2022_PROGRAM_ID,
+              data: tokenAccountFull(NFT_MINT, teeKey.publicKey, 1n),
+            },
+          },
+        },
+        reason: /still holds 1/,
+      },
+      { name: "no transaction in the answer", artifact: () => ({ accountKeys: [] }), reason: /without a transaction/ },
+    ]
+    for (const { name, artifact, state, reason } of cases) {
+      const dir = await tempDir()
+      await seedTeeStore(dir, [enabledEntry()])
+      const classic = getAssociatedTokenAddressSync(MINT, teeKey.publicKey)
+      const rpc = positionState({
+        tokenAccounts: [
+          { pubkey: classic.toBase58(), mint: MINT.toBase58(), amount: "9", decimals: 6, state: "initialized" },
+        ],
+        ...state,
+      })
+      const { fetch } = createRoutedFetch({
+        "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+        [`/api/v1/agent/lp/positions/${NFT_MINT.toBase58()}/close-build`]: () => jsonResponse(200, artifact()),
+        "/rpc": rpcHandler(rpc),
+      })
+      const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+      expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+      const parsed = JSON.parse(stdout.text.trim())
+      const kind =
+        name === "no transaction in the answer" ? "DAMM_POSITION_CLOSE_UNAVAILABLE" : "DAMM_CLOSE_TRANSACTION_REFUSED"
+      const leftover = parsed.residuals.find((r: { kind: string }) => r.kind === kind)
+      expect(`${name}: ${JSON.stringify(leftover ?? parsed.residuals)}`).toContain(`${name}: {`)
+      expect(leftover.detail).toMatch(reason)
+      expect(leftover.account).toBe(NFT_ACCOUNT.toBase58())
+      // No DAMM transaction was ever signed or sent; the classic token and SOL still moved.
+      for (const wire of rpc.sent)
+        for (const ix of instructionsOf(wire)) expect(ix.programId.toBase58()).not.toBe(DAMM_V2_PROGRAM_ID)
+      expect(parsed.receipts.map((r: { kind: string }) => r.kind)).toEqual(["token", "sol"])
+    }
+  })
+
+  test("every artifact is fetched and verified before ANY close is signed: a refused second close does not undo the first, and the first is sent only after both were checked", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const OTHER_MINT = Keypair.generate().publicKey
+    const OTHER_ACCOUNT = getAssociatedTokenAddressSync(OTHER_MINT, teeKey.publicKey, false, SPL_TOKEN_2022)
+    const rpc = positionState({
+      token2022Accounts: [
+        candidate(),
+        {
+          pubkey: OTHER_ACCOUNT.toBase58(),
+          mint: OTHER_MINT.toBase58(),
+          amount: "1",
+          decimals: 0,
+          state: "initialized",
+        },
+      ],
+    })
+    rpc.accounts[OTHER_MINT.toBase58()] = { owner: TOKEN_2022_PROGRAM_ID, data: baseMint(0) }
+    rpc.accounts[OTHER_ACCOUNT.toBase58()] = {
+      owner: TOKEN_2022_PROGRAM_ID,
+      data: tokenAccountFull(OTHER_MINT, teeKey.publicKey, 1n),
+    }
+    const { fetch, calls } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      [`/api/v1/agent/lp/positions/${NFT_MINT.toBase58()}/close-build`]: () => jsonResponse(200, closeArtifact()),
+      // The second position's close names the wrong fee payer: refused.
+      [`/api/v1/agent/lp/positions/${OTHER_MINT.toBase58()}/close-build`]: () =>
+        jsonResponse(
+          200,
+          closeArtifact((keys) => [...keys].reverse()),
+        ),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const parsed = JSON.parse(stdout.text.trim())
+    expect(parsed.receipts.map((r: { kind: string }) => r.kind)).toEqual(["lp-close", "token", "sol"])
+    expect(parsed.residuals.map((r: { kind: string; mint?: string }) => [r.kind, r.mint])).toEqual([
+      ["DAMM_CLOSE_TRANSACTION_REFUSED", OTHER_MINT.toBase58()],
+    ])
+    // Order: both close-builds, then the first send.
+    const sequence = calls.map((c) => {
+      const path = new URL(c.url).pathname
+      if (path === "/rpc") return (JSON.parse(String(c.init.body)) as { method: string }).method
+      return path
+    })
+    const lastFetch = Math.max(...sequence.map((step, i) => (step.endsWith("/close-build") ? i : -1)))
+    expect(sequence.filter((step) => step.endsWith("/close-build"))).toHaveLength(2)
+    expect(sequence.indexOf("sendTransaction")).toBeGreaterThan(lastFetch)
+  })
+
+  test("the verified close is displayed before it is signed, in human output and in the --json document", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = positionState()
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      [`/api/v1/agent/lp/positions/${NFT_MINT.toBase58()}/close-build`]: () => jsonResponse(200, closeArtifact()),
+      "/api/v1/agent/wallets/lw_tee1/swept": sweptRoute(rpc),
+      "/rpc": rpcHandler(rpc),
+    })
+    const human = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC], human.deps)).toBe(0)
+    const text = human.stdout.text
+    const shown = humanText(text).indexOf(
+      `Close LP position Position ${NFT_MINT.toBase58()} Verification verified, unsigned; about to sign`,
+    )
+    expect(shown).toBeGreaterThan(-1)
+    expect(text).toContain(`fee payer   ${TEE} (this TEE wallet)`)
+    expect(text).toContain("program     Meteora DAMM v2")
+    expect(text).toContain(`wallet      ${MINT.toBase58()}: 0 -> 700000 raw (+700000) in ${TEE_ATA_A.toBase58()}`)
+    expect(text).toContain(`position    NFT account ${NFT_ACCOUNT.toBase58()} is closed by this transaction`)
+    // Displayed BEFORE the receipt line for the same close.
+    expect(shown).toBeLessThan(text.indexOf(`closed LP position ${NFT_MINT.toBase58()}`))
+
+    const dir2 = await tempDir()
+    await seedTeeStore(dir2, [enabledEntry()])
+    const rpc2 = positionState()
+    const routed = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      [`/api/v1/agent/lp/positions/${NFT_MINT.toBase58()}/close-build`]: () => jsonResponse(200, closeArtifact()),
+      "/api/v1/agent/wallets/lw_tee1/swept": sweptRoute(rpc2),
+      "/rpc": rpcHandler(rpc2),
+    })
+    const json = depsFor(dir2, routed.fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], json.deps)).toBe(0)
+    const parsed = JSON.parse(json.stdout.text.trim())
+    expect(parsed.lpCloses).toHaveLength(1)
+    expect(parsed.lpCloses[0]).toMatchObject({ mint: NFT_MINT.toBase58(), account: NFT_ACCOUNT.toBase58() })
+    expect(parsed.lpCloses[0].display.some((line: string) => line.startsWith("program     Meteora DAMM v2"))).toBe(true)
+  })
+
+  test("a verified close whose blockhash has expired is leftover DAMM_POSITION_CLOSE_UNAVAILABLE without a signature, and tokens and SOL still sweep", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const classic = getAssociatedTokenAddressSync(MINT, teeKey.publicKey)
+    const rpc = positionState({
+      blockhashValid: false,
+      tokenAccounts: [
+        { pubkey: classic.toBase58(), mint: MINT.toBase58(), amount: "9", decimals: 6, state: "initialized" },
+      ],
+    })
+    const { fetch, calls } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      [`/api/v1/agent/lp/positions/${NFT_MINT.toBase58()}/close-build`]: () => jsonResponse(200, closeArtifact()),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(3)
+    const parsed = JSON.parse(stdout.text.trim())
+    const leftover = parsed.residuals.find((r: { kind: string }) => r.kind === "DAMM_POSITION_CLOSE_UNAVAILABLE")
+    expect(leftover.detail).toContain("blockhash has expired")
+    // close-build's blockhash is taken at confirmed. Finalized would reject a fresh one.
+    const blockhashChecks = calls
+      .filter((call) => new URL(call.url).pathname === "/rpc")
+      .map((call) => JSON.parse(String(call.init?.body)) as { method?: string; params?: unknown[] })
+      .filter((body) => body.method === "isBlockhashValid")
+    expect(blockhashChecks).toHaveLength(1)
+    expect(blockhashChecks[0]?.params?.[1]).toEqual({ commitment: "confirmed" })
+    expect(leftover.account).toBe(NFT_ACCOUNT.toBase58())
+    for (const wire of rpc.sent)
+      for (const ix of instructionsOf(wire)) expect(ix.programId.toBase58()).not.toBe(DAMM_V2_PROGRAM_ID)
+    expect(parsed.receipts.map((r: { kind: string }) => r.kind)).toEqual(["token", "sol"])
+    expect(parsed.pending).toEqual([])
+  })
+
+  test("--emergency with an open position: no API call at all, the NFT itself moves to the vault under Token-2022", async () => {
+    const dir = await tempDir()
+    await seedTeeStore(dir, [enabledEntry()])
+    const rpc = positionState()
+    const { fetch, calls } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("disable-pending")),
+      "/rpc": rpcHandler(rpc),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [PASSPHRASE, "confirm"])
+    expect(await run(["tee", "sweep", TEE, "--rpc-url", RPC, "--emergency"], deps)).toBe(3)
+    expect(calls.map((c) => new URL(c.url).pathname).filter((p) => p.startsWith("/api/"))).toEqual([
+      "/api/v1/agent/wallets/lw_tee1/lifecycle",
+    ])
+    const tx = Transaction.from(Buffer.from(rpc.sent[0] as string, "base64"))
+    expect(tx.instructions[1]?.programId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID)
+    expect(tx.instructions[1]?.data[0]).toBe(12)
+    expect(tx.instructions[1]?.keys[2]?.pubkey.toBase58()).toBe(
+      getAssociatedTokenAddressSync(NFT_MINT, new PublicKey(VAULT), false, SPL_TOKEN_2022).toBase58(),
+    )
+    expect(humanText(stdout.text)).toContain(humanText("position NFT moved as-is to the vault (emergency"))
+  })
+})
+
+// BE-658 PR B: all providers and transactions below are synthetic. Existing fixtures above
+// intentionally keep their original context-less answers to prove backward compatibility.
+describe("BE-667: context floor and guarded preflight rejection (S-T1–S-T16)", () => {
+  type Request = { id: number; method: string; params: unknown[] }
+  type Intercept = (body: Request) => Response | undefined | Promise<Response | undefined>
+  const rejection = (
+    body: Request,
+    err: unknown = { InstructionError: [0, { Custom: 1 }] },
+    logs = [
+      "Program 11111111111111111111111111111111 invoke [1]",
+      "Transfer: insufficient lamports 834880258, need 836389098",
+      "Program 11111111111111111111111111111111 failed: custom program error: 0x1",
+    ],
+  ) =>
+    jsonResponse(200, {
+      jsonrpc: "2.0",
+      id: body.id,
+      error: {
+        code: -32002,
+        message: "Transaction simulation failed",
+        data: { err, logs, unitsConsumed: 150 },
+      },
+    })
+  const zeroAccounts = (n: number) =>
+    Array.from({ length: n }, () => ({
+      pubkey: Keypair.generate().publicKey.toBase58(),
+      mint: Keypair.generate().publicKey.toBase58(),
+      amount: "0",
+      decimals: 6,
+      state: "initialized",
+    }))
+  async function harness(
+    opts: {
+      rpc?: RpcState
+      intercept?: Intercept
+      slot?: number | null
+      entry?: KeystoreEntry
+      endpoint?: string
+      routes?: Record<string, RouteHandler>
+    } = {},
+  ) {
+    const dir = await tempDir()
+    const path = await seedTeeStore(dir, [opts.entry ?? enabledEntry()])
+    const rpc = opts.rpc ?? defaultRpcState()
+    const calls: Request[] = []
+    let records = 0
+    const base = rpcHandler(rpc)
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("quarantined")),
+      "/api/v1/agent/wallets/lw_tee1/swept": () => {
+        records++
+        return jsonResponse(200, { success: true, state: "swept" })
+      },
+      ...opts.routes,
+      [new URL(opts.endpoint ?? RPC).pathname]: async (req) => {
+        const body = JSON.parse(String(req.init.body)) as Request
+        calls.push(body)
+        if (body.method === "sendTransaction") {
+          const wire = body.params[0] as string
+          const pending = (await openStore(dir)).entries[0]?.tee?.sweepPending ?? []
+          expect(pending.map((p) => p.signature)).toContain(sigOf(wire))
+          const tx = VersionedTransaction.deserialize(Buffer.from(wire, "base64"))
+          expect(
+            ed25519.verify(tx.signatures[0] as Uint8Array, tx.message.serialize(), teeKey.publicKey.toBytes()),
+          ).toBe(true)
+          for (const ix of instructionsOf(wire)) {
+            if (ix.programId.toBase58() === SYSTEM_PROGRAM_ID) expect(ix.keys[1]?.toBase58()).toBe(VAULT)
+            if (ix.data[0] === 12 && [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].includes(ix.programId.toBase58()))
+              expect(ix.keys[2]?.toBase58()).toBe(
+                getAssociatedTokenAddressSync(
+                  ix.keys[1] as PublicKey,
+                  new PublicKey(VAULT),
+                  false,
+                  ix.programId,
+                ).toBase58(),
+              )
+          }
+        }
+        const intercepted = await opts.intercept?.(body)
+        if (intercepted) return intercepted
+        const response = base(req) as Response
+        const result = await response.json()
+        if (opts.slot !== null && result.result && typeof result.result === "object" && "value" in result.result) {
+          result.result.context = { slot: opts.slot ?? 100 }
+          if (body.method === "getSignatureStatuses") {
+            for (const status of result.result.value)
+              if (status?.confirmationStatus === "finalized") status.slot = opts.slot ?? 100
+          }
+        }
+        return jsonResponse(200, result)
+      },
+    })
+    const execute = async (json = true, emergency = false, extra: Record<string, unknown> = {}) => {
+      const io = depsFor(dir, fetch, [PASSPHRASE, "confirm"], extra)
+      const code = await run(
+        [
+          "tee",
+          "sweep",
+          TEE,
+          "--rpc-url",
+          opts.endpoint ?? RPC,
+          ...(json ? ["--json"] : []),
+          ...(emergency ? ["--emergency"] : []),
+        ],
+        io.deps,
+      )
+      return { ...io, code, body: json ? JSON.parse(io.stdout.text) : undefined }
+    }
+    return { dir, path, rpc, calls, execute, records: () => records }
+  }
+  const floorOf = (body: Request) => (body.params.at(-1) as { minContextSlot?: number })?.minContextSlot
+
+  for (const ignoresFloor of [false, true])
+    test(`S-T1 provider pool: older bank ${ignoresFloor ? "ignores" : "refuses"} the floor; incident arithmetic`, async () => {
+      const S = 452_457_956
+      const rpc = defaultRpcState({ lamports: 833_376_418, token2022Accounts: zeroAccounts(2) })
+      let staleReads = 0
+      let sends = 0
+      const h = await harness({
+        rpc,
+        slot: S + 40,
+        intercept: async (b) => {
+          if (b.method === "getBalance" && sends === 2 && staleReads++ === 0) {
+            expect(floorOf(b)).toBeGreaterThanOrEqual(S)
+            return ignoresFloor
+              ? jsonResponse(200, { id: b.id, result: { context: { slot: S - 1 }, value: 833_376_418 } })
+              : jsonResponse(200, {
+                  id: b.id,
+                  error: {
+                    code: -32016,
+                    message: "Minimum context slot has not been reached",
+                    data: { contextSlot: S - 1 },
+                  },
+                })
+          }
+          if (b.method === "getSignatureStatuses")
+            return jsonResponse(200, {
+              id: b.id,
+              result: { value: [{ confirmationStatus: "finalized", err: null, slot: S }] },
+            })
+          if (b.method === "sendTransaction") {
+            // Durable pending evidence exists before EVERY send, and each wire is signed by this TEE.
+            const pending = (await openStore(h.dir)).entries[0]?.tee?.sweepPending ?? []
+            expect(pending.map((p) => p.signature)).toContain(sigOf(b.params[0] as string))
+            expect(Transaction.from(Buffer.from(b.params[0] as string, "base64")).verifySignatures()).toBe(true)
+            if (sends++ < 2) rpc.lamports += 1_513_840
+          }
+        },
+      })
+      const result = await h.execute()
+      expect(result.code).toBe(0)
+      expect(833_376_418 + 2 * (1_513_840 - 5_000)).toBe(836_394_098)
+      const sol = instructionsOf(rpc.sent[2] as string)[0]
+      expect(sol?.data.readBigUInt64LE(4)).toBe(836_389_098n)
+      expect(sol?.keys[1]?.toBase58()).toBe(VAULT)
+      expect(rpc.fee).toBe(5_000)
+      const afterCloses = h.calls.slice(h.calls.findIndex((b) => b.method === "getBalance"))
+      for (const method of ["getBalance", "getLatestBlockhash", "getFeeForMessage", "sendTransaction"])
+        for (const b of afterCloses.filter((b) => b.method === method)) expect(floorOf(b)).toBeGreaterThanOrEqual(S)
+      expect(rpc.sent).toHaveLength(3) // two closes, exactly one SOL transfer
+      expect(result.body.receipts.map((r: { slot: number }) => r.slot)).toEqual([S, S, S])
+      expect(result.body.contextFloorSlot).toBe(S + 40)
+      expect(result.body.pending).toEqual([])
+    })
+
+  for (const fault of ["behind", "unverified", "unsupported"])
+    test(`S-T2 context ${fault} stops SOL signing and completion`, async () => {
+      const h = await harness({
+        intercept: (b) => {
+          if (b.method !== "getBalance") return
+          if (fault === "unverified") return jsonResponse(200, { id: b.id, result: { value: 1_000_000 } })
+          return jsonResponse(200, {
+            id: b.id,
+            error: {
+              code: fault === "behind" ? -32016 : -32602,
+              message: fault === "behind" ? "Minimum context slot has not been reached" : "invalid minContextSlot",
+              data: { contextSlot: 99 },
+            },
+          })
+        },
+      })
+      const r = await h.execute()
+      expect(r.code).toBe(3)
+      expect(h.rpc.sent).toHaveLength(0)
+      expect(r.body.residuals.map((r: { kind: string }) => r.kind)).toContain(
+        `rpc-context-${fault === "behind" ? "behind" : "unverified"}`,
+      )
+      expect(r.body.residuals.some((r: { kind: string }) => r.kind === "sol-remaining")).toBe(false)
+      expect(r.body.residuals[0].detail).toContain("Nothing was signed")
+      expect(r.body.residuals[0].detail).toContain("rpc.test")
+      expect(r.body.residuals[0].detail).toContain("--rpc-url")
+      expect(r.body.residuals[0].detail).not.toContain(RPC)
+      expect(r.body.inventory.verified).toBe(false)
+      expect(h.records()).toBe(0)
+    })
+
+  for (const emergency of [false, true])
+    test(`S-T3/S-T14 SOL rejection, output parity, immediate rerun; emergency=${emergency}`, async () => {
+      let rejecting = true
+      const h = await harness({
+        intercept: (b) => {
+          if (rejecting && b.method === "sendTransaction") return rejection(b)
+          if (rejecting && b.method === "getSignatureStatuses")
+            return jsonResponse(200, { id: b.id, result: { value: [null] } })
+        },
+        entry: emergency ? teeEntry({ tee: { network: "solana-mainnet", vaultDestination: VAULT } }) : undefined,
+      })
+      const r = await h.execute(true, emergency)
+      expect(r.code).toBe(3)
+      const residual = r.body.residuals[0]
+      expect(residual.kind).toBe("sol-transfer-rejected")
+      expect(residual.broadcast).toBe(false)
+      expect(residual.rejection).toEqual({ reason: "preflight-failed", rpcCode: -32002, pendingCleared: true })
+      expect(residual.diagnostics.unitsConsumed).toBe(150)
+      expect(residual.diagnostics.err).toBe('{"InstructionError":[0,{"Custom":1}]}')
+      expect(residual.signature).toBe(sigOf(h.calls.find((b) => b.method === "sendTransaction")?.params[0] as string))
+      expect(r.body.pending).toEqual([])
+      expect(r.body.receipts).toEqual([])
+      expect((await openStore(h.dir)).entries[0]?.tee?.sweepPending).toEqual([])
+      const human = await h.execute(false, emergency)
+      expect(humanText(human.stdout.text)).toContain(humanText("rejected at simulation (not broadcast)"))
+      for (const log of residual.diagnostics.logs) expect(human.stdout.text).toContain(log)
+      expect(human.stdout.text).toContain(residual.signature)
+      expect(humanText(human.stdout.text)).toContain(humanText("Re-run this sweep now"))
+      for (const output of [r.stdout.text, r.stderr.text, human.stdout.text, human.stderr.text]) {
+        expect(output).not.toContain("may still land")
+        expect(output).not.toContain("still in flight")
+      }
+      expect(h.calls.filter((b) => b.method === "sendTransaction")).toHaveLength(2) // one per run
+      expect(h.calls.filter((b) => b.method === "getSignatureStatuses")).toHaveLength(2) // one guard per rejection
+      rejecting = false
+      const retry = await h.execute(true, emergency)
+      expect(retry.code).toBe(emergency ? 3 : 0)
+      expect(retry.body.receipts).toHaveLength(1)
+      expect(h.rpc.sent).toHaveLength(1)
+      if (emergency) expect(h.records()).toBe(0)
+    })
+
+  test("S-T4/S-T15 fourth close rejected: fifth and SOL finalize to the pinned vault", async () => {
+    const accounts = zeroAccounts(5)
+    let sends = 0
+    let guarding = false
+    const h = await harness({
+      rpc: defaultRpcState({ token2022Accounts: accounts }),
+      intercept: (b) => {
+        if (b.method === "sendTransaction" && ++sends === 4) {
+          guarding = true
+          return rejection(b)
+        }
+        if (b.method === "getSignatureStatuses" && guarding) {
+          guarding = false
+          return jsonResponse(200, { id: b.id, result: { value: [null] } })
+        }
+      },
+    })
+    const r = await h.execute()
+    expect(r.code).toBe(3)
+    expect(sends).toBe(6)
+    expect(r.body.receipts).toHaveLength(5)
+    expect(r.body.residuals).toHaveLength(1)
+    expect(r.body.residuals[0]).toMatchObject({
+      kind: "token-transfer-rejected",
+      account: accounts[3]?.pubkey,
+      broadcast: false,
+    })
+    expect(r.body.residuals[0].detail).toContain("close")
+    expect(h.rpc.token2022Accounts).toHaveLength(1)
+    expect(h.rpc.lamports).toBe(0)
+    for (const wire of h.rpc.sent)
+      for (const ix of instructionsOf(wire)) {
+        if (ix.data[0] === 9) expect(ix.keys[1]?.toBase58()).toBe(TEE) // rent goes to TEE then SOL sweep
+        if (ix.programId.toBase58() === SYSTEM_PROGRAM_ID) expect(ix.keys[1]?.toBase58()).toBe(VAULT)
+      }
+    expect((await openStore(h.dir)).entries[0]?.tee?.sweepPending).toEqual([])
+  })
+
+  test("S-T5 rejection cap lists every skipped account and SOL", async () => {
+    const accounts = zeroAccounts(5)
+    const h = await harness({
+      rpc: defaultRpcState({ token2022Accounts: accounts }),
+      intercept: (b) => {
+        if (b.method === "sendTransaction") return rejection(b)
+        if (b.method === "getSignatureStatuses") return jsonResponse(200, { id: b.id, result: { value: [null] } })
+      },
+    })
+    const r = await h.execute()
+    expect(r.code).toBe(3)
+    expect(h.calls.filter((b) => b.method === "sendTransaction")).toHaveLength(3)
+    expect(r.body.pending).toEqual([])
+    const skipped = r.body.residuals.filter((r: { kind: string }) => r.kind === "not-attempted")
+    expect(skipped).toHaveLength(3)
+    expect(skipped.map((r: { account?: string }) => r.account)).toEqual([
+      accounts[3]?.pubkey,
+      accounts[4]?.pubkey,
+      undefined,
+    ])
+    for (const r of skipped) expect(r.detail).toContain("3 transactions were rejected")
+    expect(r.body.residuals).toHaveLength(6)
+  })
+
+  test("S-T6 BlockhashNotFound is a rejection with empty logs", async () => {
+    const h = await harness({
+      intercept: (b) => {
+        if (b.method === "sendTransaction") return rejection(b, "BlockhashNotFound", [])
+        if (b.method === "getSignatureStatuses") return jsonResponse(200, { id: b.id, result: { value: [null] } })
+      },
+    })
+    const r = await h.execute()
+    expect(r.code).toBe(3)
+    expect(r.body.residuals[0]).toMatchObject({
+      kind: "sol-transfer-rejected",
+      diagnostics: { err: '"BlockhashNotFound"', logs: [] },
+    })
+  })
+
+  for (const fault of [
+    "502",
+    "429",
+    "reset",
+    "non-json",
+    "no-data",
+    "id-mismatch",
+    "deadline",
+    "processed",
+    "confirmed",
+  ]) {
+    test(`S-T7 ${fault} stays uncertain, blocks later accounts, and never resends`, async () => {
+      const accounts = zeroAccounts(2)
+      const h = await harness({
+        rpc: defaultRpcState({ token2022Accounts: accounts }),
+        intercept: (b) => {
+          if (b.method === "sendTransaction") {
+            if (fault === "reset") throw new TypeError("connection reset")
+            if (fault === "502" || fault === "429") return new Response("", { status: Number(fault) })
+            if (fault === "non-json") return new Response("broken")
+            if (fault === "no-data")
+              return jsonResponse(200, { id: b.id, error: { code: -32002, message: "simulation failed" } })
+            if (fault === "id-mismatch")
+              return jsonResponse(200, {
+                id: b.id + 1,
+                error: { code: -32002, message: "simulation failed", data: { err: "BlockhashNotFound", logs: [] } },
+              })
+          }
+          if (b.method === "getSignatureStatuses")
+            return jsonResponse(200, {
+              id: b.id,
+              result: {
+                value: [
+                  fault === "deadline"
+                    ? null
+                    : { confirmationStatus: fault === "confirmed" ? "confirmed" : "processed", err: null, slot: 999 },
+                ],
+              },
+            })
+        },
+      })
+      const r = await h.execute()
+      expect(r.code).toBe(3)
+      expect(h.calls.filter((b) => b.method === "sendTransaction")).toHaveLength(1)
+      expect(r.body.pending).toHaveLength(1)
+      expect(r.body.residuals[0].kind).toBe("finality-uncertain")
+      expect(r.body.residuals[0].detail).toContain("may still land")
+      expect(r.body.residuals.filter((r: { kind: string }) => r.kind === "not-attempted")).toHaveLength(2)
+      expect((await openStore(h.dir)).entries[0]?.tee?.sweepPending).toHaveLength(1)
+      expect(r.body.contextFloorSlot).toBe(100) // processed slot 999 cannot raise a finalized floor
+    })
+  }
+
+  for (const fails of [false, true])
+    test(`S-T8 guard ${fails ? "throws" : "finds processed then finalized"}`, async () => {
+      let polls = 0
+      const h = await harness({
+        rpc: defaultRpcState({ lamports: 0 }),
+        intercept: (b) => {
+          // Show a balance to size the transfer; post-inventory is empty when guard finalizes.
+          if (b.method === "getBalance" && polls === 0)
+            return jsonResponse(200, { id: b.id, result: { value: 1_000_000, context: { slot: 100 } } })
+          if (b.method === "sendTransaction") return rejection(b)
+          if (b.method === "getSignatureStatuses") {
+            if (fails) throw new TypeError("guard connection reset")
+            return jsonResponse(200, {
+              id: b.id,
+              result: {
+                value: [{ confirmationStatus: polls++ === 0 ? "processed" : "finalized", err: null, slot: 100 }],
+              },
+            })
+          }
+        },
+      })
+      const r = await h.execute()
+      expect(r.code).toBe(fails ? 3 : 0)
+      expect(h.calls.filter((b) => b.method === "sendTransaction")).toHaveLength(1)
+      if (fails) {
+        expect(r.body.pending).toHaveLength(1)
+        expect(r.body.residuals[0]).toMatchObject({ kind: "finality-uncertain", diagnostics: { unitsConsumed: 150 } })
+        expect(r.body.residuals[0].detail).toContain("status guard failed")
+        expect(r.body.residuals[0].detail).toContain("rejected at simulation")
+      } else {
+        expect(polls).toBe(2)
+        expect(r.body.receipts).toHaveLength(1)
+        expect(r.body.residuals).toEqual([])
+        expect((await openStore(h.dir)).entries[0]?.tee?.sweepPending).toEqual([])
+      }
+    })
+
+  for (const json of [true, false])
+    test(`S-T9 cleanup write failure and expiry recovery; json=${json}`, async () => {
+      let failCleanup = false
+      let rejecting = true
+      const accounts = zeroAccounts(2)
+      const h = await harness({
+        rpc: defaultRpcState({ token2022Accounts: accounts }),
+        intercept: (b) => {
+          if (rejecting && b.method === "sendTransaction") return rejection(b)
+          if (rejecting && b.method === "getSignatureStatuses") {
+            failCleanup = true
+            return jsonResponse(200, { id: b.id, result: { value: [null] } })
+          }
+        },
+      })
+      const saved = `${h.path}.saved`
+      let obstructed = false
+      const r = await h.execute(json, false, {
+        readFile: async (p: string) => {
+          if (p === h.path && failCleanup) {
+            if (!obstructed) {
+              await rename(h.path, saved)
+              await mkdir(h.path)
+              obstructed = true
+            }
+            return realReadFile(saved, "utf8")
+          }
+          return realReadFile(p, "utf8")
+        },
+      })
+      await rmdir(h.path)
+      await rename(saved, h.path)
+      expect(r.code).toBe(3)
+      if (json) {
+        expect(r.body.residuals[1]).toMatchObject({
+          kind: "token-transfer-rejected",
+          broadcast: false,
+          rejection: { pendingCleared: false },
+        })
+        expect(r.body.pending).toEqual([])
+        expect(r.body.residuals.filter((r: { kind: string }) => r.kind === "not-attempted")).toHaveLength(2)
+      } else {
+        expect(humanText(r.stdout.text)).toContain(humanText("could not be removed"))
+        expect(humanText(r.stdout.text)).toContain(humanText("within two minutes"))
+        expect(r.stdout.text).not.toContain("in flight")
+        expect(r.stdout.text).not.toContain("may still land")
+        expect(r.stdout.text).toContain("local-record-failed")
+      }
+      expect(h.calls.filter((b) => b.method === "sendTransaction")).toHaveLength(1)
+      expect((await openStore(h.dir)).entries[0]?.tee?.sweepPending).toHaveLength(1)
+      // First next run: missing but valid -> preserve. Then missing + expired + missing -> drop.
+      failCleanup = false
+      rejecting = false
+      h.rpc.statuses = [null]
+      h.rpc.blockhashValid = true
+      const still = await h.execute()
+      expect(still.body.pending).toHaveLength(1)
+      expect(still.body.residuals.filter((r: { kind: string }) => r.kind === "not-attempted")).toHaveLength(3)
+      h.rpc.statuses = [null, null]
+      h.rpc.blockhashValid = false
+      const expired = await h.execute()
+      expect(expired.code).toBe(0)
+      expect(expired.body.pending).toEqual([])
+      expect(h.rpc.sent).toHaveLength(3)
+    })
+
+  for (const slot of [undefined, 250])
+    test(`S-T10 retained receipt slot ${slot} seeds only when present`, async () => {
+      const entry = enabledEntry()
+      if (entry.tee)
+        entry.tee.sweepReceipts = [
+          {
+            kind: "close",
+            signature: "retained",
+            amountRaw: "0",
+            finalizedAt: "2026-10-01T00:00:00Z",
+            ...(slot === undefined ? {} : { slot }),
+          },
+        ]
+      const h = await harness({ entry, slot: slot ?? null })
+      const r = await h.execute()
+      expect(r.code).toBe(0)
+      expect(floorOf(h.calls[0] as Request)).toBe(slot)
+      expect(r.body.contextFloorSlot).toBe(slot ?? null)
+      expect(r.body.receipts[0].signature).toBe("retained")
+    })
+
+  test("S-T11 old pending shape finalizes with a slot before the first inventory read", async () => {
+    const entry = enabledEntry()
+    if (entry.tee)
+      entry.tee.sweepPending = [
+        {
+          kind: "sol",
+          signature: "old-pending",
+          blockhash: BLOCKHASH,
+          amountRaw: "995000",
+          submittedAt: "2026-10-01T00:00:00Z",
+        },
+      ]
+    const h = await harness({ entry, slot: 300, rpc: defaultRpcState({ lamports: 0 }) })
+    const r = await h.execute()
+    expect(r.code).toBe(0)
+    expect(h.rpc.sent).toHaveLength(0)
+    expect(floorOf(h.calls[1] as Request)).toBe(300)
+    expect(r.body.receipts[0]).toMatchObject({ signature: "old-pending", slot: 300 })
+    expect((await openStore(h.dir)).entries[0]?.tee?.sweepReceipts?.[0]?.slot).toBe(300)
+  })
+
+  test("S-T12 credentials, endpoint paths and signed wire never enter JSON or human output", async () => {
+    const endpoint = "https://synthetic.invalid/v1/KEY?api-key=SECRET"
+    const h = await harness({
+      endpoint,
+      intercept: (b) => {
+        if (b.method === "sendTransaction")
+          return jsonResponse(200, {
+            id: b.id,
+            error: {
+              code: -32002,
+              message: `simulation failed ${endpoint} token=SECRET`,
+              data: {
+                err: { url: endpoint },
+                logs: [`failure ${endpoint} auth=SECRET`],
+                returnData: { data: b.params[0] },
+                accounts: [endpoint],
+              },
+            },
+          })
+        if (b.method === "getSignatureStatuses") return jsonResponse(200, { id: b.id, result: { value: [null] } })
+      },
+    })
+    for (const json of [true, false]) {
+      const r = await h.execute(json)
+      expect(r.code).toBe(3)
+      const output = r.stdout.text + r.stderr.text
+      for (const secret of [
+        "KEY",
+        "SECRET",
+        endpoint,
+        ...h.calls.filter((b) => b.method === "sendTransaction").map((b) => b.params[0] as string),
+      ])
+        expect(output).not.toContain(secret)
+    }
+  })
+
+  for (const behind of [false, true])
+    test(`S-T13 completion inventory ${behind ? "all behind" : "reveals late Token-2022 account"} never marks swept`, async () => {
+      const late = zeroAccounts(1)
+      const h = await harness({
+        intercept: (b) => {
+          if (h.rpc.sent.length && b.method === "getTokenAccountsByOwner") {
+            expect(floorOf(b)).toBeGreaterThanOrEqual(100)
+            if (behind)
+              return jsonResponse(200, {
+                id: b.id,
+                error: { code: -32016, message: "behind", data: { contextSlot: 99 } },
+              })
+            if ((b.params[1] as { programId: string }).programId === TOKEN_2022_PROGRAM_ID)
+              h.rpc.token2022Accounts = late
+          }
+        },
+      })
+      const r = await h.execute()
+      expect(r.code).toBe(3)
+      expect(r.body.state).toBe("quarantined")
+      expect(r.body.residuals.map((r: { kind: string }) => r.kind)).toContain(
+        behind ? "inventory-unverified" : "token-account-remaining",
+      )
+      expect(h.records()).toBe(0)
+      expect((await openStore(h.dir)).entries[0]?.tee?.sweptAt).toBeUndefined()
+    })
+
+  test("S-T16 baseline JSON keys and types stay unchanged, floor is additive", async () => {
+    const h = await harness({ slot: null })
+    const r = await h.execute()
+    expect(r.code).toBe(0)
+    expect(r.body).toMatchObject({
+      address: TEE,
+      vaultDestination: VAULT,
+      state: "swept",
+      serverState: "quarantined",
+      emergency: false,
+      newReceipts: 1,
+      retainedReceipts: 0,
+      residuals: [],
+      pending: [],
+      recordedOnServer: true,
+      contextFloorSlot: null,
+      inventory: { verified: true, lamports: "0", tokenAccounts: 0 },
+    })
+    expect(Object.keys(r.body).sort()).toEqual(
+      [
+        "address",
+        "vaultDestination",
+        "state",
+        "serverState",
+        "emergency",
+        "receipts",
+        "newReceipts",
+        "retainedReceipts",
+        "residuals",
+        "pending",
+        "inventory",
+        "recordedOnServer",
+        "contextFloorSlot",
+      ].sort(),
+    )
+    expect(typeof r.body.inventory.observedAt).toBe("string")
+    expect(Object.keys(r.body.receipts[0]).sort()).toEqual(["kind", "amountRaw", "signature", "finalizedAt"].sort())
+  })
+  test("S2 context-behind send is guarded, not retried, and gives the RPC fix", async () => {
+    const h = await harness({
+      intercept: (b) => {
+        if (b.method === "sendTransaction")
+          return jsonResponse(200, {
+            id: b.id,
+            error: { code: -32016, message: "Minimum context slot has not been reached", data: { contextSlot: 99 } },
+          })
+        if (b.method === "getSignatureStatuses") return jsonResponse(200, { id: b.id, result: { value: [null] } })
+      },
+    })
+    const r = await h.execute()
+    expect(r.code).toBe(3)
+    expect(r.body.residuals[0]).toMatchObject({
+      kind: "sol-transfer-rejected",
+      broadcast: false,
+      rejection: { reason: "context-behind", rpcCode: -32016, pendingCleared: true },
+    })
+    expect(r.body.residuals[0].detail).toContain("behind slot 100 (it is at 99)")
+    expect(r.body.residuals[0].diagnostics).toBeUndefined()
+    const human = await h.execute(false)
+    expect(humanText(human.stdout.text)).toContain(humanText("rejected before simulation (not broadcast)"))
+    expect(humanText(human.stdout.text)).toContain(humanText("Fix: --rpc-url https://<your-rpc>"))
+    expect(h.calls.filter((b) => b.method === "sendTransaction")).toHaveLength(2)
+    expect(h.calls.filter((b) => b.method === "getSignatureStatuses")).toHaveLength(2)
+  })
+
+  for (const hook of [false, true])
+    test(`S1.4 token ${hook ? "hook resolver" : "mint read"} context failure stops all later signatures`, async () => {
+      const accounts = zeroAccounts(2)
+      if (accounts[0]) {
+        accounts[0].mint = MINT_2022.toBase58()
+        accounts[0].amount = "7"
+      }
+      const h = await harness({
+        rpc: defaultRpcState({
+          token2022Accounts: accounts,
+          accounts: mint2022(extendedMint(6, [{ type: 14, body: transferHookBody(Keypair.generate().publicKey) }])),
+        }),
+        intercept: (b) => {
+          if (b.method === "getAccountInfo" && (!hook || b.params[0] !== MINT_2022.toBase58()))
+            return jsonResponse(200, {
+              id: b.id,
+              error: { code: -32016, message: "behind", data: { contextSlot: 99 } },
+            })
+        },
+      })
+      const r = await h.execute()
+      expect(r.code).toBe(3)
+      expect(h.rpc.sent).toHaveLength(0)
+      expect(r.body.residuals[0]).toMatchObject({ kind: "rpc-context-behind", account: accounts[0]?.pubkey })
+      expect(r.body.residuals.filter((r: { kind: string }) => r.kind === "not-attempted")).toHaveLength(2)
+      expect(r.body.residuals.some((r: { kind: string }) => r.kind === "sol-remaining")).toBe(false)
+    })
+
+  test("S1.4 LP verification cannot swallow a context error and allow token or SOL signing", async () => {
+    const accounts = zeroAccounts(2)
+    for (const acct of accounts) {
+      acct.amount = "1"
+      acct.decimals = 0
+    }
+    const message = new TransactionMessage({
+      payerKey: teeKey.publicKey,
+      recentBlockhash: BLOCKHASH,
+      instructions: [
+        new TransactionInstruction({
+          programId: new PublicKey(DAMM_V2_PROGRAM_ID),
+          data: Buffer.alloc(8),
+          keys: [{ pubkey: teeKey.publicKey, isSigner: true, isWritable: true }],
+        }),
+      ],
+    }).compileToV0Message()
+    const artifact = {
+      transaction: Buffer.from(new VersionedTransaction(message).serialize()).toString("base64"),
+      accountKeys: message.staticAccountKeys.map((key) => key.toBase58()),
+    }
+    const h = await harness({
+      rpc: defaultRpcState({ token2022Accounts: accounts, tokenAccounts: zeroAccounts(1) }),
+      routes: Object.fromEntries(
+        accounts.map((acct) => [
+          `/api/v1/agent/lp/positions/${acct.mint}/close-build`,
+          () => jsonResponse(200, artifact),
+        ]),
+      ),
+      intercept: (b) => {
+        if (b.method === "getMultipleAccounts")
+          return jsonResponse(200, { id: b.id, error: { code: -32016, message: "behind", data: { contextSlot: 99 } } })
+      },
+    })
+    const r = await h.execute()
+    expect(r.code).toBe(3)
+    expect(h.rpc.sent).toHaveLength(0)
+    expect(r.body.residuals[0]).toMatchObject({ kind: "rpc-context-behind", account: accounts[0]?.pubkey })
+    expect(r.body.residuals.filter((r: { kind: string }) => r.kind === "not-attempted")).toHaveLength(3)
+  })
+})
+
+describe("tee status server read", () => {
+  test("tee status reads lifecycle and balances without unlocking a present vault; T27 exception ignores env passphrase", async () => {
+    const dir = await tempDir()
+    await mkdir(join(dir, "vault"), { recursive: true })
+    await Bun.write(join(dir, "vault.enc"), "must never be opened")
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/trading": () =>
+        jsonResponse(200, {
+          scopes: [],
+          privyAppId: null,
+          page: [
+            { id: "lw_tee1", address: TEE, label: "server-tee", chain: "solana", active: true, allowLaunch: false },
+          ],
+          isDone: true,
+        }),
+      "/api/v1/agent/wallets/lw_tee1/lifecycle": () => jsonResponse(200, LIFECYCLE("enabled")),
+      "/rpc": rpcHandler(defaultRpcState()),
+    })
+    const { deps, stdout } = depsFor(dir, fetch, [], {
+      env: { CANDLE_CONFIG_DIR: dir, CANDLE_KEYSTORE_PASSPHRASE: "must-not-be-used" },
+      promptSecret: async () => {
+        throw new Error("status must never unlock")
+      },
+    })
+    expect(await run(["tee", "status", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(0)
+    expect(JSON.parse(stdout.text)).toMatchObject({
+      source: "server",
+      verified: false,
+      label: "server-tee",
+      localState: null,
+      vaultDestination: null,
+      retainedSweepReceipts: null,
+      pendingSweepTransactions: null,
+      vaultLifecycle: null,
+      server: { state: "enabled" },
+      balances: { lamports: "1000000" },
+    })
+  })
+
+  test("tee status unknown address fails TEE_WALLET_NOT_ON_KEY", async () => {
+    const { fetch } = createRoutedFetch({
+      "/api/v1/agent/wallets/trading": () =>
+        jsonResponse(200, { scopes: [], privyAppId: null, page: [], isDone: true }),
+    })
+    const { deps, stdout } = depsFor(await tempDir(), fetch, [])
+    expect(await run(["tee", "status", TEE, "--rpc-url", RPC, "--json"], deps)).toBe(1)
+    expect(JSON.parse(stdout.text)).toMatchObject({ code: "TEE_WALLET_NOT_ON_KEY" })
+  })
+})

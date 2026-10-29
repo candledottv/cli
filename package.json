@@ -1,0 +1,15 @@
+{
+  "name": "candle-cli",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "bin": {
+    "candle": "packages/cli/dist/index.js"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.11",
+    "@types/node": "20.19.37",
+    "typescript": "5.9.3"
+  }
+}

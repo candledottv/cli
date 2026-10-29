@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- The data-protection keychain, which is where a kSecAttrTokenIDSecureEnclave key lives, admits
+       a Developer ID app through its application identifier and keychain access group, both with
+       the team prefix (CC-03). The team id is substituted by the release job from the certificate
+       it signs with; an unsigned development build has no identity and cannot create the key. -->
+  <key>com.apple.application-identifier</key>
+  <string>__TEAM_ID__.__BUNDLE_ID__</string>
+  <key>keychain-access-groups</key>
+  <array>
+    <string>__TEAM_ID__.__BUNDLE_ID__</string>
+  </array>
+  <!-- The synced passkey factor (BE-135, AD-2): AuthenticationServices serves a relying party only
+       to an app whose associated-domains entitlement names it AND whose domain serves an
+       apple-app-site-association listing this app's application identifier
+       (__TEAM_ID__.__BUNDLE_ID__) under webcredentials. Under Developer ID this entitlement needs
+       a provisioning profile embedded in the bundle (Contents/embedded.provisionprofile), which
+       the release job supplies from APPLE_DEVELOPER_ID_PROVISIONING_PROFILE_BASE64. Whether a
+       Developer ID-distributed app obtains associated domains for passkeys at all is T57's first
+       question. -->
+  <key>com.apple.developer.associated-domains</key>
+  <array>
+    <string>webcredentials:cli.candle.tv</string>
+  </array>
+  <!-- Hardened runtime, no exceptions: no JIT, no unsigned memory, no library validation bypass. -->
+</dict>
+</plist>
