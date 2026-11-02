@@ -17,7 +17,8 @@ unlocks and prints the plan without writing; `--json` returns
 Single and batch rename require new labels of at most 64 characters, without edge whitespace,
 control characters or a leading `-`; names are never trimmed. Existing longer labels still
 resolve as targets. A terminal is required. TEE wallets are refused by `vault rename`; use
-`candle tee rename`.
+`candle tee rename`. A retired TEE wallet (demoted and swept) is the exception: it renames here,
+since Candle no longer holds it. `candle vault list` hides retired TEE wallets unless `--all`.
 
 `candle tee rename <label|address|id> <new-label>` renames a TEE wallet on both sides: the label
 Candle holds and, when the wallet's key is in this vault, the vault entry.
@@ -57,19 +58,11 @@ and Homebrew refuse an older Mac rather than install a binary not built for it.
 
 ### No-npm fallback
 
-The same CLI can run straight from the public repo:
+The same CLI builds from its public source repository:
 
 ```
-bunx github:candledottv/agentic candle auth login
-```
-
-That fetches the `agentic` repo, resolves the `candle` bin at its root (`packages/cli/dist/index.js`,
-a committed build), and runs it. If bun's git-dependency handling fails on your machine, clone and
-build directly:
-
-```
-git clone https://github.com/candledottv/agentic.git
-cd agentic
+git clone https://github.com/candledottv/cli.git
+cd cli
 bun install
 bun run --cwd packages/cli build
 node packages/cli/dist/index.js auth login
@@ -116,6 +109,7 @@ emergency procedure, rebinding, trusted wallets and API key access levels are al
 | `candle vault import-legacy --tee`, `candle vault retire-legacy` | Copies the wallets in an existing `tee-wallets.enc` into the vault as imported keys (the recovery phrase does not restore them), then retires the old file once the vault holds everything and a backup has been verified. |
 | `candle tee status\|disable\|sweep\|fund` | Operate a TEE wallet (Tier 2): `status` shows its server state and on-chain balances, `disable` stops the agent (exit 0 only on a verified stop, 3 while pending), `sweep --rpc-url <url>` moves everything to the pinned vault, signed locally (closing DAMM v2 positions after verifying each server-built close; `--emergency` sweeps when the API cannot be read and moves the position NFT instead), and `fund` prints what your vault signs. On a Hood wallet (0x), `status` shows ETH, USDG and the gas reserve, and `sweep` moves USDG, WETH, every `--token` and then ETH last. See [CLI custody](https://docs.candle.tv/developers/cli-custody). |
 | `candle tee signer new --key <prefix\|label> [--out <pem>] [--force]` | On the trading machine, with that key's API key: generates the key's signer here and waits for the owner to approve it with `keys signer approve`. The key's wallets then trade from this machine. `--out` also writes a plaintext PEM for an SDK process. |
+| `candle tee signer remove --key <prefix\|label>` | Removes this machine's key signer once it owns no wallets, and tells the server the signer is gone. Refuses while a wallet is still owned by it. Uses the device token, or the key's own API key. |
 | `candle tee rebind <wallet...> --to-key <prefix\|label>`, `candle tee rebinds [wallet]` | Move TEE wallets to another key on the same account (owner only, preview then `confirm`; funds and the relay signer do not move), and list the rebind history. |
 | `candle tee rename <label\|address\|id> <new-label>`, `candle tee rename --pairs-from <file> [--dry-run]` | Rename one TEE wallet, or 1–256 from a pairs file: the label Candle holds and the vault entry when there is one (owner only; one server call, all or nothing, then one vault commit). |
 | `candle tee new\|enable` | `new` adds a key to an existing `tee-wallets.enc` and refuses when that store is absent (`vault new-key --chain solana`, then `vault promote --from <label> --to-key <prefix>`). `--factor` does not apply. `enable <address> --vault <address>` delegates an existing key with a pinned sweep vault. `vault import-legacy --tee` migrates an existing store. |
@@ -128,11 +122,14 @@ emergency procedure, rebinding, trusted wallets and API key access levels are al
 | `candle portfolio [<filter>] [--chain solana\|hood] [--rpc-url <url>] [--evm-rpc-url <url>] [--no-perps]` | Vault, TEE and embedded wallets on Solana and Hood in one table with chain, amount, price and value, subtotals per group and per chain, and a total. Solana vault and external balances are read over your own Solana RPC; Candle is sent only the mints, for prices. EVM vault keys are read over your own Hood RPC (`--evm-rpc-url`, else `CANDLE_EVM_RPC_URL`, else the built-in Hood RPC) for ETH and USDG only, priced by asset, never by address; an RPC on another chain is refused. An unpriced Hood token shows why (`no-market-row`, `stale-mark`, ...). `--chain` shows one chain. Each TEE wallet's DAMM v2 LP positions follow the tokens, valued by Candle at the same marks, and count in the total; one whose pool could not be read is shown as not read and the total says it is partial. A Hyperliquid section follows (each EVM TEE wallet's account, read from Hyperliquid directly, never in the total); `--no-perps` skips it. |
 | `candle scan <contract address> [--chain solana\|hood]` | The token card for one contract, as a Quant group gets it: market, all-time high since launch, bundles, snipers, insiders, fresh wallets, wallet age, tracked wallets in the last hour, the same-name leader, forensics coverage and the Candle page, with the source of each figure. Facts only; a field with no source prints a dash. The chain is read from the address unless `--chain` names it. No key needed and none sent. Served only where `TOKEN_CARD_ENABLED` is on, and `TOKEN_CARD_DISABLED` elsewhere. |
 | `candle token clusters <mint> [--chain solana\|hood]` | Optional third-party Solana cluster estimates, with fetched time and a linked-wallet caveat. Unavailable analysis prints a reason and exits 0; `--json` emits the availability union. No key. |
+| `candle token edit <mint> [--chain solana\|hood] [--description <text>] [--website <url>] [--x <url>] [--telegram <url>] [--discord <url>] [--clear <field>]...` | As the token's creator, set Candle's copy of its description and links; `--clear` removes one. Name, symbol and image cannot be changed, and nothing is written on chain. Needs a `launch:write` key from the launching account. Served only where `TOKEN_METADATA_EDIT_ENABLED` is on, and `METADATA_EDIT_DISABLED` elsewhere. |
+| `candle token history <mint> [--chain solana\|hood]` | The token's metadata edits, newest first. Public; no key sent. |
 | `candle token events <mint> [--chain solana\|hood] [--kind trade\|signal\|callout] [--since <iso-8601>] [--limit <n>] [--before <cursor>]` | One token's signals, callouts and tracked-wallet trades, one event per line: time, kind, name or short address (with the wallet's kind), action and size, sells with `W` or `L` when known. `--kind` filters the fetched page locally; `--before` continues the page. No key needed; a configured key is sent so group names follow its tier. Served only where `TOKEN_EVENTS_ENABLED` is on, and `TOKEN_EVENTS_DISABLED` elsewhere. |
-| `candle token about\|claim\|section set\|section restore\|history\|flag <address>` | The token's About page: `about` and `history` are public reads with no key, `about --capabilities` is this account's own eligibility (`token-pages:read`), and `claim`, `section set\|restore` and `flag` act as the key's account (`token-pages:write`, granted only through `keys create --scopes`). Every write needs the account's own current 0.5% of supply (any positive balance to flag), checked by Candle. The creator proof is a message the creator signs on their own machine (`claim --creator --challenge`, then `--challenge-id` and `--signature`), never a transaction. Section text comes from `--file`; a revision conflict exits 4 and leaves the file untouched; no answer exits 3 with the `--idempotency-key` to rerun with. |
+| `candle token about\|claim\|section set\|section restore\|history\|flag\|comment\|comments <address>` | The token's About page: `about`, `history` and `comments` are public reads with no key, `about --capabilities` is this account's own eligibility (`token-pages:read`), and `claim`, `section set\|restore`, `comment` and `flag` act as the key's account (`token-pages:write`, granted only through `keys create --scopes`). Every write needs the account's own current 0.5% of supply (any positive balance to flag), checked by Candle. The creator proof is a message the creator signs on their own machine (`claim --creator --challenge`, then `--challenge-id` and `--signature`), never a transaction. Section text comes from `--file`; a revision conflict exits 4 and leaves the file untouched; no answer exits 3 with the `--idempotency-key` to rerun with. |
 | `candle plans` | The plans the API serves (`GET /api/v1/agent/plans`): each plan's monthly price, agent trade fee, Hyperliquid perps builder fee, the limits a new key gets, and one row per capability (buying and selling tokens not launched on Candle, self-launch, atomic launch, linked wallets, perps, limit orders). Every number is the server's; the CLI bundles none. Needs no key and sends none. `--json` is the server's body. Your own plan is `candle doctor`'s Plan row. |
 | `candle lp pools\|add\|positions\|remove\|claim` | Meteora DAMM v2 liquidity from a TEE wallet through its bound key (`lp:write`, opt-in). `pools <token>` lists pools with liquidity, fee, volume and an estimated yield; `add <pool> --amount <n> <token> --wallet <tee>` opens or grows a position at the pool's ratio after showing both tokens' Token-2022 warnings; `positions` lists every position across your TEE wallets; `remove <position> --percent <n>` withdraws (100% also claims fees and closes the position); `claim <position>` claims fees and rewards. No Candle fee. A `tee sweep` closes open positions itself; see TEE wallets. |
 | `candle perps setup\|deposit\|open\|close\|cancel\|orders\|positions\|leverage` | Hyperliquid perpetuals from the EVM TEE wallet bound to the key (`perps:write`, opt-in). `setup` approves Candle's builder fee (0.1%, none on Max) once; `deposit <amount> <SOL\|USDC\|ETH\|USDG>` moves funds onto the Hyperliquid account through Relay from the key's Solana or Hood TEE wallet (`swap:write`; `--to` names the EVM TEE wallet from Solana; `deposit status <id>` reads it; no withdrawal yet); `open <coin> <long\|short> <size>` trades at market, or as a limit with `--price`, with optional `--tp` and `--sl`; `close <coin>` closes reduce-only; `cancel <cloid>`; `leverage <coin> <x> [--isolated]`; `orders` and `positions` read live. Candle builds each action within the key's limits; the CLI recomputes its hash and checks the action type and Candle's builder before anything is signed, then submits the signed action to Hyperliquid itself. `CANDLE_HYPERLIQUID_BUILDER` deliberately replaces the release builder pin; its use is shown in the preview. |
+| `candle accounts create --env staging --name <fleet-name> [--username <handle>] [--scopes <a,b,c>] [--profile <name>] [--use] [--yes]` | Creates a staging test member with no browser: Free, tagged `test-fleet` (excluded from the KPI figures), with Solana and Hood TEE wallets and a first API key. macOS only, at a terminal, under the fleet runner lock. The identity key is read from the login keychain item `candle-fleet-<env>-<name>-sol` and signs a `Candle x402 create_account` proof; the key signer is never read (its public half comes from the owner's sealed-signer receipt). The key Candle returns is handed to the hash-pinned reviewed sibling, which seals it into `candle-fleet-<env>-<name>-apikey`; the profile keeps the item's name, never the key. This profile is a public fleet record; ordinary CLI authentication (including `doctor`) refuses with `ACCOUNTS_FLEET_RUNNER_REQUIRED`. Section 6 confines credential reads to the reviewed fleet runner under R9.3; general profile use needs a separate custody decision. This restriction takes precedence over the spec section 5 output example's `doctor` suggestion. `--use` only selects the public record; it grants no credential access. Refused before anything is sent when that item exists, when the default username is over 30 characters (use `--username`), or when the sibling or receipt does not check. Production is refused. Exit 3 means pending (rerun with the same signer) or the key could not be stored. |
 | `candle profile list` | Lists profiles on this machine, with cached accounts. |
 | `candle profile add <name> --api-url <url>` | Creates a profile before authenticating it. |
 | `candle profile use <name>` | Makes a profile the active one. |
@@ -164,19 +161,21 @@ Every command accepts these global options:
 
 ## Verify a release
 
-Every release on https://github.com/candledottv/agentic/releases is built and signed by that
+Every release on https://github.com/candledottv/cli/releases is built and signed by that
 repository's `release.yaml` workflow, and `install.sh` and `candle update` already check this for
-you. To check a download by hand, three commands, in increasing strength:
+you. Releases up to 0.12.0 were published from https://github.com/candledottv/agentic/releases; check
+one of those against that repository's name in the commands below. To check a download by hand,
+three commands, in increasing strength:
 
 ```
-curl -fsSLO https://github.com/candledottv/agentic/releases/download/cli-v0.6.1/SHA256SUMS
-curl -fsSLO https://github.com/candledottv/agentic/releases/download/cli-v0.6.1/candle-darwin-arm64
+curl -fsSLO https://github.com/candledottv/cli/releases/download/cli-v0.13.5/SHA256SUMS
+curl -fsSLO https://github.com/candledottv/cli/releases/download/cli-v0.13.5/candle-darwin-arm64
 grep candle-darwin-arm64 SHA256SUMS | shasum -a 256 -c
 ```
 
 ```
-gh attestation verify candle-darwin-arm64 --repo candledottv/agentic \
-  --cert-identity https://github.com/candledottv/agentic/.github/workflows/release.yaml@refs/tags/cli-v0.6.1
+gh attestation verify candle-darwin-arm64 --repo candledottv/cli \
+  --cert-identity https://github.com/candledottv/cli/.github/workflows/release.yaml@refs/tags/cli-v0.13.5
 ```
 
 `--cert-identity` is the signing certificate's subject, the workflow file and the release tag in
@@ -186,9 +185,9 @@ and the two signer flags) as mutually exclusive, and the signer-workflow flag al
 any tag's attestation.
 
 ```
-curl -fsSLO https://github.com/candledottv/agentic/releases/download/cli-v0.6.1/candle-darwin-arm64.sigstore.json
+curl -fsSLO https://github.com/candledottv/cli/releases/download/cli-v0.13.5/candle-darwin-arm64.sigstore.json
 cosign verify-blob --new-bundle-format --bundle candle-darwin-arm64.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/candledottv/agentic/\.github/workflows/release\.yaml@refs/tags/cli-v' \
+  --certificate-identity-regexp '^https://github.com/candledottv/cli/\.github/workflows/release\.yaml@refs/tags/cli-v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   candle-darwin-arm64
 ```
@@ -542,3 +541,30 @@ and `--json` for the result. Add/remove amounts are decimal CNDL/sCNDL respectiv
 MOVE REAL FUNDS. A rerun posts the saved signed TEE transaction to submit again without
 re-signing; the server reads the chain first, so it lands once. The signed transaction is kept
 in the CLI operations directory for that retry. An embedded rerun replays the saved build.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). Third-party material, including the EFF long wordlist used for
+generated vault passphrases (CC BY 3.0 US), is listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+### Immutable token updates (unreleased source)
+
+`candle token update <address> --file ./update.txt --chain solana --idempotency-key <saved-key>`
+posts 1–1000 characters with the account's `token-pages:write` key and fresh 0.5% eligibility.
+The file is validated locally and stays untouched. A lost answer retries identical bytes once;
+exit 3 retains the key for an explicit retry. The post cannot be edited.
+`candle token post delete <address> <post-id> --chain solana --idempotency-key <saved-key>`
+soft-deletes a post owned by that key's account, including posts from its agents, after selling too.
+Both commands support `--json` and default-off server refusals. Package release remains a separate
+human-owned step.
+
+### Token comments (unreleased source)
+
+`candle token comment <address> --file ./comment.txt --chain solana --idempotency-key <saved-key>`
+posts 1–500 characters under the same `token-pages:write` key and fresh 0.5% eligibility as a
+section edit. The file is validated locally and stays untouched; a lost answer retries identical
+bytes once, and exit 3 retains the key. A comment cannot be edited and is never pushed to holders.
+`candle token comments <address> [--limit <n>] [--cursor <c>]` lists comments newest first with
+tombstones; it is public and sends no key. `candle token post delete` removes the key account's own
+comment, including after selling. Package release remains a separate human-owned step.

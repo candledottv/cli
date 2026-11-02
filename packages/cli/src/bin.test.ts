@@ -8,22 +8,43 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { spawnSync } from "node:child_process"
-import { mkdtempSync, readFileSync, symlinkSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { readFileSync, symlinkSync } from "node:fs"
 import { join, resolve } from "node:path"
 import pkg from "../package.json"
+import { tempDirs } from "./temp-dirs.test-support"
 import { fakeWalletsApi, pipeEnv, runPipeline, shellQuote } from "./test-support"
+
+const tempDir = tempDirs()
 
 const pkgDir = resolve(import.meta.dir, "..")
 const bundle = join(pkgDir, "dist", "index.js")
+let node: string
+let nodeEnv: Record<string, string>
 
 beforeAll(() => {
   const built = spawnSync("bun", ["run", "build"], { cwd: pkgDir, encoding: "utf8" })
   if (built.status !== 0) throw new Error(`build failed: ${built.stderr}`)
+
+  const found = Bun.which("node")
+  if (!found) throw new Error("the bin test needs node on PATH")
+  node = found
+  const home = tempDir("candle-bin-home-")
+  // main() resolves both credential stores before dispatch, even for --version/--help.
+  // Inheriting PATH lets host `which`/`secret-tool` and a Secret Service probe consume the
+  // test's 5s budget. These entry/dispatch checks need no OS keychain or caller credentials.
+  // Resolve node first, then give the child an empty tool directory and a fresh home/config.
+  nodeEnv = { PATH: tempDir("candle-bin-path-"), HOME: home, CANDLE_CONFIG_DIR: home }
 })
 
 function runNode(entry: string, args: string[]) {
-  return spawnSync("node", [entry, ...args], { encoding: "utf8" })
+  return spawnSync(node, [entry, ...args], {
+    env: nodeEnv,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+    // A stuck child must be reaped before Bun's 5s test deadline.
+    timeout: 4_000,
+    killSignal: "SIGKILL",
+  })
 }
 
 describe("the built bin entry", () => {
@@ -34,7 +55,7 @@ describe("the built bin entry", () => {
   })
 
   test("runs when invoked through a symlink, the way bunx and npx execute a bin", () => {
-    const dir = mkdtempSync(join(tmpdir(), "candle-bin-"))
+    const dir = tempDir("candle-bin-")
     const link = join(dir, "candle")
     symlinkSync(bundle, link)
     const res = runNode(link, ["--version"])
@@ -71,7 +92,7 @@ describe("the built bin entry", () => {
   })
 
   test("through a symlink, a real command still dispatches (bunx passthrough token included)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "candle-bin-"))
+    const dir = tempDir("candle-bin-")
     const link = join(dir, "candle")
     symlinkSync(bundle, link)
     // `candle` as the first token mirrors bunx passing the bin name through; the dispatcher
@@ -107,7 +128,7 @@ describe("the built bin entry, through a real pipe", () => {
   }
 
   test("wallets --json arrives whole to a slow reader", async () => {
-    const res = await runPipeline(`${candle("wallets --json")} | (sleep 0.5; cat)`, pipeEnv())
+    const res = await runPipeline(`${candle("wallets --json")} | (sleep 0.5; cat)`, pipeEnv(tempDir))
     expect(res.err).toBe("")
     expect(res.status).toBe(0)
     expect(res.out.length).toBeGreaterThan(4 * 65_536)
@@ -119,7 +140,10 @@ describe("the built bin entry, through a real pipe", () => {
   }, 60_000)
 
   test("a reader that closes early (| head) ends the output quietly with status 0", async () => {
-    const res = await runPipeline(`${candle("wallets --json")} 2>&1 | head -c 10; exit "\${PIPESTATUS[0]}"`, pipeEnv())
+    const res = await runPipeline(
+      `${candle("wallets --json")} 2>&1 | head -c 10; exit "\${PIPESTATUS[0]}"`,
+      pipeEnv(tempDir),
+    )
     expect(res.err).toBe("")
     expect(res.out.toString("utf8")).toBe('{"embedded')
     expect(res.status).toBe(0)

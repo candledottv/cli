@@ -86,6 +86,7 @@ export const ENVIRONMENT: EnvVar[] = [
   },
   { name: "CANDLE_PROFILE", description: "The profile to act as, when --profile is not given" },
   { name: "CANDLE_API_URL", description: "API base URL, when --api-url is not given" },
+  { name: "CANDLE_HACC_URL", description: "Strategy lab base URL (default https://api.hacc.fun); HTTPS only" },
   {
     name: "CANDLE_X402_NETWORK",
     description: "The network per-use x402 payments are made on: mainnet (default) or devnet, for tests",
@@ -645,7 +646,7 @@ export const HELP: Record<string, Topic> = {
     group: "Trade",
     summary: "Create a token on Solana or Hood, with an optional first buy",
     description:
-      "Creates a token from the wallet you name, with an optional first buy. Embedded launches use /launch/headless on every plan, with the key's embedded-wallet allowance and launch:write; no swap:write is needed. A Solana first buy is a creator bundle, signed by Candle. A Hood first buy is best effort after creation. TEE launches use /launch/self and require Pro or Max, allowLaunch, a bound key and verified authority. TEE buys need TEE_LAUNCH_BUYS_ENABLED on the server; Solana buys also need AGENT_TRADING_ENABLED and Jito. Existing server gates and ceilings apply. The embedded path previews the launch before confirmation; --dry-run stops at the preview. No buy creates only the token. Local image and banner uploads happen before confirmation and are public and permanent even if the launch is declined. Reuse --client-trade-id for recovery. --check answers first, before any of it: which launch path works on this key and server (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, with nothing uploaded, built or sent; name a wallet with --wallet to narrow it, and it exits 1 when no path works.",
+      "Creates a token from the wallet you name, with an optional first buy. Embedded launches use /launch/headless on every plan, with the key's embedded-wallet allowance and launch:write; no swap:write is needed. A Solana first buy is a creator bundle, signed by Candle. A Hood first buy is best effort after creation. TEE launches use /launch/self and require Pro or Max, allowLaunch, a bound key and verified authority. TEE buys need TEE_LAUNCH_BUYS_ENABLED on the server; Solana buys also need AGENT_TRADING_ENABLED and Jito. Existing server gates and ceilings apply. The embedded path previews the launch before confirmation; --dry-run stops at the preview. No buy creates only the token. Local image and banner uploads happen before confirmation and are public and permanent even if the launch is declined. Reuse --client-trade-id for recovery. On Solana, --fee-wallet <address> sets the wallet the launch's curve and pool fees earn to, an on-curve wallet by itself or a Squads v4 vault with --fee-wallet-multisig <address> and --fee-wallet-multisig-vault-index <n>; without it the fees earn to the account wallet, which the preview, the confirm and --check all say. --check answers first, before any of it: which launch path works on this key and server (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, with nothing uploaded, built or sent; name a wallet with --wallet to narrow it, and it exits 1 when no path works.",
     usage: [LAUNCH_USAGE],
     rows: [],
     flags: [
@@ -755,7 +756,7 @@ export const HELP: Record<string, Topic> = {
   },
   agent: {
     group: "Account",
-    summary: "Read or edit this agent's public page, and post on it",
+    summary: "This agent's public page and posts; any agent's positions",
     description:
       "An acting key with profileSelfEdit allowed may edit its bio, strategy, models, links and images, and publish or delete posts on its own page. Name, slug and visibility remain owner-only. The server enforces permission, admin lock and the daily limits: 20 profile edits and 30 posts per UTC day, each shared by every key of the profile. A post is free text shown as plain text, tied to no trade or launch. --avatar-file and --banner-file publish the image and metadata on uploads.candle.tv and save the field without a later PATCH. Each image and any text PATCH consume separate profile edits and may succeed independently. candle image upload is for launch images (IPFS), not profile images.",
     usage: [
@@ -764,12 +765,18 @@ export const HELP: Record<string, Topic> = {
       "candle agent post create --text <text> [--chain <solana|hood> --mint <address>]",
       "candle agent post delete <post-id>",
       "candle agent post list [profile-id] [--limit <n>] [--cursor <cursor>]",
+      "candle agent positions <profile-id|slug> [--kind spot|perp] [--json]",
     ],
     rows: [
       { invocation: "profile show|set", description: "Read the displayed profile or edit allowed fields" },
       {
         invocation: "post create|delete|list",
         description: "Publish or delete a post on this agent's page; list an agent's posts (this key's own by default)",
+      },
+      {
+        invocation: "positions <profile-id|slug>",
+        description:
+          "A published agent's open positions, spot and Hyperliquid perps, with amounts; under $1 hidden. No key",
       },
     ],
     flags: [
@@ -794,6 +801,7 @@ export const HELP: Record<string, Topic> = {
       { invocation: "--mint <address>", description: "A token Candle shows publicly, shown as a chip" },
       { invocation: "--limit <n>", description: "Posts per page, 1 to 50 (default 20)" },
       { invocation: "--cursor <cursor>", description: "The previous page's cursor" },
+      { invocation: "--kind <spot|perp>", description: "positions: only tokens or only perps" },
     ],
     examples: [
       "candle agent profile show --json",
@@ -801,6 +809,7 @@ export const HELP: Record<string, Topic> = {
       "candle agent profile set --avatar-file avatar.png --banner-file banner.webp",
       'candle agent post create --text "Watching the curve fill"',
       "candle agent post list --json",
+      "candle agent positions prof_0123456789abcdef --kind perp",
     ],
     env: [],
   },
@@ -829,7 +838,7 @@ export const HELP: Record<string, Topic> = {
     summary:
       "P&L per chain and combined: realized, fees, unrealized and open positions (--profile for one key's share)",
     description:
-      "Without --profile, the account's books: every profile, the web app and the CLI, one ledger, the same figures the console shows, to the cent for the same moment. Needs a key with the Read scope (account:read). With --profile <name>, that profile's key reads its share of the same P&L: realized on the sales it made, and the open positions that belong to it (the wallet's bound key, else the key whose buy opened them), with a row per wallet that sums to the total. Positions live in wallets: each wallet is its own average-cost pool, the account is the sum of its wallets, and a recorded move between two of the account's wallets carries its cost and realizes nothing. Both show a Solana block, a Hood block, then the combined figure, the closed positions as money made, minus money lost, plus partial sells, and a CHAIN column (and WALLET, where the API names it) on positions. The account's books add a By agent table (each key, then Manual for web-app trades, then the account total). Unpriced positions are shown as unpriced and never valued at zero; a position worth under one cent is marked dust and still counted. A bridge between Solana and Hood is not a trade: it opens and closes nothing, and bridge and Relay costs are not netted from P&L. Where Candle serves LP, DAMM v2 positions are included: realized (withdrawals against the cost basis at the add, plus claimed fees), unrealized (open positions at their share of the pool plus unclaimed fees, against that basis), and vs holding (what the deposited tokens would be worth held); Total is the console's token figure, and Total with LP covers tokens and LP. Only --profile <name> adds a Hyperliquid section under its own heading, over every EVM TEE wallet bound to the profile, per binding period: realized gross, funding (received positive, paid negative), fees including builder fees, realized net, unrealized and the net. Facts and unrealized stop at the same cutoff per wallet; a cutoff read now is marked (live, not yet settled). The net is also counted in Total, whose line says it includes Hyperliquid; when the section cannot be read, Total is the token figure and the CLI says it excludes perps and why. Deposits and withdrawals are not P&L. Account-wide candle pnl and its By agent table cover ledger trades only; a key with only perps activity has no row there. For live perps positions and risk, use candle perps positions or candle portfolio.",
+      "Without --profile, the account's books: every profile, the web app and the CLI, one ledger, the same figures the console shows, to the cent for the same moment. Needs a key with the Read scope (account:read). With --profile <name>, that profile's key reads its share of the same P&L: realized on the sales it made and on positions its buy opened that closed through a sale made by hand in the web app or an exit outside Candle (the fee and trade count stay under Manual), and the open positions that belong to it (the wallet's bound key, else the key whose buy opened them), with a row per wallet that sums to the total. Positions live in wallets: each wallet is its own average-cost pool, the account is the sum of its wallets, and a recorded move between two of the account's wallets carries its cost and realizes nothing. Both show a Solana block, a Hood block, then the combined figure, the closed positions as money made, minus money lost, plus partial sells, and a CHAIN column (and WALLET, where the API names it) on positions. The account's books add a By agent table (each key, then Manual for web-app trades, then the account total). Unpriced positions are shown as unpriced and never valued at zero; a position worth under one cent is marked dust and still counted. A bridge between Solana and Hood is not a trade: it opens and closes nothing, and bridge and Relay costs are not netted from P&L. Where Candle serves LP, DAMM v2 positions are included: realized (withdrawals against the cost basis at the add, plus claimed fees), unrealized (open positions at their share of the pool plus unclaimed fees, against that basis), and vs holding (what the deposited tokens would be worth held); Total is the console's token figure, and Total with LP covers tokens and LP. Only --profile <name> adds a Hyperliquid section under its own heading, over every EVM TEE wallet bound to the profile, per binding period: realized gross, funding (received positive, paid negative), fees including builder fees, realized net, unrealized and the net. Facts and unrealized stop at the same cutoff per wallet; a cutoff read now is marked (live, not yet settled). The net is also counted in Total, whose line says it includes Hyperliquid; when the section cannot be read, Total is the token figure and the CLI says it excludes perps and why. Deposits and withdrawals are not P&L. Account-wide candle pnl and its By agent table cover ledger trades only; a key with only perps activity has no row there. For live perps positions and risk, use candle perps positions or candle portfolio.",
     usage: ["candle pnl [--profile <name>] [--dust] [--json]"],
     rows: [],
     examples: ["candle pnl", "candle pnl --profile scalper --json"],
@@ -837,10 +846,10 @@ export const HELP: Record<string, Topic> = {
   },
   token: {
     group: "Account",
-    summary: "Token About pages, events, cluster analysis, forensics and the vamp finder",
+    summary: "Token About pages, creator metadata edits, events, cluster analysis, forensics and the vamp finder",
     intro: "Token About pages, events, clusters, forensics, vamp finder",
     description:
-      "about, claim, section, history and flag are the token's About page: three shared sections (thesis, tokenomics, lore) any eligible holder may edit, with full history. about and history are public and send no key. about --capabilities reads this account's own eligibility (token-pages:read). claim, section set, section restore and flag act as the key's account and need token-pages:write; neither scope is in any preset, so grant them with keys create --scopes token-pages:read,token-pages:write. Candle checks on every write that the account's Candle-known wallets hold at least 0.5% of the token's current supply (any positive balance to flag); the scope is never a holding. A creator proof is a message, never a transaction: claim --creator --challenge prints the exact bytes to sign (and --message-out writes them to a file), you sign them on your own machine, for example with candle sign message, and claim --creator --challenge-id <id> --signature <sig> sends the signature; a creator wallet already among the account's known wallets needs no signature. Section text comes from --file and is checked here first (valid UTF-8, at most 32 KiB, no control characters but newline and tab, thesis 280 characters, tokenomics and lore 5,000); the file is only read. Every write sends an Idempotency-Key and retries once on no answer with the same key. Exit codes: 0 done, 1 refused (the code is in --json), 2 usage or local input refused (nothing sent), 3 no answer so the outcome is unknown (rerun with the printed --idempotency-key), 4 revision conflict (your file is untouched; read history, merge, rerun with the latest --base-revision). Token page switches ship off; a switched-off server answers feature_off or not_found. events lists one token's signals, callouts and tracked-wallet trades, one event per line: time, kind, name or short address, action, size. Needs no key; a configured key is sent so wallet group names follow its tier. Off on a deployment until TOKEN_EVENTS_ENABLED is on; until then the command answers TOKEN_EVENTS_DISABLED. clusters reads third-party estimates of linked Solana wallets. Exchange, pool and service wallets may be grouped together; the figures do not establish common ownership or wrongdoing. Unavailable analysis is a normal result and exits 0. Needs no key and sends none. forensics and vamp-candidates send the profile's API key when it has one. Where the API offers x402 per-use payments, forensics past the free rate and the vamp finder without a key (or past a Free account's daily allowance) answer with a price: the CLI pays it in USDC from a Solana vault key, at a terminal, after a typed confirm (or --yes), within the limits candle spend sets, or prints the price and pays nothing. A paid call that Candle then fails to serve is credited, never refunded.",
+      "edit sets Candle's copy of a token's description and its four links (website, X, Telegram, Discord) as the token's creator: the key's account must be the one that launched it, and the key needs launch:write. Name, symbol and image cannot be changed. A flag sets a field; --clear <field> removes it (repeatable); fields not named keep their value. A description is at most 500 characters and safe for on-chain JSON, and a link is an absolute http(s) URL of at most 200 characters. The chain is read from the address (0x is Hood) unless --chain says otherwise. Candle's token page and API change at once; wallets and terminals that read the on-chain metadata do not, since this edit writes nothing on chain. A Hood token that carries its metadata on chain is refused (ONCHAIN_METADATA_TOKEN) and is edited with Candle's on-chain edit instead, and a TEE-launched Hood token is refused (TEE_LAUNCHED_HOOD_TOKEN). Re-sending the current values changes nothing and is not counted as an edit. Each edit sends an Idempotency-Key and retries once on no answer with the same key; exit 3 means the outcome is unknown (rerun with the printed --idempotency-key). Off on a deployment until TOKEN_METADATA_EDIT_ENABLED is on; until then edit answers METADATA_EDIT_DISABLED. history <mint> with no section lists the token's edits, newest first, with what each changed from and to; it is public and sends no key. about, claim, section, history and flag are the token's About page: three shared sections (thesis, tokenomics, lore) any eligible holder may edit, with full history. about and history are public and send no key. about --capabilities reads this account's own eligibility (token-pages:read). claim, section set, section restore and flag act as the key's account and need token-pages:write; neither scope is in any preset, so grant them with keys create --scopes token-pages:read,token-pages:write. Candle checks on every write that the account's Candle-known wallets hold at least 0.5% of the token's current supply (any positive balance to flag); the scope is never a holding. A creator proof is a message, never a transaction: claim --creator --challenge prints the exact bytes to sign (and --message-out writes them to a file), you sign them on your own machine, for example with candle sign message, and claim --creator --challenge-id <id> --signature <sig> sends the signature; a creator wallet already among the account's known wallets needs no signature. Section text comes from --file and is checked here first (valid UTF-8, at most 32 KiB, no control characters but newline and tab, thesis 280 characters, tokenomics and lore 5,000); the file is only read. Every write sends an Idempotency-Key and retries once on no answer with the same key. Exit codes: 0 done, 1 refused (the code is in --json), 2 usage or local input refused (nothing sent), 3 no answer so the outcome is unknown (rerun with the printed --idempotency-key), 4 revision conflict (your file is untouched; read history, merge, rerun with the latest --base-revision). Token page switches ship off; a switched-off server answers feature_off or not_found. events lists one token's signals, callouts and tracked-wallet trades, one event per line: time, kind, name or short address, action, size. Needs no key; a configured key is sent so wallet group names follow its tier. Off on a deployment until TOKEN_EVENTS_ENABLED is on; until then the command answers TOKEN_EVENTS_DISABLED. clusters reads third-party estimates of linked Solana wallets. Exchange, pool and service wallets may be grouped together; the figures do not establish common ownership or wrongdoing. Unavailable analysis is a normal result and exits 0. Needs no key and sends none. forensics and vamp-candidates send the profile's API key when it has one. Where the API offers x402 per-use payments, forensics past the free rate and the vamp finder without a key (or past a Free account's daily allowance) answer with a price: the CLI pays it in USDC from a Solana vault key, at a terminal, after a typed confirm (or --yes), within the limits candle spend sets, or prints the price and pays nothing. A paid call that Candle then fails to serve is credited, never refunded.",
     usage: [
       "candle token clusters <mint> [--chain solana|hood] [--json]",
       "candle token events <mint> [--chain solana|hood] [--kind trade|signal|callout] [--since <iso-8601>] [--limit <n>] [--before <cursor>] [--json]",
@@ -849,10 +858,20 @@ export const HELP: Record<string, Topic> = {
       "candle token about <address> [--chain solana|hood] [--capabilities] [--json]",
       "candle token claim <address> [--creator [--challenge [--message-out <path>] | --challenge-id <id> --signature <sig>]] [--json]",
       "candle token section set|restore <address> <thesis|tokenomics|lore> --file <path>|--version-id <id> --base-revision <n> [--json]",
+      "candle token edit <mint> [--chain solana|hood] [--description <text>] [--website <url>] [--x <url>] [--telegram <url>] [--discord <url>] [--clear <field>]... [--idempotency-key <key>] [--json]",
+      "candle token history <mint> [--chain solana|hood] [--limit <n>] [--cursor <c>] [--json]",
       "candle token history <address> <thesis|tokenomics|lore> [--limit <n>] [--cursor <c>] [--json]",
+      "candle token update <address> --file <path> [--chain solana|hood] [--idempotency-key <key>] [--json]",
+      "candle token comment <address> --file <path> [--chain solana|hood] [--idempotency-key <key>] [--json]",
+      "candle token comments <address> [--chain solana|hood] [--limit <n>] [--cursor <c>] [--json]",
+      "candle token post delete <address> <post-id> [--chain solana|hood] [--idempotency-key <key>] [--json]",
       "candle token flag <address> --content <id> --reason <reason> [--detail <text>] [--json]",
     ],
     rows: [
+      {
+        invocation: "edit <mint>",
+        description: "As the token's creator, set or --clear its description and links (not name, symbol or image)",
+      },
       { invocation: "clusters <mint>", description: "Read cluster analysis, or its unavailable reason" },
       {
         invocation: "events <mint>",
@@ -876,8 +895,24 @@ export const HELP: Record<string, Topic> = {
         invocation: "section set|restore <address> <section>",
         description: "Write a section from --file, or restore an earlier --version-id, at --base-revision",
       },
-      { invocation: "history <address> <section>", description: "A section's versions, newest first" },
-      { invocation: "flag <address>", description: "Report one exact version to Candle's review queue" },
+      {
+        invocation: "history <address> [<section>]",
+        description: "The token's metadata edits, newest first; with a section, that section's versions",
+      },
+      { invocation: "update <address>", description: "Post an immutable holder update from --file (1000 characters)" },
+      {
+        invocation: "comment <address>",
+        description: "Post an immutable comment from --file (500 characters); never pushed to holders",
+      },
+      { invocation: "comments <address>", description: "The token's comments, newest first, with tombstones" },
+      {
+        invocation: "post delete <address> <post-id>",
+        description: "Delete your own update or comment, including after selling",
+      },
+      {
+        invocation: "flag <address>",
+        description: "Report one exact version, update or comment to Candle's review queue",
+      },
     ],
     flags: [
       { invocation: "--chain <chain>", description: "solana (default) or hood; Hood cluster analysis is unavailable" },
@@ -887,7 +922,8 @@ export const HELP: Record<string, Topic> = {
       },
       {
         invocation: "--limit <n>",
-        description: "events, history or vamp-candidates: how many to read (events 1 to 1000, history 1 to 50)",
+        description:
+          "events, history, comments or vamp-candidates: how many to read (events 1 to 1000, history and comments 1 to 50)",
       },
       { invocation: "--min-copies <n>", description: "vamp-candidates: copies in the last 24h, at least" },
       { invocation: "--since <iso-8601>", description: "events: list only events at or after this time" },
@@ -898,20 +934,34 @@ export const HELP: Record<string, Topic> = {
         description: "The Solana vault key that pays, by label or address (needed when the vault has several)",
       },
       { invocation: "--yes", description: "Pay without the typed confirm (the vault unlock still prompts)" },
-      { invocation: "--file <path>", description: "section set: the section text, UTF-8; an empty file needs --clear" },
+      {
+        invocation: "--file <path>",
+        description: "section set, update or comment: the text, UTF-8; an empty section file needs --clear",
+      },
       {
         invocation: "--base-revision <n>",
         description: "section set|restore: the revision you started from (0 first)",
       },
       { invocation: "--version-id <id>", description: "section restore: the earlier version to copy into a new one" },
-      { invocation: "--content <id>", description: "flag: the exact version id being reported" },
+      { invocation: "--content <id>", description: "flag: the exact version, update or comment id being reported" },
       {
         invocation: "--reason <reason>",
         description: "flag: spam, scam, abuse, misleading, unsafe_link or other; --detail adds up to 500 characters",
       },
+      // The five edit flags and their help are the launch definition's own (BE-2140).
+      ...launchFlagRows
+        .filter((row) => /^--(description|website|x|telegram|discord) /.test(row.invocation))
+        .map((row) => ({ invocation: row.invocation, description: `edit: ${row.description}` })),
+      {
+        invocation: "--clear <field>",
+        description: "edit: remove website, x, telegram, discord or description; repeatable",
+      },
       { invocation: "--idempotency-key <key>", description: "Writes: reuse a key to retry without writing twice" },
     ],
     examples: [
+      "candle token edit <mint> --x https://x.com/<handle> --website https://<site>",
+      "candle token edit <mint> --clear discord --json",
+      "candle token history <mint>",
       "candle token about <mint> --capabilities",
       "candle token section set <mint> thesis --file ./thesis.txt --base-revision 3",
       "candle token claim <mint> --creator --challenge --message-out ./proof.txt",
@@ -961,6 +1011,81 @@ export const HELP: Record<string, Topic> = {
     examples: ["candle quant terms", "candle quant terms --yes --json"],
     env: ENV_API,
   },
+  lab: {
+    group: "Account",
+    intro: "Strategy replays, runners and edges",
+    summary: "Strategy lab: replay a definition and read measured runners and edges",
+    description:
+      "The hacc strategy lab, using this profile's production agent key. Access and daily caps come from the server; Pro access depends on admission. Replays wait by default, polling every 5 seconds for up to 11 minutes. The lead card compares random controls within the definition's priceable candidates, break-even cost and regime context. Its tick-mark limitations are printed with the card. Backtests are a model of the past. The lab never trades. --json preserves the server's body. A device token or test key cannot use the lab.",
+    usage: ["candle lab <status|replay|runners|edges> [flags]"],
+    rows: [
+      { invocation: "status", description: "Plan, admission, replay cap and usage, reset time and active job" },
+      {
+        invocation: "replay --definition <file|-> --from <iso> --to <iso>",
+        description: "Submit and wait for a replay; replay get <job-id> reads it; replay cancel <job-id> cancels it",
+      },
+      { invocation: "runners [--hours n] [--min-wallets n]", description: "Measured runners in the window" },
+      {
+        invocation: "edges [--days n] [--min-n n]",
+        description: "Signal edges net of the cost already used by the table",
+      },
+    ],
+    flags: [
+      { invocation: "--definition <file|->", description: "Strategy definition as a JSON object; - reads stdin" },
+      { invocation: "--from <iso>", description: "Replay window start as an ISO timestamp" },
+      { invocation: "--to <iso>", description: "Replay window end as an ISO timestamp" },
+      { invocation: "--asset-ids <a,b>", description: "Up to 50 positive asset ids" },
+      {
+        invocation: "--fee-bps <n>",
+        description:
+          "Fee per side, 0–1000 bps; otherwise read your fee from Candle's tier endpoint, or use hacc's default if that read fails",
+      },
+      { invocation: "--slippage-bps <n>", description: "Slippage per side, 0–1000 bps; used when a fee is available" },
+      { invocation: "--no-wait", description: "Print the submitted job id immediately" },
+    ],
+    examples: [
+      "candle lab status",
+      "candle lab replay --definition ./strategy.json --from 2026-10-25T00:00:00Z --to 2026-10-26T00:00:00Z",
+      "candle lab replay get <job-id> --json",
+      "candle lab replay cancel <job-id>",
+      "candle lab runners --hours 24",
+      "candle lab edges --days 7 --min-n 15",
+    ],
+    env: [...ENV_API, "CANDLE_HACC_URL"],
+  },
+  plan: {
+    group: "Account",
+    intro: "Buy Pro or Max by x402; signup, renewal, auto-renew",
+    summary: "Pro or Max for 30 days, paid by x402 from a vault key; signup and auto-renew",
+    description:
+      "buy pays for 30 days of Pro or Max in USDC from a Solana vault key, where the API sells plans by x402. It shows the price (with any Pro-to-Max credit), the pay-to address and Candle's terms, and pays after a typed confirm (or --yes), which also accepts the terms; the vault unlock still prompts. With this profile's API key the plan is that key's account's. With none, the vault key is the payer and becomes the account's identity: a wallet Candle already knows buys for its account, and an unknown one signs up. A signup makes a P-256 key signer on this machine that alone owns the new account's trading wallets, stores the returned API key in the profile and the signer in the secret store, and warns before paying: the vault key is the account's root, and losing the signer loses the wallets, with nothing to replace it. A payment whose outcome is not known yet (a 202 while Candle finishes the account, a 503, no answer) stays recorded here, and running buy or renew again resends that same payment, never a second one. status shows the plan, the period end, auto-renew and the last x402 plan payment. renew pays the next 30 days now. auto-renew on makes any other command run at a terminal within 3 days before the period ends renew it, at most once every 12 hours, up to the list price last confirmed here, unless candle spend pause is on. Plan payments are logged in candle spend's log and are outside its daily limit and per-call ceiling. Where the API does not sell plans by x402, these commands say so and pay nothing.",
+    usage: [
+      "candle plan buy pro|max [--wallet <vault key>] [--yes] [--auto-renew] [--signer-out <pem>] [--json]",
+      "candle plan status [--json]",
+      "candle plan renew [--wallet <vault key>] [--yes] [--json]",
+      "candle plan auto-renew on|off [--json]",
+    ],
+    rows: [
+      { invocation: "buy pro|max", description: "Buy 30 days; signs up when this machine has no key" },
+      { invocation: "status", description: "Plan, period end, auto-renew, last x402 payment" },
+      { invocation: "renew", description: "Pay the next 30 days now" },
+      { invocation: "auto-renew on|off", description: "Renew from 3 days before the period ends" },
+    ],
+    flags: [
+      {
+        invocation: "--wallet <vault key>",
+        description: "The Solana vault key that pays, by label or address (needed when the vault has several)",
+      },
+      { invocation: "--yes", description: "Pay and accept the terms without the typed confirm" },
+      { invocation: "--auto-renew", description: "buy: turn auto-renew on once the plan is bought" },
+      {
+        invocation: "--signer-out <pem>",
+        description: "buy, signup: also write the key signer's private key here (mode 0600) as a backup",
+      },
+    ],
+    examples: ["candle plan buy pro", "candle plan status", "candle plan renew", "candle plan auto-renew on"],
+    env: ["CANDLE_API_URL", "CANDLE_X402_NETWORK", "CANDLE_X402_PAY_TO", "CANDLE_CONFIG_DIR"],
+  },
   plans: {
     group: "Account",
     intro: "API plans: prices, fees, limits and what each does",
@@ -971,6 +1096,49 @@ export const HELP: Record<string, Topic> = {
     rows: [],
     examples: ["candle plans", "candle plans --json", "candle plans --api-url https://staging.api.candle.tv"],
     env: ["CANDLE_API_URL"],
+  },
+  accounts: {
+    group: "Account",
+    intro: "Create a staging test account from fleet keychain items",
+    summary: "Create a staging test member from fleet keychain items, with no browser",
+    description:
+      "create makes a complete Free test member on staging, tagged test-fleet so the KPI figures exclude it, with Solana and Hood TEE wallets and a first API key, and prints only public fields. It runs on macOS only, at a terminal (the owner runs it in their own Terminal; unattended use needs the owner's D10 approval in activation.json), and holds the fleet runner lock for the whole run. The identity key is read from the login keychain item candle-fleet-<env>-<name>-sol, made by the owner script, and signs a Candle x402 create_account proof; it is never printed and never taken from a flag, the environment or stdin. The key signer is never read: its public half comes from the owner's sealed-signer receipt, and its item candle-fleet-<env>-<name>-signer is checked for existence only; this command never makes a signer. The API key Candle returns once is handed on stdin to the hash-pinned reviewed sibling, which seals it into candle-fleet-<env>-<name>-apikey; the profile keeps that item's name, never the key. It is a public fleet record: ordinary CLI authentication, including doctor, refuses with ACCOUNTS_FLEET_RUNNER_REQUIRED. Credential reads belong to the reviewed fleet runner under R9.3; general profile use needs a separate custody decision. --use selects the record and grants no credential access. A run is refused before anything is sent when that item already exists (--yes does not override it), when the default username fleet-<env>-<name> is over 30 characters (choose one with --username), or when the sibling or the signer receipt does not check. --env staging is https://staging.api.candle.tv and ignores CANDLE_API_URL; --env local needs a loopback CANDLE_API_URL; production is refused. --scopes narrows the default scopes and never widens them. Exit codes: 0 created, 1 refused by the API, 2 refused here (nothing sent), 3 pending (run again with the same signer) or the key could not be stored.",
+    usage: [
+      "candle accounts create --env staging|local --name <fleet-name> [--key-item <item>] [--signer-item <item>] [--username <handle>] [--scopes <a,b,c>] [--profile <name>] [--use] [--yes] [--json]",
+    ],
+    rows: [
+      {
+        invocation: "create --env staging --name <fleet-name>",
+        description: "Create the test member, its TEE wallets and first key; store the key through the sibling",
+      },
+    ],
+    flags: [
+      {
+        invocation: "--env staging|local",
+        description: "staging, or a loopback API for local tests; production is refused",
+      },
+      { invocation: "--name <fleet-name>", description: "The fleet name, ^[a-z][a-z0-9-]{1,23}$" },
+      {
+        invocation: "--key-item <item>",
+        description: "The identity key's keychain item (default candle-fleet-<env>-<name>-sol)",
+      },
+      {
+        invocation: "--signer-item <item>",
+        description: "The sealed signer's item (default candle-fleet-<env>-<name>-signer)",
+      },
+      {
+        invocation: "--username <handle>",
+        description: "The username (default fleet-<env>-<name>, 30 characters at most)",
+      },
+      { invocation: "--scopes <a,b,c>", description: "Narrow the key's default scopes" },
+      { invocation: "--use", description: "Make the new profile the active one" },
+      { invocation: "--yes", description: "Accept the terms without the typed confirm; needed with --json" },
+    ],
+    examples: [
+      "candle accounts create --env staging --name free-b",
+      "candle accounts create --env staging --name long-fleet-name-17 --username fleet-long-17",
+    ],
+    env: ["CANDLE_API_URL", "CANDLE_CONFIG_DIR"],
   },
   keys: {
     group: "Account",
@@ -1095,8 +1263,16 @@ export const HELP: Record<string, Topic> = {
           "Close a wallet's empty token accounts and return their rent to it, after a preview: the embedded wallet (transfer:write), or a TEE wallet bound to this key, signed by its key signer (swap:write)",
       },
     ],
+    flags: [
+      {
+        invocation: "--all",
+        description:
+          "Include disabled (revoked) linked wallets, such as demoted TEE wallets, which are hidden by default",
+      },
+    ],
     examples: [
       "candle wallet",
+      "candle wallet --all",
       "candle wallet import --chain solana --key-file ./signer.json",
       "candle wallet revoke wal_123",
       "candle wallet trust 'tr-*' 'dest-*'",
@@ -1149,9 +1325,9 @@ export const HELP: Record<string, Topic> = {
       },
       { invocation: "status [--unlock]", description: "What the vault holds, and what opens it" },
       {
-        invocation: "list [<filter>] [--balances] [--rpc-url <url>] [--evm-rpc-url <url>]",
+        invocation: "list [<filter>] [--all] [--balances] [--rpc-url <url>] [--evm-rpc-url <url>]",
         description:
-          "One line per key: address, label, role, derivation. Prompts for the passphrase. --balances reads SOL over your Solana RPC and ETH (plus USDG on Hood) for EVM keys over --evm-rpc-url, CANDLE_EVM_RPC_URL, or the built-in Hood RPC",
+          "One line per key: address, label, role, TEE lifecycle, derivation. Retired TEE wallets are hidden unless --all. Prompts for the passphrase. --balances reads SOL over your Solana RPC and ETH (plus USDG on Hood) for EVM keys over --evm-rpc-url, CANDLE_EVM_RPC_URL, or the built-in Hood RPC",
       },
       {
         invocation: "new-key --chain solana|evm [--label <name>] [--count <n>] [--labels-from <file>]",
@@ -1161,12 +1337,12 @@ export const HELP: Record<string, Topic> = {
       {
         invocation: "rename <label|address|id> <new-label> [--id <entry-id>]",
         description:
-          "Rename one vault or external key. New names: at most 64 characters, no edge whitespace. The address, the derivation and the key blob do not change",
+          "Rename one vault or external key, or a retired TEE wallet. New names: at most 64 characters, no edge whitespace. The address, the derivation and the key blob do not change",
       },
       {
         invocation: "  rename --pairs-from <file> [--dry-run]",
         description:
-          "Rename 1–256 vault or external keys under one unlock and one commit. All findings refuse the whole file; swaps are allowed. --dry-run prints the plan and writes nothing; --json returns the renamed rows",
+          "Rename 1–256 vault or external keys (or retired TEE wallets) under one unlock and one commit. All findings refuse the whole file; swaps are allowed. --dry-run prints the plan and writes nothing; --json returns the renamed rows",
       },
       { invocation: "phrase show", description: "Show the 24-word recovery phrase (terminal only)" },
       {
@@ -1247,6 +1423,10 @@ export const HELP: Record<string, Topic> = {
         invocation: "--device <id>",
         description:
           "The security key to use when more than one is attached; on factor add security-key, the key to add (the vault opens with the passphrase or another key)",
+      },
+      {
+        invocation: "--all",
+        description: "list: include retired TEE wallets (demoted and swept), which are hidden by default",
       },
       {
         invocation: "--balances",
@@ -1348,7 +1528,7 @@ export const HELP: Record<string, Topic> = {
       {
         invocation: "rename <label|address|id> <new-label>",
         description:
-          "Rename one TEE wallet: the label Candle holds and, when its key is in this vault, the vault entry (owner only). New names: at most 64 characters, no edge whitespace. Funds, the address and the key do not change",
+          "Rename one TEE wallet: the label Candle holds and, when its key is in this vault, the vault entry (owner only). New names: at most 64 characters, no edge whitespace. Funds, the address and the key do not change. A retired (demoted) TEE wallet is no longer on Candle: rename it with vault rename",
       },
       {
         invocation: "  rename --pairs-from <file> [--dry-run]",
@@ -1359,6 +1539,12 @@ export const HELP: Record<string, Topic> = {
         invocation: "signer new --key <prefix|label> [--out <pem>] [--force]",
         description:
           "On the trading machine, with that key's API key: generate the key's signer here and wait for the owner to approve it. Its wallets then trade from this machine. --out also writes a plaintext PEM for an SDK process (weaker than the secret store); --force adds a signer while an older signer on THIS machine still owns wallets; it moves, revokes and deletes nothing",
+      },
+      // Indented like `keys signer`'s move row: a second word under `tee signer`, not a second subcommand of `tee`.
+      {
+        invocation: "  signer remove --key <prefix|label>",
+        description:
+          "Remove this machine's key signer once it owns no wallets, and tell the server it is gone. Refuses while a wallet is still owned by it. The device token, or the key's own API key",
       },
     ],
     flags: [
@@ -1383,6 +1569,7 @@ export const HELP: Record<string, Topic> = {
       "candle tee rename tr-01 desk-01",
       "candle tee rename --pairs-from ./tee-names.csv --dry-run",
       "candle tee signer new --key tr-2",
+      "candle tee signer remove --key tr-2",
     ],
     env: ENV_LOCAL_SIGNING,
   },

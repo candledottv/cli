@@ -22,6 +22,7 @@ test("all registered tools are listed", () => {
     "candle_delete_post",
     "candle_execution_status",
     "candle_finish_unstake",
+    "candle_get_agent_positions",
     "candle_get_agent_profile",
     "candle_get_feed",
     "candle_get_fees",
@@ -34,6 +35,11 @@ test("all registered tools are listed", () => {
     "candle_get_profile_wallets",
     "candle_get_staking",
     "candle_get_wallets",
+    "candle_lab_edges",
+    "candle_lab_replay",
+    "candle_lab_replay_result",
+    "candle_lab_runners",
+    "candle_lab_status",
     "candle_launch_and_seed",
     "candle_launch_token",
     "candle_list_agent_posts",
@@ -69,8 +75,28 @@ test("all registered tools are listed", () => {
     "candle_swap",
     "candle_sweep",
     "candle_token_card",
+    "candle_token_clusters",
+    "candle_token_edit",
     "candle_token_events",
     "candle_token_forensics",
+    "candle_token_history",
+    "candle_token_page_about",
+    "candle_token_page_burns",
+    "candle_token_page_capabilities",
+    "candle_token_page_claim",
+    "candle_token_page_comment",
+    "candle_token_page_comments",
+    "candle_token_page_creator_challenge",
+    "candle_token_page_flag",
+    "candle_token_page_history",
+    "candle_token_page_mark_seen",
+    "candle_token_page_post_delete",
+    "candle_token_page_section_restore",
+    "candle_token_page_section_set",
+    "candle_token_page_seen",
+    "candle_token_page_update",
+    "candle_token_page_updates",
+
     "candle_trade",
     "candle_transfer",
     "candle_unstake",
@@ -292,6 +318,14 @@ describe("buildRequest", () => {
 
     const profile = buildRequest("candle_get_agent_profile", { idOrWallet: "a/b?c" }, { apiUrl: "https://api.test" })
     expect(profile.url).toBe("https://api.test/api/v1/users/a%2Fb%3Fc/agent")
+    expect(profile.init.headers).not.toHaveProperty("x-api-key")
+    // Tier is private: a configured key is sent so the account's own profile carries it.
+    const keyed = buildRequest(
+      "candle_get_agent_profile",
+      { idOrWallet: "x" },
+      { apiUrl: "https://api.test", apiKey: "cndl_live_k" },
+    )
+    expect(keyed.init.headers).toHaveProperty("x-api-key", "cndl_live_k")
   })
   test("get_portfolio is a keyed GET of /api/v1/agent/portfolio with no body", () => {
     const r = buildRequest("candle_get_portfolio", {}, { apiUrl: "https://api.test", apiKey: "cndl_live_k" })
@@ -712,6 +746,33 @@ describe("candle_get_operation: what a 404 returns", () => {
 })
 
 // BE-1411 T7 to T10 (R6 to R9, I3, I4): the local swap always has an id.
+describe("candle_swap maxSlippageBps matches the API's 0-5000 bound", () => {
+  const { tools } = toolsWith(["candle_swap"], async () => new Response("{}"))
+  const schema = z.object(tools.get("candle_swap")?.inputSchema as z.ZodRawShape)
+  const base = { from: "SOL", to: "USDC", amount: "0.5" }
+  test("5000 is accepted, 5001 and fractions are not", () => {
+    expect(schema.safeParse({ ...base, maxSlippageBps: 5000 }).success).toBe(true)
+    expect(schema.safeParse({ ...base, maxSlippageBps: 5001 }).success).toBe(false)
+    expect(schema.safeParse({ ...base, maxSlippageBps: 10000 }).success).toBe(false)
+    expect(schema.safeParse({ ...base, maxSlippageBps: 1.5 }).success).toBe(false)
+  })
+})
+
+describe("candle_trade maxSlippageBps matches the API's 0-5000 bound", () => {
+  const { tools } = toolsWith(["candle_trade"], async () => new Response("{}"))
+  const schema = z.object(tools.get("candle_trade")?.inputSchema as z.ZodRawShape)
+  const base = { mint: "Mint", side: "buy", amount: "0.5" }
+
+  test("5000 and zero are accepted, 5001, negatives and fractions are not", () => {
+    expect(schema.safeParse(base).success).toBe(true)
+    expect(schema.safeParse({ ...base, maxSlippageBps: 0 }).success).toBe(true)
+    expect(schema.safeParse({ ...base, maxSlippageBps: 5000 }).success).toBe(true)
+    expect(schema.safeParse({ ...base, maxSlippageBps: 5001 }).success).toBe(false)
+    expect(schema.safeParse({ ...base, maxSlippageBps: -1 }).success).toBe(false)
+    expect(schema.safeParse({ ...base, maxSlippageBps: 1.5 }).success).toBe(false)
+  })
+})
+
 describe("candle_swap: the request always carries an id, and every result returns it", () => {
   const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
   const SWAP = { from: "SOL", to: "USDC", amount: "0.5" }

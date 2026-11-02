@@ -23,6 +23,7 @@ export type IdKey =
   | "rewardId"
   | "clientId"
   | "clientDepositId"
+  | "idempotencyKey"
   | "coreOpId"
 
 export type ToolClass = { class: "read" } | { class: "card"; kind: CardKind; idKey: IdKey }
@@ -39,10 +40,25 @@ export const TOOL_CLASSES: Readonly<Record<string, ToolClass>> = {
   candle_token_events: READ,
   // BE-2119: the public token card read. Keyless; the same body for every caller.
   candle_token_card: READ,
+  // BE-2140: the public edit history is a read; the creator's edit is an approval card, replayed by its key.
+  candle_token_history: READ,
+  candle_token_page_about: READ,
+  candle_token_page_capabilities: READ,
+  candle_token_page_burns: READ,
+  candle_token_page_history: READ,
+
   candle_token_forensics: READ,
+  candle_token_clusters: READ,
+  // BE-2039: hacc's strategy lab. A replay spends a daily replay and moves nothing.
+  candle_lab_status: READ,
+  candle_lab_replay: READ,
+  candle_lab_replay_result: READ,
+  candle_lab_runners: READ,
+  candle_lab_edges: READ,
   candle_get_agent_profile: READ,
   candle_list_agents: READ,
   candle_list_agent_posts: READ,
+  candle_get_agent_positions: READ,
   candle_get_plans: READ,
   candle_get_wallets: READ,
   candle_get_profile_wallets: READ,
@@ -95,6 +111,14 @@ export const TOOL_CLASSES: Readonly<Record<string, ToolClass>> = {
   candle_create_post: card("profile"),
   candle_delete_post: card("profile"),
   candle_report_activity: card("profile"),
+  // Token-page messages and content mutate state; content writes carry a replay key.
+  candle_token_page_creator_challenge: card("profile"),
+  candle_token_page_claim: card("profile", "idempotencyKey"),
+  candle_token_page_section_set: card("profile", "idempotencyKey"),
+  candle_token_edit: card("profile", "idempotencyKey"),
+  candle_token_page_section_restore: card("profile", "idempotencyKey"),
+  candle_token_page_flag: card("profile", "idempotencyKey"),
+
   // Changes which wallets the key may spend from: a card with a factor, never a timed window.
   candle_set_profile_wallets: card("keyaccess"),
   // User-started only (K-3).

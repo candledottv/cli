@@ -24,6 +24,8 @@ import { chmod, readFile, realpath, rename, unlink, writeFile } from "node:fs/pr
 import { homedir, hostname } from "node:os"
 import { pathToFileURL } from "node:url"
 import { browserUrl, resolveApiUrl } from "./client"
+import { accountsCreate } from "./commands/accounts"
+import { agentPositions } from "./commands/agent-positions"
 import { agentPost } from "./commands/agent-post"
 import { agentProfile } from "./commands/agent-profile"
 import { authLogin, authLogout, authStatus } from "./commands/auth"
@@ -41,6 +43,7 @@ import { keysAccess } from "./commands/keys-access"
 import { keysSelf, keysUpdate } from "./commands/keys-embedded-wallet"
 import { keysLimit } from "./commands/keys-limit"
 import { keysWallets } from "./commands/keys-wallets"
+import { labEdges, labReplay, labRunners, labStatus } from "./commands/lab"
 import { launch } from "./commands/launch"
 import { lpAdd, lpClaim, lpPools, lpPositions, lpRemove } from "./commands/lp"
 import { mcp, mcpActsAsIdentity } from "./commands/mcp"
@@ -67,6 +70,7 @@ import {
 import { perpsBook, perpsCandles, perpsMarket, perpsMarkets } from "./commands/perps-markets"
 import { perpsAccount, perpsRisk, perpsThresholds, perpsWatch } from "./commands/perps-risk"
 import { perpsWithdraw } from "./commands/perps-withdraw"
+import { maybeAutoRenew, planAutoRenew, planBuy, planRenew, planStatus } from "./commands/plan"
 import { plans } from "./commands/plans"
 import { plugins, runPlugin } from "./commands/plugins"
 import { pnl } from "./commands/pnl"
@@ -85,7 +89,17 @@ import { teeRebind, teeRebinds } from "./commands/tee-rebind"
 import { teeRename } from "./commands/tee-rename"
 import { tokenClusters } from "./commands/token-clusters"
 import { tokenEvents } from "./commands/token-events"
-import { tokenAbout, tokenClaim, tokenFlag, tokenHistory, tokenSection } from "./commands/token-pages"
+import { tokenEdit, tokenHistory } from "./commands/token-metadata"
+import {
+  tokenAbout,
+  tokenClaim,
+  tokenComment,
+  tokenComments,
+  tokenFlag,
+  tokenPost,
+  tokenSection,
+  tokenUpdate,
+} from "./commands/token-pages"
 import { tokenForensics, tokenVampCandidates } from "./commands/token-paid"
 import { transfer } from "./commands/transfer"
 import { tui } from "./commands/tui"
@@ -130,7 +144,15 @@ import { renderTopic, renderTopLevel } from "./help"
 import { resolveSecretStore, SECRETS_SERVICE, SecretStoreLockedError, SecretStoreReadError } from "./keychain"
 import { pluginInvocation, realRunPlugin } from "./plugins"
 import { terminalStyle } from "./presentation"
-import { migratedConfig, profileSecretRef, resolveProfileName, resolveProfileNameForLogin } from "./profiles"
+import { writeOwnerOnlyFile } from "./private-file"
+import {
+  assertOrdinaryProfile,
+  migratedConfig,
+  ProfileFleetOnlyError,
+  profileSecretRef,
+  resolveProfileName,
+  resolveProfileNameForLogin,
+} from "./profiles"
 import { platformKey } from "./release"
 import { writeLocalFailure, writeUsageFailure } from "./render"
 import { defaultSecretsPath, promptHiddenSecret, promptVisibleLine, SECRET_REFS } from "./secret-store"
@@ -226,14 +248,21 @@ const COMMANDS: Record<string, CommandRoute> = {
   portfolio: { bare: portfolio },
   // FE-438: the creator fees this account's launched tokens can pay, and the claim to the wallet
   // fixed at launch. Candle signs; this machine sends a mint and a dry-run flag.
-  agent: { subcommands: { profile: agentProfile, post: agentPost } },
+  // BE-1990: `agent positions` is the public positions read; it reads and sends no credential.
+  agent: { subcommands: { profile: agentProfile, post: agentPost, positions: agentPositions } },
   fees: { bare: feesList, subcommands: { claim: feesClaim } },
   // BE-723 (Plans v2 P6): the served plan table. Public, so it reads and sends no credential.
   plans: { bare: plans },
+  // BE-2184 (cli-account-create spec 5): a staging test member from fleet keychain items, no browser.
+  accounts: { subcommands: { create: accountsCreate } },
   // x402 C4 (BE-1875): forensics and the vamp finder may answer a per-use 402, paid from a vault
   // key inside the local spending rules (src/x402/), or shown and not paid.
   // Token page About (BE-1959, token pages spec 7): `about` and `history` are public reads;
   // `claim`, `section set|restore` and `flag` act as the key's account under `token-pages:write`.
+  // BE-1963 (row 4A): `comment` posts under the same gate, `comments` is a public read, and
+  // `post delete` removes the key's own update or comment.
+  // BE-2140: `edit` sets the creator's description and links (launch:write, as the key's account);
+  // `history <mint>` without a section is that edit history, with one the About section history.
   token: {
     subcommands: {
       clusters: tokenClusters,
@@ -245,6 +274,11 @@ const COMMANDS: Record<string, CommandRoute> = {
       section: tokenSection,
       history: tokenHistory,
       flag: tokenFlag,
+      edit: tokenEdit,
+      update: tokenUpdate,
+      comment: tokenComment,
+      comments: tokenComments,
+      post: tokenPost,
     },
   },
   // BE-2119 (Quant in groups 6.8): the token card for one pasted contract. Public and keyless.
@@ -261,6 +295,12 @@ const COMMANDS: Record<string, CommandRoute> = {
   },
   // x402 C4 (spec 7.3): Quant's terms over the key route, which a paid Quant turn needs first.
   quant: { subcommands: { terms: quantTerms } },
+  lab: { subcommands: { status: labStatus, replay: labReplay, runners: labRunners, edges: labEdges } },
+  // x402 C7 (BE-1878): Pro or Max by x402 from a vault key, the wallet-as-identity signup, and the
+  // local auto-renew flag. Plan payments are outside the per-use limits (spec 10.3).
+  plan: {
+    subcommands: { buy: planBuy, status: planStatus, renew: planRenew, "auto-renew": planAutoRenew },
+  },
   // Ember Phase 3 PR D (BE-315, R4): Meteora DAMM v2 liquidity from a TEE wallet, on the agent
   // rail under the bound key's opt-in `lp:write`. Server-built, relay-signed, never a vault key.
   lp: { subcommands: { pools: lpPools, add: lpAdd, positions: lpPositions, remove: lpRemove, claim: lpClaim } },
@@ -523,6 +563,8 @@ export const NEVER_GUARDED = new Set([
   "verify",
   // BE-723: `GET /agent/plans` is public; the command acts as no identity.
   "plans",
+  // BE-2184: `accounts create` makes a new account and its profile; there is no identity yet to guard.
+  "accounts",
   "token",
   // BE-2119: the token card route is public and reads no key; `scan` acts as no identity.
   "scan",
@@ -559,6 +601,11 @@ export async function run(argv: string[], deps: Deps): Promise<number> {
   try {
     code = await runCommand(argv, deps)
   } catch (error) {
+    if (error instanceof ProfileFleetOnlyError) {
+      const parsed = extractGlobalFlags(argv)
+      writeLocalFailure(deps, { code: error.code, message: error.message }, !("error" in parsed) && parsed.flags.json)
+      return 1
+    }
     if (error instanceof ProfileCoreOwnedError) {
       // The resolver's second guard (deps.ts) fired: dispatch's own gate should have refused
       // first, so this is a path the gate does not know. Same answer either way.
@@ -728,9 +775,12 @@ async function runCommand(argv: string[], deps: Deps): Promise<number> {
   // (list, add, and -- Tasks 3 and 4 -- use/rename/remove), and `profile use` is the way OUT of
   // resolveProfileName's "several profiles, none selected" refusal, so it cannot be gated by it.
   const isProfileCommand = cmd === "profile"
+  // `accounts create` makes the profile it names (`--profile`, default `<env>-<name>`) and acts as no
+  // stored identity, so it resolves none: the raw flag reaches it as `profileFlag`.
+  const isAccountsCreate = cmd === "accounts" && sub === "create"
   const resolution = isAuthLogin
     ? resolveProfileNameForLogin(config, { flag: flags.profile, env: deps.env })
-    : isProfileCommand
+    : isProfileCommand || isAccountsCreate
       ? ({ ok: true, name: undefined } as const)
       : resolveProfileName(config, { flag: flags.profile, env: deps.env })
   if (!resolution.ok) {
@@ -750,6 +800,7 @@ async function runCommand(argv: string[], deps: Deps): Promise<number> {
     return 1
   }
   const profile = resolution.name
+  assertOrdinaryProfile(config, profile)
   const profileApiUrl = profile ? config.profiles?.[profile]?.apiUrl?.trim() || config.apiUrl : config.apiUrl
   const apiUrl = flags.apiUrl ?? resolveApiUrl(profileApiUrl, deps.env)
   const ctx: CommandContext = {
@@ -815,10 +866,11 @@ async function runCommand(argv: string[], deps: Deps): Promise<number> {
   const coreFace = word === "core" && sub === "mcp"
   const actsAsIdentity = !publicPerpsRead && !coreFace && (word !== "mcp" || mcpActsAsIdentity(tokens.slice(1)))
   // BE-1959: `token` is unguarded for its reads, but a token page write (and the private
-  // capabilities read) acts as the key's account, so it pays for the same check.
+  // capabilities read) acts as the key's account, so it pays for the same check. BE-2140: so does
+  // `token edit`, the creator metadata write.
   const tokenPageActs =
     word === "token" &&
-    (["claim", "section", "flag"].includes(sub ?? "") || (sub === "about" && tokens.includes("--capabilities")))
+    (["claim", "section", "flag", "edit"].includes(sub ?? "") || (sub === "about" && tokens.includes("--capabilities")))
   if (
     ROUTED_COMMANDS.has(word) &&
     (!NEVER_GUARDED.has(word) || tokenPageActs) &&
@@ -838,6 +890,10 @@ async function runCommand(argv: string[], deps: Deps): Promise<number> {
     // owns stdout, which under `--json` must carry exactly one JSON value.
     if (verdict.warning) deps.stderr.write(`${verdict.warning}\n`)
   }
+
+  // x402 C7 (spec 6.3): auto-renew, when its local flag is on and the period ends within 3 days.
+  // Reads one local file and returns at once otherwise; never fails the command.
+  if (ROUTED_COMMANDS.has(word) && routesToCommand(cmd, sub)) await maybeAutoRenew(word, ctx)
 
   return dispatch(cmd, sub, cmdArgs, tokens, ctx)
 }
@@ -1086,7 +1142,7 @@ export async function buildRealDeps(): Promise<Deps> {
     runPlugin: realRunPlugin,
     // 0600: the only caller is wallets import's --signer-out, and the content is a signing
     // private key.
-    writeFile: (path: string, content: string) => writeFile(path, content, { mode: 0o600 }),
+    writeFile: writeOwnerOnlyFile,
     promptSecret: promptHiddenSecret,
     promptLine: promptVisibleLine,
     isTTY: {

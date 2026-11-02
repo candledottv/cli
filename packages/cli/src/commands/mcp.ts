@@ -54,7 +54,27 @@ export const MCP_TOOL_NAMES = [
   "candle_vamp_candidates",
   "candle_token_events",
   "candle_token_card",
+  "candle_token_edit",
+  "candle_token_history",
+  "candle_token_page_about",
+  "candle_token_page_capabilities",
+  "candle_token_page_burns",
+  "candle_token_page_history",
+  "candle_token_page_creator_challenge",
+  "candle_token_page_claim",
+  "candle_token_page_section_set",
+  "candle_token_page_section_restore",
+  "candle_token_page_flag",
+  "candle_token_page_updates",
+  "candle_token_page_update",
+  "candle_token_page_post_delete",
+  "candle_token_page_comments",
+  "candle_token_page_comment",
+  "candle_token_page_seen",
+  "candle_token_page_mark_seen",
+
   "candle_token_forensics",
+  "candle_token_clusters",
   "candle_get_agent_profile",
   "candle_list_agents",
   "candle_update_profile",
@@ -62,6 +82,7 @@ export const MCP_TOOL_NAMES = [
   "candle_list_agent_posts",
   "candle_create_post",
   "candle_delete_post",
+  "candle_get_agent_positions",
   "candle_get_plans",
   "candle_report_activity",
   "candle_trade",
@@ -105,25 +126,51 @@ export const MCP_TOOL_NAMES = [
   "candle_perps_risk",
   "candle_perps_thresholds",
   "candle_perps_set_thresholds",
+  // BE-2039: the strategy lab over a production key, so --read-only leaves them out too.
+  "candle_lab_status",
+  "candle_lab_replay",
+  "candle_lab_replay_result",
+  "candle_lab_runners",
+  "candle_lab_edges",
 ] as const
 
 /**
- * The eight tools that authenticate with no API key at all -- what `--read-only` pins the server
+ * The tools that authenticate with no API key at all -- what `--read-only` pins the server
  * to. Mirrors the keyless tools in packages/mcp/src/tools.ts's buildRequest.
  *
  * KEYLESS, not merely non-writing: candle_get_wallets and candle_execution_status also move
  * nothing, but they read the account and need a key, so pinning the server to them would hand
  * back a `--read-only` server that fails on every call without one.
  */
+/** BE-1834: these ordinary MCP tools stay unclassified/unoffered by the held core/TUI. */
+export const TOKEN_PAGE_CORE_DEFERRED: readonly string[] = [
+  "candle_token_page_updates",
+  "candle_token_page_update",
+  "candle_token_page_post_delete",
+  "candle_token_page_comments",
+  "candle_token_page_comment",
+  "candle_token_page_seen",
+  "candle_token_page_mark_seen",
+]
+
 export const READ_ONLY_TOOL_NAMES = [
   "candle_get_market",
   "candle_get_feed",
   "candle_token_events",
   "candle_token_card",
+  "candle_token_history",
+  "candle_token_page_about",
+  "candle_token_page_burns",
+  "candle_token_page_history",
+  "candle_token_page_updates",
+  "candle_token_page_comments",
+
   "candle_token_forensics",
+  "candle_token_clusters",
   "candle_get_agent_profile",
   "candle_list_agents",
   "candle_list_agent_posts",
+  "candle_get_agent_positions",
   "candle_resolve_token",
   "candle_get_plans",
 ] as const
