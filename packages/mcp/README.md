@@ -1,7 +1,7 @@
 # @candledottv/mcp
 
 An MCP (Model Context Protocol) server for the Candle agent rail. The current source exposes Candle's REST API as
-eighty-two tools over stdio, plus four Hyperliquid market reads (eighty-six in all), so an MCP-capable agent can launch tokens (optionally seeded with a dev
+eighty-three tools over stdio, plus four Hyperliquid market reads (eighty-seven in all), so an MCP-capable agent can launch tokens (optionally seeded with a dev
 buy in the same call), trade, convert between base assets (including across chains), read market
 and feed data, read one token's signals and tracked-wallet trades and its card data, report on-chain activity,
 check an agent profile, and backtest a strategy in hacc's strategy lab without hand-rolling HTTP calls. The five
@@ -13,8 +13,8 @@ Eighteen tools are read-only and need nothing but `CANDLE_API_URL` (which alread
 production): `candle_get_market`, `candle_get_feed`, `candle_token_events`, `candle_token_card`, `candle_token_history`,
 `candle_token_page_about`, `candle_token_page_burns`, `candle_token_page_history`, `candle_token_page_updates`, `candle_token_page_comments`, `candle_token_forensics`, `candle_token_clusters`,
 `candle_get_agent_profile`, `candle_list_agents`, `candle_list_agent_posts`, `candle_get_agent_positions`, `candle_resolve_token` and `candle_get_plans`.
-The five token-page reads, `candle_token_clusters` and `candle_token_history` are unreleased source; published 0.10.25 has the original ten, and `candle_get_agent_positions` is new in 0.10.27.
-With a source build and token-page reads enabled on the deployment, those eighteen work immediately without a key.
+All of them are in the published 0.10.29; `candle_get_agent_positions` is new since 0.10.27.
+With token-page reads enabled on the deployment, those eighteen work immediately without a key.
 Install the released server with no `env` block at all and its ten public reads work immediately:
 
 ```json
@@ -35,7 +35,7 @@ Environment below -- or skip env editing entirely: install the Candle CLI
 environment.
 
 `CANDLE_MCP_TOOLS` (optional) is a comma-separated allowlist of tool names; only those register.
-Unset means all eighty-two. An unknown name fails startup with the valid names in the message, rather
+Unset means all eighty-three. An unknown name fails startup with the valid names in the message, rather
 than silently registering the wrong surface. `candle mcp --read-only` / `--tools` set this for
 you.
 
@@ -163,6 +163,7 @@ tools, getting a key, funding the embedded wallet, and idempotent retries, see
 | `candle_execution_status` | One call before trading: wallets to spend from, tier, and whether trading is possible | Composes the wallet and tier reads | `CANDLE_AGENT_API_KEY` |
 | `candle_get_operation` | Look up a trade or launch by the id its write used, and whether it landed | `GET /api/v1/trade/agent/jobs/:clientId` or `/api/v1/launch/headless/jobs/:clientId` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_fees` | The creator fees the account's launched tokens can pay: raw amounts from chain reads, and the reason a token cannot be claimed | `GET /api/v1/agent/fees` | `CANDLE_AGENT_API_KEY` (`account:read`) |
+| `candle_atomic_launch_dry_run` | Check a Solana launch with first buys and price each buy on the curve it would deploy; builds, reserves and writes nothing | `POST /api/v1/launch/atomic/dry-run` | `CANDLE_AGENT_API_KEY` (`launch:write`, `swap:write`, Pro or Max) |
 | `candle_claim_fees` | Collect one token's creator fees to the wallet fixed at launch (no destination argument); `dryRun` sends nothing | `POST /api/v1/agent/fees/:mint/claim` | `CANDLE_AGENT_API_KEY` (`launch:write`) |
 | `candle_get_staking` | Read CNDL/sCNDL, withdrawals, rewards, pool wait and wallet eligibility notes | `GET /api/v1/agent/staking` |
 | `candle_stake` | Stake raw CNDL; stable clientStakeId, dryRun first | `POST /api/v1/agent/staking/stake/build` |
@@ -239,7 +240,7 @@ explicitly. Assets with nothing spendable report `empty`; a failed asset never s
 ## Errors
 
 This package never reinterprets an error body, and that body is not one uniform shape across all
-eighty-two tools:
+eighty-three tools:
 
 - `candle_token_events`, called with `kind`, is the one narrowing of a SUCCESS body, never an
   error one: the relayed `events` are filtered to that kind and the body gains `filteredByKind`.
@@ -409,10 +410,9 @@ Every JSON result carries `network`, epoch-ms `readAt`, `gate: { minOpenInterest
 
 SDK and local MCP cache market reads for five seconds; book and candle snapshots are never cached. CLI/MCP select testnet with `CANDLE_HYPERLIQUID_NETWORK=testnet`; SDK uses `hyperliquidNetwork: "testnet"`. These four tools are local-only and are absent from hosted MCP tool sets. MCP uses the existing `CANDLE_API_KEY` or `CANDLE_AGENT_API_KEY` configuration, with no signer PEM required. No signing, relay or `/exchange` request occurs.
 
-## Token page tools (unreleased local source)
+## Token page tools (local clients)
 
-The sixteen `candle_token_page_*` tools below are available in local MCP source and the bundled
-`candle mcp` source. They require a human-owned package release before npm installs receive them.
+The sixteen `candle_token_page_*` tools below are in the published 0.10.29 and the bundled `candle mcp`.
 They are not offered by the hosted OAuth connector. Existing OAuth consent and key grants are
 unchanged; local keys need explicit `token-pages:read` or `token-pages:write` scopes. All token-page
 switches default off: `404`/`feature_off` is a refusal, not an empty page or permission grant.
@@ -447,7 +447,7 @@ removed or unsafe versions cannot be restored. The four reads have read-only MCP
 and content mutations have mutation hints and approval classifications; content approvals retain
 `idempotencyKey` as their operation ID. The server never enables a deployment switch.
 
-Token update tools in unreleased source:
+Token update tools:
 
 | Tool | Behavior |
 | --- | --- |
@@ -461,7 +461,7 @@ All three mutations require `token-pages:write` and a durable `idempotencyKey`.
 Update bodies cannot be edited. Reporting and moderation apply to their exact post IDs.
 These tools grant no notification delivery or activation permission.
 
-Token comment tools in unreleased source:
+Token comment tools:
 
 | Tool | Behavior |
 | --- | --- |

@@ -181,6 +181,8 @@ export const TOOL_NAMES = [
   "candle_get_plans",
   "candle_trade",
   "candle_launch_and_seed",
+  // BE-1851: the atomic launch dry run on its own, with first buys priced; keyed, writes nothing.
+  "candle_atomic_launch_dry_run",
   "candle_swap",
   "candle_transfer",
   "candle_sweep",
@@ -400,6 +402,21 @@ export function buildRequest(name: RestToolName, args: Record<string, unknown>, 
       return {
         url: `${base}${path}`,
         init: { method: "POST", headers: jsonHeaders(apiKey), body: JSON.stringify(body) },
+      }
+    }
+
+    case "candle_atomic_launch_dry_run": {
+      const apiKey = requireApiKey(cfg)
+      // Solana only, and the route reads its payers from the body: main unless the caller names a
+      // linked wallet. `buyAmount` is not forwarded; the buys belong in `firstBuys`.
+      const { payer, chain: _chain, buyAmount: _buyAmount, ...rest } = args as Record<string, unknown>
+      return {
+        url: `${base}/api/v1/launch/atomic/dry-run`,
+        init: {
+          method: "POST",
+          headers: jsonHeaders(apiKey),
+          body: JSON.stringify({ ...rest, chain: "solana", payer: payer ?? { type: "main" } }),
+        },
       }
     }
 
@@ -1069,6 +1086,35 @@ const getFeesShape = {
   cursor: z.string().optional().describe("The previous page's continueCursor, verbatim"),
   limit: z.number().optional().describe("Tokens per page, 1 to 50 (default 20). Each one costs chain reads"),
 }
+
+const atomicPayerShape = z.union([
+  z.object({ type: z.literal("main") }),
+  z.object({ type: z.literal("linked"), linkedWalletId: z.string().min(1) }),
+])
+
+const atomicLaunchDryRunShape: Record<string, z.ZodTypeAny> = (() => {
+  const { buyAmount: _buyAmount, chain: _chain, ...launch } = launchTokenShape
+  return {
+    ...launch,
+    clientLaunchId: z.string().optional().describe("Not used by a dry run; send the id you will launch with"),
+    payer: atomicPayerShape
+      .optional()
+      .describe("Who pays for the launch: {type:'main'} (default) or {type:'linked', linkedWalletId}"),
+    firstBuys: z
+      .array(
+        z.object({
+          payer: atomicPayerShape,
+          amountRaw: z
+            .string()
+            .regex(/^[1-9][0-9]*$/)
+            .describe("Quote-asset raw units"),
+        }),
+      )
+      .min(1)
+      .max(4)
+      .describe("One to four first buys, each priced on the curve this launch would deploy"),
+  }
+})()
 
 const claimFeesShape = {
   mint: z.string().describe("The launched token: a Solana mint or a Hood token address, as candle_get_fees lists it"),
@@ -2003,7 +2049,9 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
       title: "Read the creator fees this account's tokens can pay",
       description:
         "The tokens launched by the account's own wallets, with what each could pay now in creator fees " +
-        "(raw units from direct chain reads) and `claimable: true` or the `reason` it is not. Reads only; " +
+        "(raw units from direct chain reads) and a `reason` saying who can claim: `claimable_by_key` on a " +
+        "claimable Solana row, and otherwise why this key cannot (including `claimable_via_web_session` " +
+        "and `fee_wallet_designated`, which name whose authority collects). Reads only; " +
         "moves nothing. It returns no earned or paid-out totals. An unreadable token is marked, never " +
         "shown as zero. Paged: pass `continueCursor` back as `cursor`.",
       inputSchema: getFeesShape,
@@ -2018,7 +2066,9 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
       description:
         "Collect one token's creator fees and pay them to the wallet fixed at launch. There is no destination " +
         "argument and the tool cannot send funds anywhere else. Candle signs with the embedded wallet, which " +
-        "pays the network fee. Needs launch:write. " +
+        "pays the network fee. A fee recipient that is a TEE wallet is refused here: claim it with the candle CLI " +
+        "(`candle fees claim`). The dry run reports the same refusal (`claimable: false`, `reason: " +
+        "wallet_not_signable`) and counts only what this tool could claim. Needs launch:write. " +
         "Call it with dryRun: true first; a real claim moves real funds into the recipient wallet, which may be " +
         "the wallet this agent trades from. Not idempotent by id: if the result is lost, read candle_get_fees " +
         "before claiming again.",
@@ -2315,6 +2365,23 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
       const result = await executeTrade(args as never, getConfig(), doFetch)
       return { content: [{ type: "text", text: result.text }], ...(result.isError ? { isError: true } : {}) }
     },
+  )
+
+  register(
+    "candle_atomic_launch_dry_run",
+    {
+      title: "Dry-run an atomic Solana launch",
+      description:
+        "Check a Solana launch bundled with first buys and price each buy, without building anything. Runs the " +
+        "same checks as the atomic build, in the same order (payers, Believer check, fee and spend limits, the " +
+        "key's transaction cap), then returns the launch preview (curveTerms) and one fill per first buy: the " +
+        "tokens it would receive and the floor the build would sign it at. Reads only; moves nothing, reserves " +
+        "nothing, and the clientLaunchId stays unused. It does not check balances, the daily cap, or the " +
+        "transaction's size, so the real launch can still refuse. Needs launch:write, swap:write and Pro or Max.",
+      inputSchema: atomicLaunchDryRunShape as typeof localLaunchAndSeedShape,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (args) => callAndRelay("candle_atomic_launch_dry_run", args, getConfig(), doFetch),
   )
 
   register(

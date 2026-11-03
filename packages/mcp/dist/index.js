@@ -189,7 +189,7 @@ function readClusterResult(value, mint) {
 }
 
 // src/version.ts
-var SERVER_VERSION = "0.10.28";
+var SERVER_VERSION = "0.10.29";
 
 // src/update-notice.ts
 var PLAIN_VERSION = /^\d+\.\d+\.\d+$/;
@@ -1445,7 +1445,7 @@ var LAUNCH_DEFINITION = {
     {
       key: "feeWallet",
       type: "string",
-      help: "Solana only: the wallet this launch's curve and pool fees earn to, an on-curve wallet or a Squads v4 vault; defaults to the account wallet.",
+      help: "Solana only: the wallet this launch's curve and pool fees earn to, an on-curve wallet or a Squads v4 vault; defaults to the wallet that launches the token (the account wallet on a server without LAUNCH_FEE_WALLET_FROM_LAUNCHER, except an embedded launch).",
       chains: [
         "solana"
       ],
@@ -6338,6 +6338,7 @@ var TOOL_NAMES = [
   "candle_get_plans",
   "candle_trade",
   "candle_launch_and_seed",
+  "candle_atomic_launch_dry_run",
   "candle_swap",
   "candle_transfer",
   "candle_sweep",
@@ -6470,6 +6471,18 @@ function buildRequest(name, args, cfg) {
       return {
         url: `${base2}${path}`,
         init: { method: "POST", headers: jsonHeaders(apiKey), body: JSON.stringify(body) }
+      };
+    }
+    case "candle_atomic_launch_dry_run": {
+      const apiKey = requireApiKey2(cfg);
+      const { payer, chain: _chain, buyAmount: _buyAmount, ...rest } = args;
+      return {
+        url: `${base2}/api/v1/launch/atomic/dry-run`,
+        init: {
+          method: "POST",
+          headers: jsonHeaders(apiKey),
+          body: JSON.stringify({ ...rest, chain: "solana", payer: payer ?? { type: "main" } })
+        }
       };
     }
     case "candle_get_market": {
@@ -6911,6 +6924,22 @@ var getFeesShape = {
   cursor: z9.string().optional().describe("The previous page's continueCursor, verbatim"),
   limit: z9.number().optional().describe("Tokens per page, 1 to 50 (default 20). Each one costs chain reads")
 };
+var atomicPayerShape = z9.union([
+  z9.object({ type: z9.literal("main") }),
+  z9.object({ type: z9.literal("linked"), linkedWalletId: z9.string().min(1) })
+]);
+var atomicLaunchDryRunShape = (() => {
+  const { buyAmount: _buyAmount, chain: _chain, ...launch } = launchTokenShape;
+  return {
+    ...launch,
+    clientLaunchId: z9.string().optional().describe("Not used by a dry run; send the id you will launch with"),
+    payer: atomicPayerShape.optional().describe("Who pays for the launch: {type:'main'} (default) or {type:'linked', linkedWalletId}"),
+    firstBuys: z9.array(z9.object({
+      payer: atomicPayerShape,
+      amountRaw: z9.string().regex(/^[1-9][0-9]*$/).describe("Quote-asset raw units")
+    })).min(1).max(4).describe("One to four first buys, each priced on the curve this launch would deploy")
+  };
+})();
 var claimFeesShape = {
   mint: z9.string().describe("The launched token: a Solana mint or a Hood token address, as candle_get_fees lists it"),
   dryRun: z9.boolean().optional().describe("Check and read only. Sends nothing and writes nothing. Use it first to see what would be claimed")
@@ -7303,12 +7332,12 @@ MARKET_NOT_FOUND means Candle has no market for that token and this could not ru
   }, async (args) => callAndRelay("candle_claim_staking_reward", args, getConfig(), doFetch));
   register("candle_get_fees", {
     title: "Read the creator fees this account's tokens can pay",
-    description: "The tokens launched by the account's own wallets, with what each could pay now in creator fees " + "(raw units from direct chain reads) and `claimable: true` or the `reason` it is not. Reads only; " + "moves nothing. It returns no earned or paid-out totals. An unreadable token is marked, never " + "shown as zero. Paged: pass `continueCursor` back as `cursor`.",
+    description: "The tokens launched by the account's own wallets, with what each could pay now in creator fees " + "(raw units from direct chain reads) and a `reason` saying who can claim: `claimable_by_key` on a " + "claimable Solana row, and otherwise why this key cannot (including `claimable_via_web_session` " + "and `fee_wallet_designated`, which name whose authority collects). Reads only; " + "moves nothing. It returns no earned or paid-out totals. An unreadable token is marked, never " + "shown as zero. Paged: pass `continueCursor` back as `cursor`.",
     inputSchema: getFeesShape
   }, async (args) => callAndRelay("candle_get_fees", args, getConfig(), doFetch));
   register("candle_claim_fees", {
     title: "Claim a token's creator fees",
-    description: "Collect one token's creator fees and pay them to the wallet fixed at launch. There is no destination " + "argument and the tool cannot send funds anywhere else. Candle signs with the embedded wallet, which " + "pays the network fee. Needs launch:write. " + "Call it with dryRun: true first; a real claim moves real funds into the recipient wallet, which may be " + "the wallet this agent trades from. Not idempotent by id: if the result is lost, read candle_get_fees " + "before claiming again.",
+    description: "Collect one token's creator fees and pay them to the wallet fixed at launch. There is no destination " + "argument and the tool cannot send funds anywhere else. Candle signs with the embedded wallet, which " + "pays the network fee. A fee recipient that is a TEE wallet is refused here: claim it with the candle CLI " + "(`candle fees claim`). The dry run reports the same refusal (`claimable: false`, `reason: " + "wallet_not_signable`) and counts only what this tool could claim. Needs launch:write. " + "Call it with dryRun: true first; a real claim moves real funds into the recipient wallet, which may be " + "the wallet this agent trades from. Not idempotent by id: if the result is lost, read candle_get_fees " + "before claiming again.",
     inputSchema: claimFeesShape
   }, async (args) => callAndRelay("candle_claim_fees", args, getConfig(), doFetch));
   register("candle_get_wallets", {
@@ -7416,6 +7445,12 @@ MARKET_NOT_FOUND means Candle has no market for that token and this could not ru
     const result = await executeTrade(args, getConfig(), doFetch);
     return { content: [{ type: "text", text: result.text }], ...result.isError ? { isError: true } : {} };
   });
+  register("candle_atomic_launch_dry_run", {
+    title: "Dry-run an atomic Solana launch",
+    description: "Check a Solana launch bundled with first buys and price each buy, without building anything. Runs the " + "same checks as the atomic build, in the same order (payers, Believer check, fee and spend limits, the " + "key's transaction cap), then returns the launch preview (curveTerms) and one fill per first buy: the " + "tokens it would receive and the floor the build would sign it at. Reads only; moves nothing, reserves " + "nothing, and the clientLaunchId stays unused. It does not check balances, the daily cap, or the " + "transaction's size, so the real launch can still refuse. Needs launch:write, swap:write and Pro or Max.",
+    inputSchema: atomicLaunchDryRunShape,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+  }, async (args) => callAndRelay("candle_atomic_launch_dry_run", args, getConfig(), doFetch));
   register("candle_launch_and_seed", {
     title: "Launch a token and seed it",
     description: "Launch a new token from the account's embedded wallet, with an optional dev-buy seed, then " + "return the fresh market state and token links in one result. On solana a seed makes this " + (options.headlessSeed === true ? "the seed is a separate first-buy transaction in the same Jito bundle as the launch, so " + "both land or neither does. That works on every plan, Free included, and needs no " + "swap:write. On hood the seed is " : "the atomic launch: the launch and the seed are two transactions Candle signs and sends as " + "one Jito bundle, so both land or neither does. That needs Pro or Max (TIER_REQUIRED " + "otherwise) and swap:write on the key, and the result carries bundleId. On hood the seed is ") + "a best-effort follow-up. A launch with no seed works on every plan, Free included. MOVES " + "REAL FUNDS unless dryRun; dry-run first, which spends nothing. Seeds above the platform " + "dev-buy ceiling are rejected (DEV_BUY_TOO_HIGH): at most 0.5 SOL / 500 USDC / 2,000,000 " + "CNDL, or on an exp- curve 10% of the threshold when that is lower; the server holds the " + "creator's own seed to the effective ceiling, so launch with the largest devBuy it allows " + "and top up with candle_trade. " + LAUNCH_SHARED_SENTENCES + (imageDir ? IMAGE_PATH_DISCLOSURE : ""),

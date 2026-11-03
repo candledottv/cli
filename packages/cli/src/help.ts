@@ -269,7 +269,7 @@ export const HELP: Record<string, Topic> = {
     intro: "Quote, swap and bridge on Solana or Hood; read an operation",
     summary: "Quote, confirm and swap on Solana or Hood, bridge between them; read an operation by id",
     description:
-      "Swaps run through a TEE wallet's bound key: the quote is shown and confirmed before anything is sent. The first buy after a launch is this command, unless the launch carried it with candle launch --buy. The assets decide the chain (ETH, USDG or a 0x token is Hood; SOL, USDC, CNDL or a mint is Solana) and a named wallet must be on it. A Hood TEE wallet signs one leg at a time: approve, Permit2, trade, then the fee, each only after the one before it landed. SOL or USDC to ETH or USDG, or back, is a bridge through Relay from a TEE wallet into this key's own TEE wallet on the other chain (--to names it when there are several); Candle charges no fee, only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and this machine checks Relay's deposit before it is signed. The bridge prints its deposit and returns while Relay fills; --wait follows it for up to ten minutes. While it is open, a sweep of either wallet refuses BRIDGE_IN_FLIGHT for two hours. Vault to vault: fund the Solana TEE wallet from the vault, bridge, then disable and sweep the Hood TEE wallet into its vault. Every plan can trade Candle-launched tokens and base assets, and sell a token it holds that was not launched on Candle; buying such a token needs Pro or Max (TIER_REQUIRED otherwise). Each trade pays the plan's agent fee on top; a base-pair swap or a bridge between this key's own wallets pays none. candle plans shows the fees in force.",
+      "Swaps run through a TEE wallet's bound key: the quote is shown and confirmed before anything is sent. The first buy after a launch is this command, unless the launch carried it with candle launch --buy. The assets decide the chain (ETH, USDG or a 0x token is Hood; SOL, USDC, CNDL or a mint is Solana) and a named wallet must be on it. A Hood TEE wallet signs one leg at a time: approve, Permit2, trade, then the fee, each only after the one before it landed. SOL or USDC to ETH or USDG, or back, is a bridge through Relay from a TEE wallet into this key's own TEE wallet on the other chain (--to names it when there are several); Candle charges no fee, only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and this machine checks Relay's deposit before it is signed. The bridge prints its deposit and returns while Relay fills; --wait follows it for up to ten minutes. While it is open, a sweep of either wallet refuses BRIDGE_IN_FLIGHT for two hours. Vault to vault: fund the Solana TEE wallet from the vault, bridge, then disable and sweep the Hood TEE wallet into its vault. Every plan can trade Candle-launched tokens and base assets, and sell a token it holds that was not launched on Candle; buying such a token needs Pro or Max (TIER_REQUIRED otherwise). Each trade pays the plan's agent fee on top; a base-pair swap or a bridge between this key's own wallets pays none. candle plans shows the fees in force. With --json, stdout is one JSON value for every swap, trade, replay and status read: kind, status, clientTradeId, signature (the primary transaction, or null), signatures (a list) and raw (the original response); every human line is on stderr. The keys older versions printed stay beside them.",
     usage: ["candle swap <from> <to> [flags]", "candle swap status <id>"],
     rows: [
       {
@@ -610,19 +610,20 @@ export const HELP: Record<string, Topic> = {
     intro: "Move funds out of a TEE wallet to your wallets or its vault",
     summary: "Move funds out of a TEE wallet to your own wallets or its vault, through its bound key",
     description:
-      "Moves one asset out of a TEE wallet this machine can sign for. The bound key must be a Withdraw key (transfer:bound); from that wallet, Candle allows only its own pinned vault or another of the account's wallets you linked while signed in or marked trusted. To a linked wallet only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and the asset must be a base asset; to the vault any token and max are allowed. Candle builds the transaction, this machine approves the relay, Privy signs, Candle broadcasts. The destination and its kind are shown before you confirm. The asset decides the chain: ETH, USDG or --token is Hood, from a Hood TEE wallet, where this machine checks the one leg moves exactly what you confirmed before it is signed, and ETH max leaves the gas reserve.",
+      "Moves one asset out of a TEE wallet this machine can sign for. The bound key must be a Withdraw key (transfer:bound); from that wallet, Candle allows only its own pinned vault or another of the account's wallets you linked while signed in or marked trusted, and, where the server has TEE_WITHDRAWALS_ENABLED on, an address on the account's withdrawal allowlist (named by its label, id or address). To a linked wallet or an approved address only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and the asset must be a base asset; to the vault any token and max are allowed. Candle builds the transaction, this machine approves the relay, Privy signs, Candle broadcasts. The destination and its kind are shown before you confirm. The asset decides the chain: ETH, USDG or --token is Hood, from a Hood TEE wallet, where this machine checks the one leg moves exactly what you confirmed before it is signed, and ETH max leaves the gas reserve.",
     usage: [
-      "candle transfer --to <address|wallet name|vault> --asset <SOL|USDC|CNDL|ETH|USDG>|--mint <mint>|--token <0x...> --amount <decimal|max> [--wallet <tee>] [--yes] [--json]",
+      "candle transfer --to <address|wallet name|allowlist label|vault> --asset <SOL|USDC|CNDL|ETH|USDG>|--mint <mint>|--token <0x...> --amount <decimal|max> [--wallet <tee>] [--yes] [--json]",
     ],
     rows: [],
     flags: [
       {
-        invocation: "--to <address|wallet name|vault>",
-        description: "Where the funds go: vault is the wallet's own pin",
+        invocation: "--to <address|wallet name|allowlist label|vault>",
+        description:
+          "Where the funds go: vault is the wallet's own pin; a linked wallet's name wins over an allowlist label",
       },
       {
         invocation: "--asset <SOL|USDC|CNDL|ETH|USDG>",
-        description: "A base asset (required for a linked-wallet destination)",
+        description: "A base asset (required for a linked-wallet or approved-address destination)",
       },
       { invocation: "--mint <mint>", description: "Any Solana mint, instead of --asset (vault destinations only)" },
       { invocation: "--token <0x...>", description: "Any Hood ERC-20, instead of --asset (vault destinations only)" },
@@ -646,9 +647,15 @@ export const HELP: Record<string, Topic> = {
     group: "Trade",
     summary: "Create a token on Solana or Hood, with an optional first buy",
     description:
-      "Creates a token from the wallet you name, with an optional first buy. Embedded launches use /launch/headless on every plan, with the key's embedded-wallet allowance and launch:write; no swap:write is needed. A Solana first buy is a creator bundle, signed by Candle. A Hood first buy is best effort after creation. TEE launches use /launch/self and require Pro or Max, allowLaunch, a bound key and verified authority. TEE buys need TEE_LAUNCH_BUYS_ENABLED on the server; Solana buys also need AGENT_TRADING_ENABLED and Jito. Existing server gates and ceilings apply. The embedded path previews the launch before confirmation; --dry-run stops at the preview. No buy creates only the token. Local image and banner uploads happen before confirmation and are public and permanent even if the launch is declined. Reuse --client-trade-id for recovery. On Solana, --fee-wallet <address> sets the wallet the launch's curve and pool fees earn to, an on-curve wallet by itself or a Squads v4 vault with --fee-wallet-multisig <address> and --fee-wallet-multisig-vault-index <n>; without it the fees earn to the account wallet, which the preview, the confirm and --check all say. --check answers first, before any of it: which launch path works on this key and server (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, with nothing uploaded, built or sent; name a wallet with --wallet to narrow it, and it exits 1 when no path works.",
-    usage: [LAUNCH_USAGE],
-    rows: [],
+      "Creates a token from the wallet you name, with an optional first buy. Embedded launches use /launch/headless on every plan, with the key's embedded-wallet allowance and launch:write; no swap:write is needed. A Solana first buy is a creator bundle, signed by Candle. A Hood first buy is best effort after creation. TEE launches use /launch/self and require Pro or Max, allowLaunch, a bound key and verified authority. TEE buys need TEE_LAUNCH_BUYS_ENABLED on the server; Solana buys also need AGENT_TRADING_ENABLED and Jito. Existing server gates and ceilings apply. The embedded path previews the launch before confirmation; --dry-run stops at the preview. No buy creates only the token. Local image and banner uploads happen before confirmation and are public and permanent even if the launch is declined. Reuse --client-trade-id for recovery. On Solana, --fee-wallet <address> sets the wallet the launch's curve and pool fees earn to, an on-curve wallet by itself or a Squads v4 vault with --fee-wallet-multisig <address> and --fee-wallet-multisig-vault-index <n>; without it the fees earn to the wallet that launches the token where the server has LAUNCH_FEE_WALLET_FROM_LAUNCHER on (an embedded launch already earns to its embedded wallet), otherwise to the account wallet, and the preview, the confirm and --check all say which; a live launch also warns on stderr when it defaults, and --require-fee-wallet refuses the launch without one. --check answers first, before any of it: which launch path works on this key and server (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, with nothing uploaded, built or sent; name a wallet with --wallet to narrow it, and it exits 1 when no path works. status reads one launch by its mint or clientLaunchId: build, signed, confirmed, trading, bonded, then migrated, with the market's lifecycle and migration fields. --wait follows it until the token is trading, the launch has failed, or ten minutes pass.",
+    usage: [LAUNCH_USAGE, "candle launch status <mint-or-client-launch-id> [--wait]"],
+    rows: [
+      {
+        invocation: "status <mint-or-client-launch-id> [--wait]",
+        description:
+          "One state for a mint or a clientLaunchId: build, signed, confirmed, trading, bonded, migrated. Uses the market's lifecycle and migration fields. --wait follows until the token is trading, the launch has failed, or ten minutes pass. Reads only.",
+      },
+    ],
     flags: [
       ...launchFlagRows,
       {
@@ -663,6 +670,11 @@ export const HELP: Record<string, Topic> = {
       },
       { invocation: "--yes", description: "Confirm the launch without an interactive prompt." },
       {
+        invocation: "--require-fee-wallet",
+        description:
+          "Refuse the launch when no --fee-wallet is given, rather than letting the fees earn to the account wallet.",
+      },
+      {
         invocation: "--rpc-url <url>",
         description: "The Solana RPC for a TEE launch with no first buy, or the Hood RPC for receipt reads.",
       },
@@ -676,6 +688,7 @@ export const HELP: Record<string, Topic> = {
       "candle launch --name Demo --symbol DEMO --image-url https://example.com/d.png --wallet AgentOne --buy 0.1",
       "candle launch --name Demo --symbol DEMO --image-url https://example.com/d.png --wallet embedded --buy 0.1 --dry-run",
       "candle launch --name Demo --symbol DEMO --image-url https://example.com/d.png --wallet AgentOne --mode exp-custom --curve-v 4 --curve-g 20 --creator-fee-bps 100 --dry-run",
+      "candle launch status <mint-or-id> --wait",
     ],
     env: ENV_API,
   },
@@ -1382,7 +1395,7 @@ export const HELP: Record<string, Topic> = {
         invocation:
           "transfer <to> --amount <n|max> --asset SOL|<mint>|ETH|USDG|<0x token> --from <label> [--rpc-url <url>]",
         description:
-          "Sign a transfer locally from a vault key or a promoted TEE wallet (Solana, or Hood: refused while a sequenced trade holds the wallet's nonce, and when that cannot be read). From an EVM key: ETH or an ERC-20, on Hood by default (--rpc-url for any EVM chain; the chain id is read from the RPC), exit 0 means depth-confirmed (1 block on Hood, 2 elsewhere), not finalized. A Solana key reads and sends over --rpc-url, else CANDLE_SOLANA_RPC_URL, else the profile's RPC, else the public endpoint. One verification: the unlock names the send; after the decoded display you type confirm. No --yes",
+          "Sign a transfer locally from a vault key or a promoted TEE wallet (Solana, or Hood: refused while a sequenced trade holds the wallet's nonce, and when that cannot be read). From an EVM key: ETH or an ERC-20, on Hood by default (--rpc-url for any EVM chain; the chain id is read from the RPC), exit 0 means depth-confirmed (1 block on Hood, 2 elsewhere), not finalized. A Solana key reads and sends over --rpc-url, else CANDLE_SOLANA_RPC_URL, else the profile's RPC, else the public endpoint. Max sends SOL minus the quoted fee (zero source reserve when emptied), or the whole token balance; EVM native max deducts the fee cap. SOL max refreshes before signing; a changed amount or fee requires a fresh confirm. One verification: the unlock names the send; after the decoded display you type confirm. No --yes",
       },
       {
         invocation:
@@ -1403,9 +1416,9 @@ export const HELP: Record<string, Topic> = {
       },
       {
         invocation:
-          "demote <tee-address> [--rpc-url <url>] [--emergency] [--sweep-to <label>] [--token <0x...>] [--from-block <n>]",
+          "demote <tee-address>... | --all --empty [--rpc-url <url>] [--emergency] [--sweep-to <label>] [--yes] [--token <0x...>] [--from-block <n>]",
         description:
-          "Disable then sweep a TEE wallet back to its pin. A Hood wallet takes tee sweep's --token and --from-block",
+          "Disable then sweep a TEE wallet back to its pin. A Hood wallet takes tee sweep's --token and --from-block (one wallet only). Several addresses, or --all --empty, demote one at a time under one unlock: every wallet and its sweep destination is listed, then you type confirm once (--yes skips it; it stands in for each sweep's confirm). A failure does not stop the rest; each wallet gets a result line and a summary counts done, incomplete, failed and skipped with reasons. --json writes one document: wallets[] and summary",
       },
       {
         invocation: "export-key <label> --to <new-file>",
@@ -1426,7 +1439,17 @@ export const HELP: Record<string, Topic> = {
       },
       {
         invocation: "--all",
-        description: "list: include retired TEE wallets (demoted and swept), which are hidden by default",
+        description:
+          "list: include retired TEE wallets (demoted and swept), which are hidden by default. demote: every TEE wallet in the vault that is not retired, with a filter (--empty)",
+      },
+      {
+        invocation: "--empty",
+        description:
+          "demote --all: only Solana TEE wallets with nothing left to sweep (0 SOL, no token accounts, no unsettled sweep); the rest are listed as skipped",
+      },
+      {
+        invocation: "--yes",
+        description: "demote with several wallets: skip the one typed confirmation for the listed set",
       },
       {
         invocation: "--balances",
@@ -1469,6 +1492,7 @@ export const HELP: Record<string, Topic> = {
       "candle vault new-key --chain solana --labels-from ./replacement-names.txt",
       "candle vault promote-batch --pairs-from ./promote-plan.csv",
       "candle vault promote-batch --pairs-from ./promote-plan.csv --to-key tr-01",
+      "candle vault demote --all --empty",
       "candle vault enroll security-key --label yubikey-a",
       "candle vault backup --to /Volumes/BACKUP/vault.enc",
       "candle vault backup --to icloud",
@@ -1536,9 +1560,14 @@ export const HELP: Record<string, Topic> = {
           "Rename 1–256 TEE wallets with one server call, all or nothing, then one vault commit. Every finding refuses the whole file. The vault is unlocked once, only when a named TEE wallet may be in it. --dry-run prints the plan and changes nothing; if the vault write fails after the server accepted, it prints address-keyed rows to re-run",
       },
       {
-        invocation: "signer new --key <prefix|label> [--out <pem>] [--force]",
+        invocation: "signer new --key <prefix|label> [--out <pem>] [--force] [--no-wait]",
         description:
-          "On the trading machine, with that key's API key: generate the key's signer here and wait for the owner to approve it. Its wallets then trade from this machine. --out also writes a plaintext PEM for an SDK process (weaker than the secret store); --force adds a signer while an older signer on THIS machine still owns wallets; it moves, revokes and deletes nothing",
+          "On the trading machine, with that key's API key: generate the key's signer here and wait for the owner to approve it. Its wallets then trade from this machine. --out also writes a plaintext P-256 authorization key for Privy wallet RPC; it cannot sign Solana transactions (the TEE signs them). --no-wait exits 0 once pending. --json emits newline-delimited JSON: a pending event with userCode, verificationUriComplete, expiresAt and fingerprint immediately, then an active result or error if waiting. Retrying re-attaches to the same live request;  --force adds a signer while an older signer on THIS machine still owns wallets; it moves, revokes and deletes nothing",
+      },
+      {
+        invocation: "  signer status --key <prefix|label>",
+        description:
+          "Read the server signer state once without generating a pair or requesting approval. --json prints one value; on the requesting machine it includes the cached code and URL while that request is live",
       },
       // Indented like `keys signer`'s move row: a second word under `tee signer`, not a second subcommand of `tee`.
       {
