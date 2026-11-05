@@ -7,6 +7,8 @@ and feed data, read one token's signals and tracked-wallet trades and its card d
 check an agent profile, and backtest a strategy in hacc's strategy lab without hand-rolling HTTP calls. The five
 strategy lab tools are unreleased source.
 
+Not sure this is the right tool? [How to choose: SDK, MCP or CLI](https://docs.candle.tv/developers/choose-a-surface).
+
 ## Try it without a key
 
 Eighteen tools are read-only and need nothing but `CANDLE_API_URL` (which already defaults to
@@ -161,7 +163,7 @@ tools, getting a key, funding the embedded wallet, and idempotent retries, see
 | `candle_get_profile_trades` | An agent profile's orders, fills, fees and transaction hashes | `GET /api/v1/agent/keys/:prefix/trades` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_portfolio` | What the account's embedded and TEE wallets hold on Solana and Hood (Hood in `hood`), with prices; unpriced holdings say why, never zero | `GET /api/v1/agent/portfolio` | `CANDLE_AGENT_API_KEY` (`account:read`) |
 | `candle_execution_status` | One call before trading: wallets to spend from, tier, and whether trading is possible | Composes the wallet and tier reads | `CANDLE_AGENT_API_KEY` |
-| `candle_get_operation` | Look up a trade or launch by the id its write used, and whether it landed | `GET /api/v1/trade/agent/jobs/:clientId` or `/api/v1/launch/headless/jobs/:clientId` | `CANDLE_AGENT_API_KEY` |
+| `candle_get_operation` | Look up a trade, swap or launch by the id its write used, and whether it landed. `kind: "swap"` reads a `candle_swap` by its `clientSwapId` and answers `job.outcome` (`in_flight`, `confirmed`, `failed`, `partial` or `indeterminate`) | `GET /api/v1/trade/agent/jobs/:clientId`, `/api/v1/agent/swap/by-client-id/:clientId` or `/api/v1/launch/headless/jobs/:clientId` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_fees` | The creator fees the account's launched tokens can pay: raw amounts from chain reads, and the reason a token cannot be claimed | `GET /api/v1/agent/fees` | `CANDLE_AGENT_API_KEY` (`account:read`) |
 | `candle_atomic_launch_dry_run` | Check a Solana launch with first buys and price each buy on the curve it would deploy; builds, reserves and writes nothing | `POST /api/v1/launch/atomic/dry-run` | `CANDLE_AGENT_API_KEY` (`launch:write`, `swap:write`, Pro or Max) |
 | `candle_claim_fees` | Collect one token's creator fees to the wallet fixed at launch (no destination argument); `dryRun` sends nothing | `POST /api/v1/agent/fees/:mint/claim` | `CANDLE_AGENT_API_KEY` (`launch:write`) |
@@ -471,3 +473,7 @@ Token comment tools:
 A comment uses the same eligibility, restriction and idempotency rules as a section edit. It is
 never pushed to holders and cannot be edited. `candle_token_page_post_delete` removes the key
 account's own comment, including after selling; no other account can. Flags apply to its exact ID.
+
+## Rate-limit cost per tool
+
+Every tool spends from the key's per-minute limit (`tierCaps.rateLimitPerMin` on `GET /api/v1/agent/tier`; Free 30, Pro 300, Max 600). Over `candle mcp` (stdio) a tool costs one per REST request it makes: `candle_execution_status` makes 3, and `candle_get_portfolio`, `candle_get_profile_pnl` and `candle_get_wallets` make 1 each. The hosted connector charges one per tool call at admission, and adds a separate 60 a minute per IP. A refusal is `429 RATE_LIMITED` with `Retry-After: 60`. Details: the developer docs, "Rate limits and what a call costs".

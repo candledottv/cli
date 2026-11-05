@@ -30,6 +30,8 @@ const checkSchema = z
       teeLaunchBuys: z.boolean(),
       // BE-2599: LAUNCH_FEE_WALLET_FROM_LAUNCHER. Absent from an older server: the account-wallet default.
       feeWalletFromLauncher: z.boolean().optional(),
+      // BE-2724: TEE_LAUNCH_BY_SCOPE_ENABLED. Absent from an older server: allowLaunch is still asked for.
+      teeLaunchByScope: z.boolean().optional(),
     }),
     embedded: z
       .object({
@@ -121,7 +123,9 @@ function embeddedLines(answer: CheckAnswer, requestedChain?: TradeChain): string
   for (const { chain, wallet } of paths) {
     if (!wallet) continue
     if (wallet.delegated === false) {
-      lines.push(`The account's ${chainName(chain)} embedded wallet is not delegated for agent access.`)
+      lines.push(
+        `The account's ${chainName(chain)} embedded wallet is not delegated for agent access. Run: candle wallets authorize`,
+      )
       continue
     }
     lines.push(`This key can launch from the ${chainName(chain)} embedded wallet with no first buy.`)
@@ -201,6 +205,10 @@ export async function launchCheck(
   const shownWallets = walletFlag === undefined ? answer.wallets : named
   const lines: string[] = [`Launch paths for key ${answer.key.keyPrefix} (tier ${answer.key.tier}):`]
   if (requestedChain) lines.push(`Requested launch chain: ${chainName(requestedChain)}.`)
+  if (answer.switches.teeLaunchByScope === true)
+    lines.push(
+      "This server lets the key's launch:write decide a TEE launch (TEE_LAUNCH_BY_SCOPE_ENABLED is on); allowLaunch is deprecated, and a first buy also needs swap:write.",
+    )
   // BE-2519: the fee wallet the launch would use, chosen or defaulted, before anything is sent.
   const launcherDefault = answer.switches.feeWalletFromLauncher === true
   if (!requestedChain || requestedChain === "solana")

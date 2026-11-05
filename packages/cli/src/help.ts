@@ -647,7 +647,7 @@ export const HELP: Record<string, Topic> = {
     group: "Trade",
     summary: "Create a token on Solana or Hood, with an optional first buy",
     description:
-      "Creates a token from the wallet you name, with an optional first buy. Embedded launches use /launch/headless on every plan, with the key's embedded-wallet allowance and launch:write; no swap:write is needed. A Solana first buy is a creator bundle, signed by Candle. A Hood first buy is best effort after creation. TEE launches use /launch/self and require Pro or Max, allowLaunch, a bound key and verified authority. TEE buys need TEE_LAUNCH_BUYS_ENABLED on the server; Solana buys also need AGENT_TRADING_ENABLED and Jito. Existing server gates and ceilings apply. The embedded path previews the launch before confirmation; --dry-run stops at the preview. No buy creates only the token. Local image and banner uploads happen before confirmation and are public and permanent even if the launch is declined. Reuse --client-trade-id for recovery. On Solana, --fee-wallet <address> sets the wallet the launch's curve and pool fees earn to, an on-curve wallet by itself or a Squads v4 vault with --fee-wallet-multisig <address> and --fee-wallet-multisig-vault-index <n>; without it the fees earn to the wallet that launches the token where the server has LAUNCH_FEE_WALLET_FROM_LAUNCHER on (an embedded launch already earns to its embedded wallet), otherwise to the account wallet, and the preview, the confirm and --check all say which; a live launch also warns on stderr when it defaults, and --require-fee-wallet refuses the launch without one. --check answers first, before any of it: which launch path works on this key and server (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, with nothing uploaded, built or sent; name a wallet with --wallet to narrow it, and it exits 1 when no path works. status reads one launch by its mint or clientLaunchId: build, signed, confirmed, trading, bonded, then migrated, with the market's lifecycle and migration fields. --wait follows it until the token is trading, the launch has failed, or ten minutes pass.",
+      "Creates a token from the wallet you name, with an optional first buy. Embedded launches use /launch/headless on every plan, with the key's embedded-wallet allowance and launch:write; no swap:write is needed. A Solana first buy is a creator bundle, signed by Candle. A Hood first buy is best effort after creation. TEE launches use /launch/self and require Pro or Max, launch:write, a bound key and verified authority; a server with TEE_LAUNCH_BY_SCOPE_ENABLED off also asks for the owner's allowLaunch (deprecated), and with it on a TEE first buy also needs swap:write. TEE buys need TEE_LAUNCH_BUYS_ENABLED on the server; Solana buys also need AGENT_TRADING_ENABLED and Jito. Existing server gates and ceilings apply. The embedded path previews the launch before confirmation; --dry-run stops at the preview. No buy creates only the token. Local image and banner uploads happen before confirmation and are public and permanent even if the launch is declined. Reuse --client-trade-id for recovery. On Solana, --fee-wallet <address> sets the wallet the launch's curve and pool fees earn to, an on-curve wallet by itself or a Squads v4 vault with --fee-wallet-multisig <address> and --fee-wallet-multisig-vault-index <n>; without it the fees earn to the wallet that launches the token where the server has LAUNCH_FEE_WALLET_FROM_LAUNCHER on (an embedded launch already earns to its embedded wallet), otherwise to the account wallet, and the preview, the confirm and --check all say which; a live launch also warns on stderr when it defaults, and --require-fee-wallet refuses the launch without one. --check answers first, before any of it: which launch path works on this key and server (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, with nothing uploaded, built or sent; name a wallet with --wallet to narrow it, and it exits 1 when no path works. status reads one launch by its mint or clientLaunchId: build, signed, confirmed, trading, bonded, then migrated, with the market's lifecycle and migration fields. --wait follows it until the token is trading, the launch has failed, or ten minutes pass.",
     usage: [LAUNCH_USAGE, "candle launch status <mint-or-client-launch-id> [--wait]"],
     rows: [
       {
@@ -1011,17 +1011,32 @@ export const HELP: Record<string, Topic> = {
   },
   quant: {
     group: "Account",
-    intro: "Quant's terms, accepted before per-use answers",
-    summary: "Quant's terms, which per-use Quant answers need accepted first",
+    intro: "Ask Quant from the terminal; accept its terms",
+    summary: "Quant over an API key: ask a question, accept the terms per-use answers need",
     description:
-      "terms shows Quant's terms and Privacy Policy and records this account's acceptance through its API key. Quant accepts only its current version; the default is the version this release was built with, and --terms-version sends another. A paid Quant answer past the daily limit is refused until the terms are accepted, before any payment is asked for.",
-    usage: ["candle quant terms [--terms-version <YYYY-MM-DD>] [--yes] [--json]"],
-    rows: [{ invocation: "terms", description: "Show Quant's terms and record acceptance" }],
-    flags: [
-      { invocation: "--terms-version <date>", description: "The terms version to accept, YYYY-MM-DD" },
-      { invocation: "--yes", description: "Accept without the typed confirm" },
+      "ask sends one question to Quant through this profile's API key (or CANDLE_API_KEY; a Read key is enough, account:read or launch:write), follows the turn until it ends and prints the answer. --json prints {turnId, answer, remaining?, resetsAt?}, remaining being today's answers left. A refusal is a plain sentence and exit 1, and --json carries the route's code: limit_reached with resetsAt, turn_in_progress with turnId, text_too_long with limit, RATE_LIMITED, VALIDATION_FAILED, NO_IDENTITY_WALLET, TERMS_REQUIRED, and QUANT_AGENT_OFF when Quant for agent keys is off on the API. Past the daily limit an API with per-use payments answers with an offer: ask prints the price as PAYMENT_REQUIRED and stops, and pays nothing. Ctrl-C, or --timeout passing (default 300 s), cancels the turn. terms shows Quant's terms and Privacy Policy and records this account's acceptance through its API key. Quant accepts only its current version; the default is the version this release was built with, and --terms-version sends another. A paid Quant answer past the daily limit is refused until the terms are accepted, before any payment is asked for.",
+    usage: [
+      'candle quant ask "<text>" [--timeout <s>] [--json]',
+      "candle quant terms [--terms-version <YYYY-MM-DD>] [--yes] [--json]",
     ],
-    examples: ["candle quant terms", "candle quant terms --yes --json"],
+    rows: [
+      { invocation: 'ask "<text>"', description: "Ask Quant one question and print the answer" },
+      { invocation: "terms", description: "Show Quant's terms and record acceptance" },
+    ],
+    flags: [
+      {
+        invocation: "--timeout <s>",
+        description: "ask: stop waiting and cancel the turn after s seconds (default 300)",
+      },
+      { invocation: "--terms-version <date>", description: "terms: the terms version to accept, YYYY-MM-DD" },
+      { invocation: "--yes", description: "terms: accept without the typed confirm" },
+    ],
+    examples: [
+      'candle quant ask "What moved SOL today?"',
+      'candle quant ask "Summarize my open positions" --json',
+      "candle quant terms",
+      "candle quant terms --yes --json",
+    ],
     env: ENV_API,
   },
   lab: {
@@ -1110,49 +1125,6 @@ export const HELP: Record<string, Topic> = {
     examples: ["candle plans", "candle plans --json", "candle plans --api-url https://staging.api.candle.tv"],
     env: ["CANDLE_API_URL"],
   },
-  accounts: {
-    group: "Account",
-    intro: "Create a staging test account from fleet keychain items",
-    summary: "Create a staging test member from fleet keychain items, with no browser",
-    description:
-      "create makes a complete Free test member on staging, tagged test-fleet so the KPI figures exclude it, with Solana and Hood TEE wallets and a first API key, and prints only public fields. It runs on macOS only, at a terminal (the owner runs it in their own Terminal; unattended use needs the owner's D10 approval in activation.json), and holds the fleet runner lock for the whole run. The identity key is read from the login keychain item candle-fleet-<env>-<name>-sol, made by the owner script, and signs a Candle x402 create_account proof; it is never printed and never taken from a flag, the environment or stdin. The key signer is never read: its public half comes from the owner's sealed-signer receipt, and its item candle-fleet-<env>-<name>-signer is checked for existence only; this command never makes a signer. The API key Candle returns once is handed on stdin to the hash-pinned reviewed sibling, which seals it into candle-fleet-<env>-<name>-apikey; the profile keeps that item's name, never the key. It is a public fleet record: ordinary CLI authentication, including doctor, refuses with ACCOUNTS_FLEET_RUNNER_REQUIRED. Credential reads belong to the reviewed fleet runner under R9.3; general profile use needs a separate custody decision. --use selects the record and grants no credential access. A run is refused before anything is sent when that item already exists (--yes does not override it), when the default username fleet-<env>-<name> is over 30 characters (choose one with --username), or when the sibling or the signer receipt does not check. --env staging is https://staging.api.candle.tv and ignores CANDLE_API_URL; --env local needs a loopback CANDLE_API_URL; production is refused. --scopes narrows the default scopes and never widens them. Exit codes: 0 created, 1 refused by the API, 2 refused here (nothing sent), 3 pending (run again with the same signer) or the key could not be stored.",
-    usage: [
-      "candle accounts create --env staging|local --name <fleet-name> [--key-item <item>] [--signer-item <item>] [--username <handle>] [--scopes <a,b,c>] [--profile <name>] [--use] [--yes] [--json]",
-    ],
-    rows: [
-      {
-        invocation: "create --env staging --name <fleet-name>",
-        description: "Create the test member, its TEE wallets and first key; store the key through the sibling",
-      },
-    ],
-    flags: [
-      {
-        invocation: "--env staging|local",
-        description: "staging, or a loopback API for local tests; production is refused",
-      },
-      { invocation: "--name <fleet-name>", description: "The fleet name, ^[a-z][a-z0-9-]{1,23}$" },
-      {
-        invocation: "--key-item <item>",
-        description: "The identity key's keychain item (default candle-fleet-<env>-<name>-sol)",
-      },
-      {
-        invocation: "--signer-item <item>",
-        description: "The sealed signer's item (default candle-fleet-<env>-<name>-signer)",
-      },
-      {
-        invocation: "--username <handle>",
-        description: "The username (default fleet-<env>-<name>, 30 characters at most)",
-      },
-      { invocation: "--scopes <a,b,c>", description: "Narrow the key's default scopes" },
-      { invocation: "--use", description: "Make the new profile the active one" },
-      { invocation: "--yes", description: "Accept the terms without the typed confirm; needed with --json" },
-    ],
-    examples: [
-      "candle accounts create --env staging --name free-b",
-      "candle accounts create --env staging --name long-fleet-name-17 --username fleet-long-17",
-    ],
-    env: ["CANDLE_API_URL", "CANDLE_CONFIG_DIR"],
-  },
   keys: {
     group: "Account",
     summary: "API keys, and the wallets each key may use",
@@ -1191,7 +1163,14 @@ export const HELP: Record<string, Topic> = {
         description:
           "The profile's own key gives up the embedded wallet, with no prompt. A key can never allow itself: the owner does that with keys update",
       },
-      { invocation: "revoke <prefix>", description: "Revoke an API key" },
+      { invocation: "stop <prefix>", description: "Pause one key with the device token; reversible with keys resume" },
+      { invocation: "resume <prefix>", description: "Resume a stopped key with the device token" },
+      {
+        invocation: "rotate <prefix|label> ([--grace <duration> | --now] [--force] [--yes] | --finish)",
+        description:
+          "Give a key a new secret, keeping its prefix, label, access, limits, wallets and history. The old secret works through --grace (default 1h, at most 24h) or stops at once with --now; --finish ends an open window early. The profile's own key is replaced in the keychain; update CANDLE_API_KEY and other copies yourself. --force rotates again while a window is open",
+      },
+      { invocation: "revoke <prefix>", description: "Revoke an API key permanently" },
       {
         invocation: "signer approve <code> --key <prefix|label> [--reject]",
         description:
@@ -1233,7 +1212,12 @@ export const HELP: Record<string, Topic> = {
       "candle tee rebind --label-prefix dest- --to-key Ab3dEf9h",
       "candle keys signer approve ABCD-EFGH --key tr-2",
       "candle keys signer move tr-2",
+      "candle keys rotate agent-one --grace 30m",
+      "candle keys rotate agent-one --now --idempotency-key rotate-2026-11",
+      "candle keys rotate agent-one --finish",
       "candle keys revoke ck_live_ab12",
+      "candle keys stop ck_live_ab12",
+      "candle keys resume ck_live_ab12",
     ],
     env: ENV_API,
   },
@@ -1251,6 +1235,11 @@ export const HELP: Record<string, Topic> = {
         description:
           "Import a wallet you own (key via --key-file or hidden prompt). A fresh key, without solana-keygen: candle vault new-key --chain solana, candle vault export-key <label> --to <file>, import that file, then delete the file",
       },
+      {
+        invocation: "authorize [--no-browser] [--no-wait] [--timeout <seconds>]",
+        description:
+          "Give agents access to the account's embedded wallets: opens the Agents page's grant step in your browser (no key is created) and, with an API key, waits until it lands",
+      },
       { invocation: "revoke <wallet-id>", description: "Revoke a linked wallet" },
       {
         invocation: "trust <label|address|id|prefix*>...",
@@ -1263,11 +1252,12 @@ export const HELP: Record<string, Topic> = {
       {
         invocation: "allow-launch <label|address|id|prefix*>...",
         description:
-          "Let TEE wallets pay for a launch (candle launch), after a screen of label, address and bound key (owner only; typed confirm)",
+          "Deprecated: a key's launch:write decides TEE launches where the server has TEE_LAUNCH_BY_SCOPE_ENABLED on. Otherwise lets TEE wallets pay for a launch (candle launch), after a screen of label, address and bound key (owner only; typed confirm)",
       },
       {
         invocation: "disallow-launch <label|address|id|prefix*>... [--yes]",
-        description: "Stop TEE wallets paying for a launch; trading is unchanged (owner only)",
+        description:
+          "Deprecated: where the server has TEE_LAUNCH_BY_SCOPE_ENABLED on it saves the value but cannot stop a launch, and exits 1 with the server's message; pause the key (candle keys stop) instead. Otherwise stops TEE wallets paying for a launch; trading is unchanged (owner only)",
       },
       {
         invocation:
@@ -1286,6 +1276,7 @@ export const HELP: Record<string, Topic> = {
     examples: [
       "candle wallet",
       "candle wallet --all",
+      "candle wallet authorize",
       "candle wallet import --chain solana --key-file ./signer.json",
       "candle wallet revoke wal_123",
       "candle wallet trust 'tr-*' 'dest-*'",

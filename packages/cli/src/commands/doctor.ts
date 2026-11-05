@@ -4,7 +4,7 @@ import { isUsageError, parseArgs } from "../args"
 import { type CheckRow, runLiveCheck } from "../checks"
 import { apiRequest } from "../client"
 import { ProfileCoreOwnedError } from "../core/ownership"
-import type { CommandContext } from "../deps"
+import type { CommandContext, Deps } from "../deps"
 import { resolveApiKey, resolveDeviceToken } from "../deps"
 import { SecretStoreLockedError } from "../keychain"
 import {
@@ -21,7 +21,7 @@ import {
 } from "../presentation"
 import { apiKeyPrefix, credentialEnvOverrides, effectiveProfileFields, printIdentity } from "../profiles"
 import { compareVersions, detectInstall, fetchLatest, helperAssetName, releaseBaseUrl, updateHomeFor } from "../release"
-import { renderError, writeUsageFailure } from "../render"
+import { formatTime, renderError, writeUsageFailure } from "../render"
 import { parseTeeReadiness, TEE_CHAIN_ASSETS } from "../tee-readiness"
 import { HELPER_ENV, HELPER_NAME, locateFido2Helper } from "../vault/fido2"
 import { CONFIG_DIR_ENV, candleConfigDir, defaultVaultPath, fileExists } from "../vault/store"
@@ -60,9 +60,23 @@ export const DOCTOR_ROW_IDS = {
   "API URL": "api_url_provenance",
   "API key": "api_key_provenance",
   "Device token": "device_token_provenance",
+  "Key rotation": "key_rotation",
 } as const
 
 const API_KEY_CHECK = "API key valid"
+
+/** BE-2648: the WARN row for an API key in a rotation's grace window. `source` is where the key came from. */
+export function keyRotationRow(until: string, source: string): CheckRow {
+  const fix =
+    source === "CANDLE_API_KEY"
+      ? "update CANDLE_API_KEY where this key is deployed to the new secret"
+      : "store the new secret with candle auth login, or rotate from this profile with candle keys rotate"
+  return {
+    check: "Key rotation",
+    state: "WARN",
+    detail: `this API key's secret was rotated; the old secret stops at ${formatTime(until)}. Fix: ${fix}.`,
+  }
+}
 
 async function teeLimitsRow(ctx: CommandContext, apiKey: string, wallets: { chain?: string }[]): Promise<CheckRow> {
   const result = await apiRequest("/api/v1/agent/keys/self/limits", {
@@ -155,6 +169,33 @@ function displayMarkWidth(state: CheckRow["state"], sym: ReturnType<typeof symbo
   return { PASS: sym.ok, WARN: sym.warning, FAIL: sym.danger, SKIP: sym.missing }[state].length
 }
 
+/**
+ * BE-2712 (D4): the config directory as it is on disk, not only the path it resolves to. Doctor
+ * never creates it. A missing directory is a WARN, not a FAIL: the first credential or signer write
+ * creates it, but on a box that should already hold a signer it is the wrong-user or
+ * wrong-`CANDLE_CONFIG_DIR` mistake, and this row is where that shows before `Signer slot` fails.
+ */
+async function configDirRow(deps: Deps, configDir: string): Promise<CheckRow> {
+  const shown = deps.env[CONFIG_DIR_ENV]?.trim()
+    ? `${configDir} (from ${CONFIG_DIR_ENV})`
+    : `${configDir} (the default)`
+  const found = await deps.inspectConfigDir(configDir)
+  if (found.state === "present") return { check: "Config directory", state: "PASS", detail: shown }
+  if (found.state === "missing") {
+    return {
+      check: "Config directory",
+      state: "WARN",
+      detail: `${shown} does not exist yet. The first credential or signer write creates it (mode 0700). If this machine should already hold credentials or signers, check the user and ${CONFIG_DIR_ENV}.`,
+    }
+  }
+  const parent = found.ancestor === undefined ? "" : `; nearest existing parent: ${found.ancestor}`
+  return {
+    check: "Config directory",
+    state: "FAIL",
+    detail: `${shown} cannot be written (${found.errno}${parent}). Fix: as the user that runs candle, run mkdir -m 700 ${configDir}, or set ${CONFIG_DIR_ENV} to a directory that user can write.`,
+  }
+}
+
 export async function doctor(args: string[], ctx: CommandContext): Promise<number> {
   const { deps, apiUrl, json } = ctx
   const parsed = parseArgs(args, { valueFlags: ["--role"] })
@@ -206,11 +247,6 @@ export async function doctor(args: string[], ctx: CommandContext): Promise<numbe
   let configDir: string | undefined
   try {
     configDir = candleConfigDir(deps.env, deps.homedir())
-    rows.push({
-      check: "Config directory",
-      state: "PASS",
-      detail: deps.env[CONFIG_DIR_ENV]?.trim() ? `${configDir} (from ${CONFIG_DIR_ENV})` : `${configDir} (the default)`,
-    })
   } catch (error) {
     rows.push({
       check: "Config directory",
@@ -221,6 +257,7 @@ export async function doctor(args: string[], ctx: CommandContext): Promise<numbe
   if (configDir === undefined) {
     rows.push({ check: "Vault", state: "SKIP", detail: `${CONFIG_DIR_ENV} is not usable, so no path to check` })
   } else {
+    rows.push(await configDirRow(deps, configDir))
     const vaultPath = defaultVaultPath(deps.env, deps.homedir())
     hasVault = await fileExists(vaultPath)
     rows.push(
@@ -370,6 +407,10 @@ export async function doctor(args: string[], ctx: CommandContext): Promise<numbe
       env: deps.env,
     })
     if (result.ok) trading = result.body as TradingPage
+    // BE-2648: the API answered this key with the rotation header, so this is the secret a rotation
+    // replaced. It works until the window ends; whatever holds it has to be updated before then.
+    const rotatedUntil = result.headers?.["x-candle-key-rotated"]
+    if (rotatedUntil) rows.push(keyRotationRow(rotatedUntil, provenance.apiKey.source))
     if (trading && Array.isArray(trading.scopes)) {
       scopes = trading.scopes
       rows.push({
@@ -509,7 +550,7 @@ export async function doctor(args: string[], ctx: CommandContext): Promise<numbe
                     ? activeTee
                       ? "not used by this key"
                       : "No usable payer: no delegated embedded wallet or active TEE wallet."
-                    : "No launch wallet is delegated. Fix: delegate one in the portal.",
+                    : "No launch wallet is delegated. Fix: candle wallets authorize (grants it in your browser).",
               },
       )
     }

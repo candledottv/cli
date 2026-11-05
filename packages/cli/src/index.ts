@@ -24,7 +24,6 @@ import { chmod, readFile, realpath, rename, unlink, writeFile } from "node:fs/pr
 import { homedir, hostname } from "node:os"
 import { pathToFileURL } from "node:url"
 import { browserUrl, resolveApiUrl } from "./client"
-import { accountsCreate } from "./commands/accounts"
 import { agentPositions } from "./commands/agent-positions"
 import { agentPost } from "./commands/agent-post"
 import { agentProfile } from "./commands/agent-profile"
@@ -42,6 +41,8 @@ import { keysCreate, keysList, keysRevoke } from "./commands/keys"
 import { keysAccess } from "./commands/keys-access"
 import { keysSelf, keysUpdate } from "./commands/keys-embedded-wallet"
 import { keysLimit } from "./commands/keys-limit"
+import { keysRotate } from "./commands/keys-rotate"
+import { keysResume, keysStop } from "./commands/keys-stop"
 import { keysWallets } from "./commands/keys-wallets"
 import { labEdges, labReplay, labRunners, labStatus } from "./commands/lab"
 import { launch } from "./commands/launch"
@@ -77,6 +78,7 @@ import { plugins, runPlugin } from "./commands/plugins"
 import { pnl } from "./commands/pnl"
 import { portfolio } from "./commands/portfolio"
 import { profileAdd, profileList, profileRemove, profileRename, profileSet, profileUse } from "./commands/profile"
+import { quantAsk } from "./commands/quant-ask"
 import { quantTerms } from "./commands/quant-terms"
 import { scan } from "./commands/scan"
 import { secretsList, secretsRemove, secretsSet } from "./commands/secrets"
@@ -126,6 +128,7 @@ import { vaultTransfer } from "./commands/vault-transfer"
 import { verify } from "./commands/verify"
 import { wallets, walletsImport, walletsRevoke } from "./commands/wallets"
 import { walletsAllowLaunch, walletsDisallowLaunch } from "./commands/wallets-allow-launch"
+import { walletsAuthorize } from "./commands/wallets-authorize"
 import { walletsCloseEmpty } from "./commands/wallets-close-empty"
 import { walletsTrust, walletsUntrust } from "./commands/wallets-trust"
 import type { CliConfig } from "./config"
@@ -140,6 +143,7 @@ import {
   profileNamesTouched,
 } from "./core/ownership"
 import type { CommandContext, Deps } from "./deps"
+import { ConfigDirUnwritableError } from "./file-lock"
 import { verifyProfileAccount } from "./guard"
 import { renderTopic, renderTopLevel } from "./help"
 import { resolveSecretStore, SECRETS_SERVICE, SecretStoreLockedError, SecretStoreReadError } from "./keychain"
@@ -161,6 +165,7 @@ import { maybeWriteUpdateNotice } from "./update-notice"
 import { appendEvmRecordForTrade } from "./vault/evm-tee"
 import type { HelperRun } from "./vault/fido2"
 import { RELEASE_POLICY } from "./vault/release-policy"
+import { inspectConfigDir } from "./vault/store"
 import { CLI_VERSION } from "./version"
 
 interface GlobalFlags {
@@ -183,6 +188,12 @@ function extractGlobalFlags(argv: string[]): { rest: string[]; flags: GlobalFlag
   const flags: GlobalFlags = { json: false, help: false, version: false, noVerifyAccount: false }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
+    // `--` ends the options: keep it and everything after it verbatim for the command's parser,
+    // so `keys revoke -- --help` passes "--help" as a positional instead of asking for help.
+    if (arg === "--") {
+      rest.push(...argv.slice(i))
+      break
+    }
     if (arg === "--json") flags.json = true
     else if (arg === "--plain") flags.plain = true
     else if (arg === "--no-color") flags.noColor = true
@@ -254,8 +265,6 @@ const COMMANDS: Record<string, CommandRoute> = {
   fees: { bare: feesList, subcommands: { claim: feesClaim } },
   // BE-723 (Plans v2 P6): the served plan table. Public, so it reads and sends no credential.
   plans: { bare: plans },
-  // BE-2184 (cli-account-create spec 5): a staging test member from fleet keychain items, no browser.
-  accounts: { subcommands: { create: accountsCreate } },
   // x402 C4 (BE-1875): forensics and the vamp finder may answer a per-use 402, paid from a vault
   // key inside the local spending rules (src/x402/), or shown and not paid.
   // Token page About (BE-1959, token pages spec 7): `about` and `history` are public reads;
@@ -295,7 +304,7 @@ const COMMANDS: Record<string, CommandRoute> = {
     },
   },
   // x402 C4 (spec 7.3): Quant's terms over the key route, which a paid Quant turn needs first.
-  quant: { subcommands: { terms: quantTerms } },
+  quant: { subcommands: { ask: quantAsk, terms: quantTerms } },
   lab: { subcommands: { status: labStatus, replay: labReplay, runners: labRunners, edges: labEdges } },
   // x402 C7 (BE-1878): Pro or Max by x402 from a vault key, the wallet-as-identity signup, and the
   // local auto-renew flag. Plan payments are outside the per-use limits (spec 10.3).
@@ -353,7 +362,11 @@ const COMMANDS: Record<string, CommandRoute> = {
       update: keysUpdate,
       limit: keysLimit,
       self: keysSelf,
+      // BE-2648: a new secret for the same key; --finish ends the old secret's grace window.
+      rotate: keysRotate,
       revoke: keysRevoke,
+      stop: keysStop,
+      resume: keysResume,
       wallets: keysWallets,
       // Key signers K3: `keys signer approve|move`, a second word of their own (like vault factor).
       signer: keysSigner,
@@ -377,6 +390,8 @@ const COMMANDS: Record<string, CommandRoute> = {
       "allow-launch": walletsAllowLaunch,
       "disallow-launch": walletsDisallowLaunch,
       "close-empty": walletsCloseEmpty,
+      // BE-2698: opens the console's grant-only step; the grant itself is the member's browser.
+      authorize: walletsAuthorize,
     },
     bare: wallets,
   },
@@ -564,8 +579,6 @@ export const NEVER_GUARDED = new Set([
   "verify",
   // BE-723: `GET /agent/plans` is public; the command acts as no identity.
   "plans",
-  // BE-2184: `accounts create` makes a new account and its profile; there is no identity yet to guard.
-  "accounts",
   "token",
   // BE-2119: the token card route is public and reads no key; `scan` acts as no identity.
   "scan",
@@ -614,6 +627,21 @@ export async function run(argv: string[], deps: Deps): Promise<number> {
       writeLocalFailure(
         deps,
         { code: PROFILE_CORE_OWNED, message: error.message, suggestion: CORE_OWNED_SUGGESTION },
+        !("error" in parsed) && parsed.flags.json,
+      )
+      return 1
+    }
+    if (error instanceof ConfigDirUnwritableError) {
+      // BE-2712 (D3): a credential write that cannot create or write the config directory.
+      const parsed = extractGlobalFlags(argv)
+      writeLocalFailure(
+        deps,
+        {
+          code: error.code,
+          message: error.message,
+          suggestion: error.suggestion,
+          details: { path: error.path, errno: error.errno },
+        },
         !("error" in parsed) && parsed.flags.json,
       )
       return 1
@@ -776,12 +804,9 @@ async function runCommand(argv: string[], deps: Deps): Promise<number> {
   // (list, add, and -- Tasks 3 and 4 -- use/rename/remove), and `profile use` is the way OUT of
   // resolveProfileName's "several profiles, none selected" refusal, so it cannot be gated by it.
   const isProfileCommand = cmd === "profile"
-  // `accounts create` makes the profile it names (`--profile`, default `<env>-<name>`) and acts as no
-  // stored identity, so it resolves none: the raw flag reaches it as `profileFlag`.
-  const isAccountsCreate = cmd === "accounts" && sub === "create"
   const resolution = isAuthLogin
     ? resolveProfileNameForLogin(config, { flag: flags.profile, env: deps.env })
-    : isProfileCommand || isAccountsCreate
+    : isProfileCommand
       ? ({ ok: true, name: undefined } as const)
       : resolveProfileName(config, { flag: flags.profile, env: deps.env })
   if (!resolution.ok) {
@@ -1119,6 +1144,7 @@ export async function buildRealDeps(): Promise<Deps> {
     // The real home, so every default path is the path this CLI has always built (BE-274, D1).
     // Only `createTestDeps` injects anything else.
     homedir,
+    inspectConfigDir,
     // Imported lazily so the MCP server and its transport are only pulled in when `candle mcp`
     // actually runs. The module is bundled into this binary either way, but `./server` connects a
     // transport the moment it is asked to run, and every other command should stay untouched by

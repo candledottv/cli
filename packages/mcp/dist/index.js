@@ -6649,7 +6649,8 @@ function buildRequest(name, args, cfg) {
     case "candle_get_operation": {
       const apiKey = requireApiKey2(cfg);
       const { clientId: clientId2, kind } = args;
-      const path = kind === "launch" ? `/api/v1/launch/headless/jobs/${encodeURIComponent(clientId2)}` : `/api/v1/trade/agent/jobs/${encodeURIComponent(clientId2)}`;
+      const id = encodeURIComponent(clientId2);
+      const path = kind === "launch" ? `/api/v1/launch/headless/jobs/${id}` : kind === "swap" ? `/api/v1/agent/swap/by-client-id/${id}` : `/api/v1/trade/agent/jobs/${id}`;
       return { url: `${base2}${path}`, init: { method: "GET", headers: jsonHeaders(apiKey) } };
     }
     case "candle_get_staking": {
@@ -6781,10 +6782,10 @@ async function callAndRelay(name, args, cfg, doFetch) {
     ...res.ok ? {} : { isError: true }
   };
 }
-var OPERATION_NOT_FOUND_RULE = "No record exists under this id in the ledger `kind` asked. That does not prove the write did " + "not run: a write that is still starting has no record yet. If a write was sent with this id, " + "send the SAME request again with the SAME id. It returns the stored outcome, or reports the one " + "still running. It never executes a second time. A refusal of that resend (a conflict or a " + "limit) is an answer about the resend, not about the write: read candle_get_operation again " + "before reporting an outcome. Never send it under a new id: a new id is a second trade or " + "launch. Check `kind`: a swap id is not read here, so replay the swap with its `clientSwapId`.";
+var OPERATION_NOT_FOUND_RULE = "No record exists under this id in the ledger `kind` asked. That does not prove the write did " + "not run: a write that is still starting has no record yet. If a write was sent with this id, " + "send the SAME request again with the SAME id. It returns the stored outcome, or reports the one " + "still running. It never executes a second time. A refusal of that resend (a conflict or a " + "limit) is an answer about the resend, not about the write: read candle_get_operation again " + "before reporting an outcome. Never send it under a new id: a new id is a second trade, swap or " + "launch. Check `kind`: an id read under the wrong kind has no record there. A swap sent without " + "a `clientSwapId` has no record at all.";
 function operationNotFoundNext(clientId2, kind) {
-  const other = kind === "launch" ? "trade" : "launch";
-  return `No ${kind} record under id "${clientId2}" yet. That does not prove the write did not run: a ` + "write that is still starting has no record yet. If a write was sent with this id, send the " + `SAME request again with the SAME id ("${clientId2}"). It returns the stored outcome, or reports ` + "the one still running. It never executes a second time. A refusal of that resend (a conflict " + "or a limit) is an answer about the resend, not about the write: read candle_get_operation " + `again before reporting an outcome. Never send it under a new id: a new id is a second ${kind}. ` + `This read asked kind "${kind}": a ${other} id has no record there, and a swap id is not read by ` + "this tool at all, so replay the swap with its clientSwapId.";
+  const others = ["trade", "swap", "launch"].filter((k) => k !== kind).join(" or ");
+  return `No ${kind} record under id "${clientId2}" yet. That does not prove the write did not run: a ` + "write that is still starting has no record yet. If a write was sent with this id, send the " + `SAME request again with the SAME id ("${clientId2}"). It returns the stored outcome, or reports ` + "the one still running. It never executes a second time. A refusal of that resend (a conflict " + "or a limit) is an answer about the resend, not about the write: read candle_get_operation " + `again before reporting an outcome. Never send it under a new id: a new id is a second ${kind}. ` + `This read asked kind "${kind}": a ${others} id has no record there.`;
 }
 async function getOperation(args, cfg, doFetch) {
   const { url, init } = buildRequest("candle_get_operation", args, cfg);
@@ -6799,7 +6800,7 @@ async function getOperation(args, cfg, doFetch) {
     const code = body?.error?.code;
     if (code === "JOB_NOT_FOUND") {
       const { clientId: clientId2, kind } = args;
-      const next = operationNotFoundNext(clientId2, kind === "launch" ? "launch" : "trade");
+      const next = operationNotFoundNext(clientId2, kind === "launch" || kind === "swap" ? kind : "trade");
       text = JSON.stringify({ ...body, outcome: "unknown", next });
     }
   }
@@ -6912,8 +6913,8 @@ var getAgentPositionsShape = {
   kind: z9.enum(["spot", "perp"]).optional().describe("Only spot tokens or only Hyperliquid perps; omit for both")
 };
 var getOperationShape = {
-  clientId: z9.string().describe("The clientTradeId or clientLaunchId the write used, or that the tool echoed back to you"),
-  kind: z9.enum(["trade", "launch"]).describe("Which rail the id belongs to. Required: ids are caller-chosen strings with no shape to dispatch on")
+  clientId: z9.string().describe("The clientTradeId, clientSwapId or clientLaunchId the write used, or that the tool echoed back to you"),
+  kind: z9.enum(["trade", "swap", "launch"]).describe("Which rail the id belongs to. Required: ids are caller-chosen strings with no shape to dispatch on")
 };
 var vampCandidatesShape = {
   limit: z9.number().optional().describe("Entries to return, 1 to 50 (default 20)"),
@@ -7160,9 +7161,7 @@ function registerToolSubset(server, options) {
   }, async (args) => callAndRelay("candle_get_market", args, getConfig(), doFetch));
   register("candle_token_forensics", {
     title: "Token forensics",
-    description: `Gate a buy before making it: who launched it (resolved on-chain; pump.fun's shared updateAuthority is never the developer; when no developer is on chain, deployer.attribution names the launchpad or issuer instead, e.g. launched via stonk.fun or issued by xStocks), their went-to-zero rate and last coins, who bought in the deploy window (the creator's own wallets are marked disclosed; strangers in the same slot are the bundle signal), same-funder insider share, same-funder deployer cluster, and safety.summary with six sourced flags (mintAuthority, freezeAuthority, tokenExtensions, lpLock, sellability, liquidityDrain). Refuse an unprompted buy when flagged; incomplete or unknown is not clearance. launch.deployerLaunches is an inclusive informational count, never a warning. Every measurement carries a coverage note -- 'unavailable' is not 'clean'. No key needed.
-
-MARKET_NOT_FOUND means Candle has no market for that token and this could not run. That is also not 'clean': report that you could not check it, rather than reporting the token as safe. That refusal now carries error.coverage -- covered:false, a reason ('external_launchpad' when the token launched somewhere else, 'unknown_mint' when nobody has indexed it), the launchpad when known, and every check that consequently did not run. Read it instead of guessing. Most of the feed, and any Solana mint Jupiter's index knows, now answers with a partial report instead. On Hood, a token Candle did not launch names its launch account (deployer.method cvc_launch_account) for pons.family and pools.trade launches, with no record of earlier coins; other Hood launchpads return no developer.`,
+    description: "Gate a buy before making it: who launched it (resolved on-chain; pump.fun's shared updateAuthority is never the developer; when no developer is on chain, deployer.attribution names the launchpad or issuer instead, e.g. launched via stonk.fun or issued by xStocks), their went-to-zero rate and last coins, who bought in the deploy window (the creator's own wallets are marked disclosed; strangers in the same slot are the bundle signal), same-funder insider share, same-funder deployer cluster, and safety.summary with six sourced flags (mintAuthority, freezeAuthority, tokenExtensions, lpLock, sellability, liquidityDrain). Refuse an unprompted buy when flagged; incomplete or unknown is not clearance. deployer.priorLaunches is counted (pump.fun curves for a curve creator; record.count says the source); deployer.launcher is the wallet that sent the launch, often a launch tool's signer, never the developer; launch.deployerLaunches is that wallet's inclusive informational count, never a warning. Every measurement carries a coverage note -- 'unavailable' is not 'clean'. No key needed.\n\nMARKET_NOT_FOUND means Candle has no market for that token and this could not run. That is also not 'clean': report that you could not check it, rather than reporting the token as safe. That refusal now carries error.coverage -- covered:false, a reason ('external_launchpad' when the token launched somewhere else, 'unknown_mint' when nobody has indexed it), the launchpad when known, and every check that consequently did not run. Read it instead of guessing. Most of the feed, and any Solana mint Jupiter's index knows, now answers with a partial report instead. On Hood, a token Candle did not launch names its launch account (deployer.method cvc_launch_account) for pons.family and pools.trade launches, with no record of earlier coins; other Hood launchpads return no developer.",
     inputSchema: tokenForensicsShape
   }, async (args) => callAndRelay("candle_token_forensics", args, getConfig(), doFetch));
   register("candle_token_clusters", {
@@ -7294,13 +7293,13 @@ MARKET_NOT_FOUND means Candle has no market for that token and this could not ru
   });
   register("candle_get_operation", {
     title: "What happened to a write",
-    description: "Look up a trade or launch by the id its write used, and find out whether it landed. " + `Reads only; moves nothing.
+    description: "Look up a trade, swap or launch by the id its write used, and find out whether it landed. " + `Reads only; moves nothing.
 
 ` + "Call this after a timeout, after a restart, or any time you hold an id and do not know " + `the outcome. Do NOT re-send the write to find out.
 
-` + `Four answers, four different next moves:
+` + `The answers, and the next move for each:
 ` + "- `confirmed`/`failed`: it is over. `signature` proves the first, `errorCode` explains " + `the second.
-` + "- `built`/`submitted`: still in flight. Wait and ask again.\n" + `- 404 (\`JOB_NOT_FOUND\`): unknown, not an outcome. ${OPERATION_NOT_FOUND_RULE} The result ` + 'says the same in `outcome: "unknown"` and `next`.\n\n' + "Amounts come back RAW, deliberately: the answer you need after a timeout is the outcome, " + "and you already know what you asked for.",
+` + "- `built`/`submitted`: still in flight. Wait and ask again.\n" + "- kind `swap` (candle_swap's `clientSwapId`) answers `job.outcome` instead: `in_flight` " + "(ask again), `confirmed` (`job.hashes`), `failed` (refused before any broadcast; the SAME " + "request with the SAME id starts over), `partial` (`hashes[0]` landed, " + "a later leg did not) or `indeterminate` (broadcast, outcome unknown; check " + "`error.message`). `partial` and `indeterminate` are final for that id.\n" + `- 404 (\`JOB_NOT_FOUND\`): unknown, not an outcome. ${OPERATION_NOT_FOUND_RULE} The result ` + 'says the same in `outcome: "unknown"` and `next`.\n\n' + "Amounts come back RAW, deliberately: the answer you need after a timeout is the outcome, " + "and you already know what you asked for.",
     inputSchema: getOperationShape
   }, async (args) => getOperation(args, getConfig(), doFetch));
   register("candle_get_staking", {
@@ -7673,7 +7672,7 @@ START HERE — fourteen tools need NO credential. Call these first to confirm th
   candle_token_events     one token's signals, callouts and tracked-wallet trades, newest first, W or L on sells. kind filters the page on this server; page with nextCursor/before until null. Off until the deployment switches it on (503 TOKEN_EVENTS_DISABLED)
   candle_token_card       one token's card data: market, all-time high since launch, safety and same-name facts, tracked wallets in the last hour, each block with its source; null means no source, not zero. Off until the deployment switches it on (503 TOKEN_CARD_DISABLED)
   candle_resolve_token    a ticker or partial name -> mint address + chain
-  candle_token_forensics  call this before quoting or buying. Returns the on-chain developer (never a launchpad shared authority; deployer.attribution names the launchpad or issuer when no developer is on chain), their went-to-zero rate and last coins, who bought in the deploy window (strangers in the same slot are the bundle signal), same-funder insider share, same-funder cluster, and safety.summary with six sourced flags. Refuse an unprompted buy when flagged; incomplete or unknown is not clearance. launch.deployerLaunches is an inclusive informational count, never a warning
+  candle_token_forensics  call this before quoting or buying. Returns the on-chain developer (never a launchpad shared authority; deployer.attribution names the launchpad or issuer when no developer is on chain), their went-to-zero rate and last coins, who bought in the deploy window (strangers in the same slot are the bundle signal), same-funder insider share, same-funder cluster, and safety.summary with six sourced flags. Refuse an unprompted buy when flagged; incomplete or unknown is not clearance. deployer.priorLaunches is counted (pump.fun curves for a curve creator; record.count says the source); deployer.launcher is the wallet that sent the launch, often a launch tool's signer, never the developer; launch.deployerLaunches is that wallet's inclusive informational count, never a warning
   candle_token_clusters   optional third-party linked-wallet estimates for a Solana token, always a result: usually status unavailable with a reason, which is not zero clustered supply or clearance. Report its caveat with any figure; keep it separate from forensics
   candle_get_agent_profile  your own tier, caps and verified activity
   candle_list_agents      the agent directory: every published agent with its strategy, declared models, all-time P&L, trades and launches; sort newest, active or pnl

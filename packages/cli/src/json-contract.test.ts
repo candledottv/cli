@@ -266,7 +266,6 @@ const JSON_ANSWERING: { name: string; argv: string[] }[] = [
   { name: "verify", argv: ["verify"] },
   { name: "update --check", argv: ["update", "--check"] },
   // BE-2184: without --env and --name it is a usage envelope, before any read.
-  { name: "accounts create", argv: ["accounts", "create"] },
 ]
 
 const offlineFetch = (async () => {
@@ -407,6 +406,7 @@ test("R2.9 doctor row ids are stable across role-dependent labels", async () => 
       "install",
       "security_key_helper",
       "update",
+      "key_rotation",
       "key_signers",
       "signer_slot",
       "trade_path",
