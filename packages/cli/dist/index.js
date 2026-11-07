@@ -532,7 +532,7 @@ var init_terminal_theme = __esm(() => {
 });
 
 // src/version.ts
-var CLI_VERSION = "0.13.17";
+var CLI_VERSION = "0.13.18";
 
 // src/presentation.ts
 function terminalStyle(deps, stream, machine = false) {
@@ -11163,6 +11163,25 @@ var init_solana_alt = __esm(() => {
   ];
 });
 
+// src/account.ts
+async function fetchAccount(deps, apiUrl, apiKey) {
+  const identity = await apiRequest("/api/v1/agent/wallets/embedded", {
+    auth: "key",
+    credentials: { apiKey },
+    apiUrl,
+    fetch: deps.fetch,
+    env: deps.env
+  });
+  const body = identity.ok ? identity.body : undefined;
+  const account = body?.account;
+  if (account)
+    return { account, ...body?.username ? { username: body.username } : {} };
+  return { failure: identity.ok ? "no account in the response" : identity.message };
+}
+var init_account = __esm(() => {
+  init_client();
+});
+
 // src/profiles.ts
 function assertOrdinaryProfile(config, profile) {
   if (profile !== undefined && config.profiles?.[profile]?.apiKeyItem !== undefined) {
@@ -11297,7 +11316,7 @@ function credentialEnvOverrides(env) {
 }
 function identityLine(profile, account, apiUrl, overrides, username, options = {}) {
   const address = account === undefined ? undefined : shortId(account, options.full);
-  const shown = overrides?.length ? `unknown (${overrides.join(", ")} override)` : username && address ? `${username} (${address})` : address ?? "unknown";
+  const shown = overrides?.length ? address ? `${address} (${overrides.join(", ")} override)` : `unknown (${overrides.join(", ")} override)` : username && address ? `${username} (${address})` : address ?? "unknown";
   const name = profile ?? "none";
   const host = apiUrl.replace(/^https:\/\//i, "").replace(/\/+$/, "");
   const sep = options.style ? symbols(options.style).note : "·";
@@ -11308,7 +11327,20 @@ async function printIdentity(ctx) {
     return;
   const config = await ctx.deps.readConfig();
   const fields2 = effectiveProfileFields(config, ctx.profile);
-  const line = identityLine(ctx.profile, fields2.account, ctx.apiUrl, credentialEnvOverrides(ctx.deps.env), fields2.username, identityStyle(ctx.deps, "stdout"));
+  const overrides = credentialEnvOverrides(ctx.deps.env);
+  let account = fields2.account;
+  let username = fields2.username;
+  if (overrides.length > 0) {
+    account = undefined;
+    username = undefined;
+    const key = ctx.deps.env.CANDLE_API_KEY?.trim();
+    if (key) {
+      const lookup = await fetchAccount(ctx.deps, ctx.apiUrl, key);
+      if (lookup.account)
+        account = lookup.account;
+    }
+  }
+  const line = identityLine(ctx.profile, account, ctx.apiUrl, overrides.length > 0 ? overrides : undefined, username, identityStyle(ctx.deps, "stdout"));
   ctx.deps.stdout.write(`${line}
 
 `);
@@ -11352,6 +11384,7 @@ function profileTable(config, now) {
 }
 var ProfileFleetOnlyError, PRE_PROFILE_FIELDS, API_KEY_PREFIXES, API_KEY_RANDOM_LENGTH = 43, INVALID_RPC_HOST = "invalid (fix with profile set)";
 var init_profiles = __esm(() => {
+  init_account();
   init_presentation();
   init_render();
   ProfileFleetOnlyError = class ProfileFleetOnlyError extends Error {
@@ -28989,13 +29022,13 @@ __export(exports_vault_support, {
   runVaultCommand: () => runVaultCommand,
   requireVaultRaw: () => requireVaultRaw,
   requireTty: () => requireTty,
-  requirePromptStreams: () => requirePromptStreams,
   refusePromptsWithoutTerminal: () => refusePromptsWithoutTerminal,
   refuseEnvPassphrase: () => refuseEnvPassphrase,
   openWithTypedPassphrase: () => openWithTypedPassphrase,
   nonDefaultVaultFooter: () => nonDefaultVaultFooter,
   missingVault: () => missingVault,
   menuSafeText: () => menuSafeText,
+  isNoTerminalRefusal: () => isNoTerminalRefusal,
   groupAddress: () => groupAddress,
   findExternalEntry: () => findExternalEntry,
   factorMenu: () => factorMenu,
@@ -29039,21 +29072,22 @@ function requireTty(ctx, what) {
   }));
   return false;
 }
-function requirePromptStreams(ctx, what) {
-  if (ctx.deps.isTTY.stdin && ctx.deps.isTTY.stderr)
-    return true;
-  writeVaultFailure(ctx, new VaultError("VAULT_UNLOCK_FAILED", `${what} needs a terminal for the passphrase prompt: standard input and standard error must both be a terminal. Standard output may be redirected; that is where the listing goes.`));
-  return false;
-}
 function refusePromptsWithoutTerminal(ctx, what) {
   if (ctx.deps.isTTY.stdin && ctx.deps.isTTY.stderr)
     return ctx;
   const refuse2 = async () => {
-    throw new VaultError("VAULT_UNLOCK_FAILED", `${what} needs a terminal here: this unlock reads a vault passphrase, a security key PIN or a choice from a prompt, and standard input and standard error must both be a terminal for that. Standard output may be redirected.`, {
+    throw tagNoTerminal(new VaultError("VAULT_UNLOCK_FAILED", `${what} needs a terminal here: this unlock reads a vault passphrase, a security key PIN or a choice from a prompt, and standard input and standard error must both be a terminal for that. Standard output may be redirected.`, {
       suggestion: "Run it from a terminal, or pass --factor touch-id or --factor passkey to unlock with a factor that reads no prompt. No environment variable or flag supplies a passphrase or PIN."
-    });
+    }));
   };
   return { ...ctx, deps: { ...ctx.deps, promptSecret: refuse2, promptLine: refuse2 } };
+}
+function tagNoTerminal(error) {
+  noTerminalRefusals.add(error);
+  return error;
+}
+function isNoTerminalRefusal(error) {
+  return error instanceof VaultError && noTerminalRefusals.has(error);
 }
 function vaultPathFor(ctx, parsed) {
   const flag = parsed.values["--keystore"];
@@ -29674,7 +29708,7 @@ function takeRepeatedFlag(args, flag) {
   }
   return { values, rest };
 }
-var PASSPHRASE_ONLY_PREFIX = "Passphrase only: ";
+var noTerminalRefusals, PASSPHRASE_ONLY_PREFIX = "Passphrase only: ";
 var init_vault_support = __esm(() => {
   init_args();
   init_presentation();
@@ -29690,6 +29724,7 @@ var init_vault_support = __esm(() => {
   init_platform();
   init_sidecar();
   init_store();
+  noTerminalRefusals = new WeakSet;
 });
 
 // src/vault/ed25519.ts
@@ -38566,7 +38601,7 @@ var init_token_clusters = __esm(() => {
 });
 
 // ../mcp/src/version.ts
-var SERVER_VERSION = "0.10.29";
+var SERVER_VERSION = "0.10.30";
 
 // ../mcp/src/update-notice.ts
 function newer(a, b) {
@@ -40424,6 +40459,12 @@ async function executeTrade(args, cfg, doFetch) {
   let amountRaw;
   let resolved = {};
   let paper = isPaperFlag(args.paper);
+  const deferExecution = isPaperFlag(args.deferExecution);
+  if (deferExecution && paper) {
+    return errText("deferExecution cannot be combined with paper; a paper trade records a quote and never executes", {
+      clientTradeId
+    });
+  }
   try {
     if (args.side === "buy") {
       const amount = args.amount;
@@ -40532,6 +40573,9 @@ async function executeTrade(args, cfg, doFetch) {
   } catch (err) {
     return errText(err instanceof Error ? err.message : String(err), { clientTradeId });
   }
+  if (deferExecution && paper) {
+    return errText("deferExecution needs a live holding, and this sell resolved to the paper book (the wallet holds none of the mint); a paper trade never executes", { clientTradeId });
+  }
   const posted = await postJson(`${base(cfg)}/api/v1/trade/agent/build`, apiKey, {
     clientTradeId,
     mint: args.mint,
@@ -40541,7 +40585,8 @@ async function executeTrade(args, cfg, doFetch) {
     payer: { type: "main" },
     ...args.quoteAsset !== undefined ? { quoteAsset: args.quoteAsset } : {},
     ...args.maxSlippageBps !== undefined ? { maxSlippageBps: args.maxSlippageBps } : {},
-    ...paper ? { paper: true } : {}
+    ...paper ? { paper: true } : {},
+    ...deferExecution ? { deferExecution: true } : {}
   }, doFetch);
   if ("thrown" in posted)
     return transportError("clientTradeId", clientTradeId, posted.thrown);
@@ -45166,6 +45211,13 @@ function buildRequest(name, args, cfg) {
       const path = kind === "launch" ? `/api/v1/launch/headless/jobs/${id}` : kind === "swap" ? `/api/v1/agent/swap/by-client-id/${id}` : `/api/v1/trade/agent/jobs/${id}`;
       return { url: `${base2}${path}`, init: { method: "GET", headers: jsonHeaders(apiKey) } };
     }
+    case "candle_trade_execute": {
+      const { clientTradeId } = args;
+      return {
+        url: `${base2}/api/v1/trade/agent/execute`,
+        init: { method: "POST", headers: jsonHeaders(requireApiKey2(cfg)), body: JSON.stringify({ clientTradeId }) }
+      };
+    }
     case "candle_get_staking": {
       return { url: `${base2}/api/v1/agent/staking`, init: { method: "GET", headers: jsonHeaders(requireApiKey2(cfg)) } };
     }
@@ -45732,7 +45784,7 @@ function registerToolSubset(server, options) {
   }, async (args) => callAndRelay("candle_get_profile_pnl", args, getConfig(), doFetch));
   register("candle_get_profile_trades", {
     title: "Read an agent profile's trade history",
-    description: "Orders, actual fills, fees, timestamps and transaction hashes for this profile. Page by time with " + "`since`, `until` and `cursor` (continue with the response's `nextCursor`). Includes FAILED " + "trades, with an errorCode saying why each did not go through, so this answers 'what happened to " + "my order' as well as 'what did I trade'. Reads only; moves nothing.",
+    description: "Orders, actual fills, fees, timestamps and transaction hashes for this profile. Page by time with " + "`since`, `until` and `cursor` (continue with the response's `nextCursor`). Includes FAILED " + "trades, with an errorCode saying why each did not go through, so this answers 'what happened to " + "my order' as well as 'what did I trade'. The profile's swaps are listed among the trades by " + "time, each with kind 'swap', rail ('swap' for candle_swap, 'build' for the CLI's build and " + "submit), fromAsset, toAsset and amountRaw; a candle_swap made without a clientSwapId is not " + "recorded, so it is not listed. Reads only; moves nothing.",
     inputSchema: profileTradesShape
   }, async (args) => callAndRelay("candle_get_profile_trades", args, getConfig(), doFetch));
   register("candle_get_paper_inventory", {
@@ -45830,6 +45882,13 @@ function registerToolSubset(server, options) {
     const result = await executeTrade(args, getConfig(), doFetch);
     return { content: [{ type: "text", text: result.text }], ...result.isError ? { isError: true } : {} };
   });
+  register("candle_trade_execute", {
+    title: "Execute a deferred trade",
+    description: "Execute a trade you built with candle_trade and deferExecution: true. MOVES REAL FUNDS: Candle signs " + "the plan it kept back from the build with the account's own delegation and broadcasts it. Takes the " + "clientTradeId and nothing else, so nothing you send can change what gets signed; to change the trade, " + `build a new one.
+
+` + "Exactly one execution per build. Calling again never broadcasts a second time: it returns the stored " + "result once the first has confirmed, and a 409 IDEMPOTENCY_CONFLICT while the outcome is still " + "unknown (read candle_get_operation with the clientTradeId, kind trade, before doing anything else). " + "More than 30 minutes after the build it is 409 QUOTE_EXPIRED: build again for a fresh quote. A " + "trade built without deferExecution has already executed and is refused here.",
+    inputSchema: tradeExecuteShape
+  }, async (args) => callAndRelay("candle_trade_execute", args, getConfig(), doFetch));
   register("candle_atomic_launch_dry_run", {
     title: "Dry-run an atomic Solana launch",
     description: "Check a Solana launch bundled with first buys and price each buy, without building anything. Runs the " + "same checks as the atomic build, in the same order (payers, Believer check, fee and spend limits, the " + "key's transaction cap), then returns the launch preview (curveTerms) and one fill per first buy: the " + "tokens it would receive and the floor the build would sign it at. Reads only; moves nothing, reserves " + "nothing, and the clientLaunchId stays unused. It does not check balances, the daily cap, or the " + "transaction's size, so the real launch can still refuse. Needs launch:write, swap:write and Pro or Max.",
@@ -46038,7 +46097,7 @@ async function registerEligibleProfileTool(server, env = process.env, doFetch = 
   }
   return eligible;
 }
-var VAMP_CANDIDATES_DESCRIPTION, localProfileTools, STAKING_DISCLOSURE = "No instant unstake. Read pool.withdrawalTimelockSeconds for the wait. Solana rewards accrue to the holding wallet. sCNDL in any eligible account wallet counts toward Pro and earns the account's Hood staking reward, except a wallet another account also claims, wallets past the 200-wallet cap, and an account with no EVM wallet. CNDL in a pending withdrawal counts toward nothing for Pro.", stakingWriteShape, TOOL_NAMES, LAB_TOOL_NAMES, PROFILE_EDIT_TOOL_NAMES, isProfileEditTool = (name) => PROFILE_EDIT_TOOL_NAMES.includes(name), OPERATION_NOT_FOUND_RULE, getMarketShape, priceHistoryShape, TOKEN_EVENTS_LIMIT_MESSAGE = "limit must be a whole number from 1 to 1000", tokenEventsLimit, TOKEN_EVENTS_KIND_NOTE = "kept back from the request and applied to the returned page by this server, so a filtered page can be shorter than limit while older events of other kinds remain: page with nextCursor as before until it is null", tokenCardShape, tokenEventsShape, tokenForensicsShape, FEED_LIMIT_MESSAGE = "limit must be a whole number from 1 to 200", feedLimit, getFeedShape, reportActivityShape, getAgentProfileShape, listAgentsShape, createPostShape, deletePostShape, listAgentPostsShape, getAgentPositionsShape, getOperationShape, vampCandidatesShape, getFeesShape, atomicPayerShape, atomicLaunchDryRunShape, claimFeesShape, resolveTokenShape, profileWalletsShape, profilePnlShape, profileTradesShape, noArgsShape, setProfileWalletsShape, swapShape, tradeShape, tokenImageUrl, tokenBannerUrl, localImageShape, localLaunchTokenShape, localLaunchAndSeedShape, IMAGE_PATH_DISCLOSURE, transferShape, sweepShape, PROFILE_PNL_HYPERLIQUID;
+var VAMP_CANDIDATES_DESCRIPTION, localProfileTools, STAKING_DISCLOSURE = "No instant unstake. Read pool.withdrawalTimelockSeconds for the wait. Solana rewards accrue to the holding wallet. sCNDL in any eligible account wallet counts toward Pro and earns the account's Hood staking reward, except a wallet another account also claims, wallets past the 200-wallet cap, and an account with no EVM wallet. CNDL in a pending withdrawal counts toward nothing for Pro.", stakingWriteShape, TOOL_NAMES, LAB_TOOL_NAMES, PROFILE_EDIT_TOOL_NAMES, isProfileEditTool = (name) => PROFILE_EDIT_TOOL_NAMES.includes(name), OPERATION_NOT_FOUND_RULE, getMarketShape, priceHistoryShape, TOKEN_EVENTS_LIMIT_MESSAGE = "limit must be a whole number from 1 to 1000", tokenEventsLimit, TOKEN_EVENTS_KIND_NOTE = "kept back from the request and applied to the returned page by this server, so a filtered page can be shorter than limit while older events of other kinds remain: page with nextCursor as before until it is null", tokenCardShape, tokenEventsShape, tokenForensicsShape, FEED_LIMIT_MESSAGE = "limit must be a whole number from 1 to 200", feedLimit, getFeedShape, reportActivityShape, getAgentProfileShape, listAgentsShape, createPostShape, deletePostShape, listAgentPostsShape, getAgentPositionsShape, getOperationShape, vampCandidatesShape, getFeesShape, atomicPayerShape, atomicLaunchDryRunShape, claimFeesShape, resolveTokenShape, profileWalletsShape, profilePnlShape, profileTradesShape, noArgsShape, setProfileWalletsShape, swapShape, tradeShape, tradeExecuteShape, tokenImageUrl, tokenBannerUrl, localImageShape, localLaunchTokenShape, localLaunchAndSeedShape, IMAGE_PATH_DISCLOSURE, transferShape, sweepShape, PROFILE_PNL_HYPERLIQUID;
 var init_tools = __esm(() => {
   init_zod();
   init_client2();
@@ -46103,6 +46162,7 @@ var init_tools = __esm(() => {
     "candle_get_agent_positions",
     "candle_get_plans",
     "candle_trade",
+    "candle_trade_execute",
     "candle_launch_and_seed",
     "candle_atomic_launch_dry_run",
     "candle_swap",
@@ -46324,7 +46384,11 @@ var init_tools = __esm(() => {
     quoteAsset: exports_external.string().optional().describe('What the wallet spends on a buy or receives on a sell: "sol", "usdc" or "cndl" on Solana, ' + '"eth" or "usdg" on Hood. Echoing the `quoteAsset` a quote (POST /api/v1/trade/agent/quote) returned is safe. On Solana it applies only ' + "to an arbitrary mint Candle never launched (a buy or sell works on any plan) and is ignored for a Candle token, " + "whose quote comes from the token itself. On Hood it is the settlement asset of a DEX " + "trade; a USDG buy adds an approval transaction an ETH buy does not. It is not the route: " + "the cheapest path to the asset is chosen separately. Defaults to sol / ETH settlement."),
     maxSlippageBps: exports_external.number().int().min(0).max(5000).optional().describe("Slippage bound in bps, 0-5000 (50%). Server defaults to 100 (1%)"),
     clientTradeId: exports_external.string().optional().describe("Idempotency key. Auto-generated when omitted and echoed in the result. Retrying with the " + "SAME id is safe (idempotent replay); a new id is a SECOND trade."),
-    paper: exports_external.preprocess((value) => value === "true" || value === 1 || value === "1" ? true : value === "false" || value === 0 || value === "0" ? false : value, exports_external.boolean().optional().describe("Rehearse instead of trading. The request passes every admission rule a live trade passes " + "-- the same planner, spend gate, key cap and loss limits -- and records the quote, but " + "nothing is ever broadcast and no funds move. Use it to check that a strategy is admitted " + "before risking anything on it. A paper fill is optimistic by construction: it books the " + "quoted price, so the gap between a paper arm and a live one IS the execution cost. " + "A sell of a mint this key already paper-bought also closes that paper book when the " + "live wallet is empty, even if this flag is omitted."))
+    paper: exports_external.preprocess((value) => value === "true" || value === 1 || value === "1" ? true : value === "false" || value === 0 || value === "0" ? false : value, exports_external.boolean().optional().describe("Rehearse instead of trading. The request passes every admission rule a live trade passes " + "-- the same planner, spend gate, key cap and loss limits -- and records the quote, but " + "nothing is ever broadcast and no funds move. Use it to check that a strategy is admitted " + "before risking anything on it. A paper fill is optimistic by construction: it books the " + "quoted price, so the gap between a paper arm and a live one IS the execution cost. " + "A sell of a mint this key already paper-bought also closes that paper book when the " + "live wallet is empty, even if this flag is omitted.")),
+    deferExecution: exports_external.preprocess((value) => value === "true" || value === 1 || value === "1" ? true : value === "false" || value === 0 || value === "0" ? false : value, exports_external.boolean().optional().describe("Quote first, spend later. The trade is built and the result carries the quote with " + 'status "built"; NOTHING is signed or spent until candle_trade_execute is called with the same ' + "clientTradeId. The build holds for 30 minutes; executing after that is QUOTE_EXPIRED and you " + "build again for a fresh quote. Rebuilding with the same clientTradeId re-quotes it, until it has " + "been sent to candle_trade_execute. There is no cancel: let an unwanted build expire. Cannot be " + "combined with `paper`."))
+  };
+  tradeExecuteShape = {
+    clientTradeId: exports_external.string().min(1).describe("The clientTradeId of a candle_trade built with deferExecution: true. Nothing else is accepted.")
   };
   tokenImageUrl = launchSchemaField(launchTokenShape, "imageUrl");
   tokenBannerUrl = launchSchemaField(launchTokenShape, "bannerUrl");
@@ -74149,29 +74213,11 @@ ${USAGE3}` : USAGE3, ctx.json);
 }
 
 // src/commands/auth.ts
-import { homedir as homedir3 } from "node:os";
-import { join as join9 } from "node:path";
-
-// src/account.ts
-init_client();
-async function fetchAccount(deps, apiUrl, apiKey) {
-  const identity = await apiRequest("/api/v1/agent/wallets/embedded", {
-    auth: "key",
-    credentials: { apiKey },
-    apiUrl,
-    fetch: deps.fetch,
-    env: deps.env
-  });
-  const body = identity.ok ? identity.body : undefined;
-  const account = body?.account;
-  if (account)
-    return { account, ...body?.username ? { username: body.username } : {} };
-  return { failure: identity.ok ? "no account in the response" : identity.message };
-}
-
-// src/commands/auth.ts
+init_account();
 init_agent_key_access();
 init_args();
+import { homedir as homedir3 } from "node:os";
+import { join as join9 } from "node:path";
 
 // src/checks.ts
 init_client();
@@ -76567,9 +76613,9 @@ var HELP = {
     group: "Account",
     intro: "Holdings, prices and value of every wallet",
     summary: "Every wallet's holdings, prices and value on Solana and Hood (vault read over your own RPCs)",
-    description: "Vault, TEE and embedded wallets on Solana and Hood, each token with its chain, amount, price and value, then subtotals per group and per chain and one total. TEE and embedded balances, on both chains, come from Candle. Solana vault and external wallets are read over your own Solana RPC, and Candle is sent only the mints they hold, for prices. EVM vault keys are read over your own EVM RPC for ETH and USDG only (the CLI cannot list other tokens), which must be Hood's (chain id 4663); any other chain is refused. Their prices come from Candle by asset (ETH, USDG), never by address. Unpriced tokens are shown as unpriced with the reason (no-market-row, stale-mark, unusable-price, source-unavailable) and left out of the total. A wallet that could not be read in full is marked not read, the footer names its chain, and the exit is 3. Where Candle serves LP, each Solana TEE wallet's DAMM v2 positions follow the tokens (share of the pool plus unclaimed fees, valued by Candle at the same marks) and count in the total; a position whose pool could not be read is shown as not read and the total says it is partial. A bridge moves value between the chain subtotals; it is not a trade. With a filter, only the wallets whose label or address contains it are read and shown, the subtotals and total are for those wallets, and the first line says how many matched. When Candle listed only part of the account's wallets, the result stays partial even if every wallet shown was read, and no match says so. After the totals, a Hyperliquid section (live from Hyperliquid, not in the ledger, and never in the total) lists each EVM TEE wallet's Hyperliquid account value, unrealized P&L, positions and risk at the default thresholds, read from Hyperliquid's public API on this machine; a failed read there is not read and the exit is 3. --chain solana and --no-perps read nothing from Hyperliquid.",
+    description: "Vault, TEE and embedded wallets on Solana and Hood, each token with its chain, amount, price and value, then subtotals per group and per chain and one total. TEE and embedded balances, on both chains, come from Candle. Solana vault and external wallets are read over your own Solana RPC, and Candle is sent only the mints they hold, for prices. EVM vault keys are read over your own EVM RPC for ETH and USDG only (the CLI cannot list other tokens), which must be Hood's (chain id 4663); any other chain is refused. Their prices come from Candle by asset (ETH, USDG), never by address. Unpriced tokens are shown as unpriced with the reason (no-market-row, stale-mark, unusable-price, source-unavailable) and left out of the total. A wallet that could not be read in full is marked not read, the footer names its chain, and the exit is 3. Where Candle serves LP, each Solana TEE wallet's DAMM v2 positions follow the tokens (share of the pool plus unclaimed fees, valued by Candle at the same marks) and count in the total; a position whose pool could not be read is shown as not read and the total says it is partial. A bridge moves value between the chain subtotals; it is not a trade. With a filter, only the wallets whose label or address contains it are read and shown, the subtotals and total are for those wallets, and the first line says how many matched. When Candle listed only part of the account's wallets, the result stays partial even if every wallet shown was read, and no match says so. After the totals, a Hyperliquid section (live from Hyperliquid, not in the ledger, and never in the total) lists each EVM TEE wallet's Hyperliquid account value, unrealized P&L, positions and risk at the default thresholds, read from Hyperliquid's public API on this machine; a failed read there is not read and the exit is 3. --chain solana and --no-perps read nothing from Hyperliquid. The vault is read only for its addresses, so the command needs no terminal: without one, a factor that asks nothing (--factor touch-id or passkey) still unlocks it, and otherwise the vault row says not read and the other groups are shown, but the result is partial: the total says so and the exit is 3. --no-vault leaves the vault out on purpose, and then the result can be complete (exit 0).",
     usage: [
-      "candle portfolio [<filter>] [--chain solana|hood] [--rpc-url <url>] [--evm-rpc-url <url>] [--no-perps] [--json]"
+      "candle portfolio [<filter>] [--chain solana|hood] [--rpc-url <url>] [--evm-rpc-url <url>] [--no-perps] [--no-vault] [--json]"
     ],
     rows: [
       {
@@ -76590,6 +76636,10 @@ var HELP = {
       {
         invocation: "--no-perps",
         description: "Skip the Hyperliquid section: send no EVM TEE address to Hyperliquid's public API"
+      },
+      {
+        invocation: "--no-vault",
+        description: "Leave the vault out: no unlock, and no vault address is sent to your RPC"
       },
       KEYSTORE_FLAG
     ],
@@ -77044,6 +77094,10 @@ var HELP = {
       },
       { invocation: "revoke <wallet-id>", description: "Revoke a linked wallet" },
       {
+        invocation: "allowlist [--all]",
+        description: "The account's withdrawal allowlist (the destinations candle transfer --to <label> resolves by). Any key reads it; approving an address is the owner's, in the agent console's Wallets tab (an API key cannot approve); an acting key can revoke one, a read-only key cannot. --all adds removed rows"
+      },
+      {
         invocation: "trust <label|address|id|prefix*>...",
         description: "Mark linked wallets yours, so agents can move funds into them (owner only; typed confirm)"
       },
@@ -77076,6 +77130,7 @@ var HELP = {
       "candle wallet authorize",
       "candle wallet import --chain solana --key-file ./signer.json",
       "candle wallet revoke wal_123",
+      "candle wallet allowlist",
       "candle wallet trust 'tr-*' 'dest-*'",
       "candle wallet allow-launch launcher-1",
       "candle wallet close-empty --keep EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
@@ -77956,6 +78011,7 @@ var TOOL_CLASSES = {
   candle_perps_risk: READ,
   candle_perps_thresholds: READ,
   candle_trade: card("trade", "clientTradeId"),
+  candle_trade_execute: card("trade"),
   candle_swap: card("swap", "clientSwapId"),
   candle_launch_token: card("launch", "clientLaunchId"),
   candle_launch_and_seed: card("launch", "clientLaunchId"),
@@ -78045,7 +78101,8 @@ async function readOnce(executor, target, writeKey) {
   if (!readsById(target))
     return { readable: false };
   const kind = target.kind === "launch" ? "launch" : "trade";
-  const outcome = await executor.execute("candle_get_operation", { clientId: target.opId, kind }, writeKey);
+  const clientId = target.tool === "candle_trade_execute" ? target.params.clientTradeId : target.opId;
+  const outcome = await executor.execute("candle_get_operation", { clientId, kind }, writeKey);
   if (outcome.state === "succeeded" || outcome.state === "pending") {
     const job = outcome.result?.job ?? outcome.result;
     const status = typeof job?.status === "string" ? job.status : "";
@@ -89536,8 +89593,7 @@ async function externalList(args, ctx) {
     return usage(ctx, `Unexpected argument: ${parsed.positionals[0]}`);
   if (!refuseEnvPassphrase(ctx))
     return 1;
-  if (!requireTty(ctx, "external list"))
-    return 1;
+  const promptCtx = refusePromptsWithoutTerminal(ctx, "external list");
   const { deps } = ctx;
   const resolvedVault = vaultPathFor(ctx, parsed);
   if ("error" in resolvedVault)
@@ -89545,7 +89601,7 @@ async function externalList(args, ctx) {
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
     const raw = await requireVaultRaw(ctx, resolvedVault);
-    const vault = hold((await unlockInteractively(ctx, path, raw, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
+    const vault = hold((await unlockInteractively(promptCtx, path, raw, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
     const externals = vault.index.entries.filter((entry) => entry.role === "external");
     const rows = externals.map((entry) => ({
       address: entry.address,
@@ -92206,6 +92262,8 @@ init_solana_lite();
 var NATIVE_MINT2 = "So11111111111111111111111111111111111111112";
 var LAMPORTS_PER_SIGNATURE = 5000n;
 var TOKEN_ACCOUNT_RENT_LAMPORTS = 2039280n;
+var BUYER_TALLY_RENT_LAMPORTS = 1461600n;
+var REGISTER_BUYER = [144, 92, 137, 46, 209, 220, 27, 164];
 var DEFAULT_UNITS_PER_INSTRUCTION = 200000n;
 var MAX_COMPUTE_UNITS = 1400000n;
 
@@ -92289,7 +92347,7 @@ function readLeg(tx, index, wallet3) {
     if (program === MEMO_PROGRAM_ID)
       continue;
     if (program !== undefined)
-      others.push({ program, data: ix.data });
+      others.push({ program, data: ix.data, accounts: accounts.map(key) });
   }
   if (unitPrice > 0n) {
     const units = unitLimit ?? (computed * DEFAULT_UNITS_PER_INSTRUCTION > MAX_COMPUTE_UNITS ? MAX_COMPUTE_UNITS : computed * DEFAULT_UNITS_PER_INSTRUCTION);
@@ -92297,12 +92355,36 @@ function readLeg(tx, index, wallet3) {
   }
   return { lamports, tokenOut, systemTransfers, others };
 }
+function isRegisterBuyer(data) {
+  return data.length >= 8 && REGISTER_BUYER.every((byte, i) => data[i] === byte);
+}
+function readRegisterBuyer(register, swap3, wallet3) {
+  if (register.program !== swap3.program)
+    throw new BundleReadError("leg 1 registers the buyer with another program");
+  if (register.data.length !== 12 || u323(register.data, 8) !== 0n)
+    throw new BundleReadError("leg 1 registers the buyer with a proof");
+  const [buyer, rentPayer, rules, tally] = register.accounts;
+  if (buyer !== wallet3)
+    throw new BundleReadError("leg 1 registers a buyer other than this wallet");
+  if (rules === undefined || tally === undefined || !swap3.accounts.includes(rules) || !swap3.accounts.includes(tally))
+    throw new BundleReadError("leg 1 registers the buyer for another pool than the one it buys");
+  return rentPayer === wallet3 ? BUYER_TALLY_RENT_LAMPORTS : 0n;
+}
 function readLaunchBundle(args) {
   const launch = readLeg(decodeLeg(args.legs[0], 0), 0, args.wallet);
   const buy = readLeg(decodeLeg(args.legs[1], 1), 1, args.wallet);
-  if (buy.others.length !== 1)
+  let registerLamports = 0n;
+  const first = buy.others[0];
+  if (first && isRegisterBuyer(first.data)) {
+    if (!args.rules)
+      throw new BundleReadError("leg 1 registers a buyer on a launch without rules");
+    const swap4 = buy.others[1];
+    if (buy.others.length !== 2 || !swap4 || isRegisterBuyer(swap4.data))
+      throw new BundleReadError("leg 1 is not one curve swap");
+    registerLamports = readRegisterBuyer(first, swap4, args.wallet);
+  } else if (buy.others.length !== 1)
     throw new BundleReadError("leg 1 is not one curve swap");
-  const swap3 = buy.others[0];
+  const swap3 = buy.others[buy.others.length - 1];
   if (u64(swap3.data, 8) !== args.buyRaw)
     throw new BundleReadError("leg 1 does not swap the confirmed --buy");
   if (args.minOutRaw !== undefined && u64(swap3.data, 16) !== args.minOutRaw)
@@ -92322,7 +92404,7 @@ function readLaunchBundle(args) {
     feeRaw = buy.tokenOut;
     quoteRaw = args.buyRaw + buy.tokenOut + launch.tokenOut;
   }
-  return { lamports: launch.lamports + buy.lamports, quoteRaw, feeRaw };
+  return { lamports: launch.lamports + buy.lamports + registerLamports, quoteRaw, feeRaw };
 }
 
 // src/launch-check.ts
@@ -93131,7 +93213,8 @@ async function atomicLaunch(ctx, key, args) {
       wallet: wallet3.address,
       quote: quoteAsset,
       buyRaw: BigInt(buy.raw),
-      ...minOut !== undefined ? { minOutRaw: BigInt(minOut) } : {}
+      ...minOut !== undefined ? { minOutRaw: BigInt(minOut) } : {},
+      rules: args.rules !== undefined
     });
   } catch (error) {
     if (!(error instanceof BundleReadError))
@@ -94074,6 +94157,7 @@ var MCP_TOOL_NAMES = [
   "candle_get_plans",
   "candle_report_activity",
   "candle_trade",
+  "candle_trade_execute",
   "candle_swap",
   "candle_transfer",
   "candle_sweep",
@@ -94206,7 +94290,8 @@ async function mcp(args, ctx) {
   }
   const identityConfig = await deps.readConfig();
   const identityFields = effectiveProfileFields(identityConfig, ctx.profile);
-  deps.stderr.write(`${identityLine(ctx.profile, identityFields.account, apiUrl, credentialEnvOverrides(deps.env), identityFields.username, identityStyle(deps, "stderr"))}
+  const identityOverrides = credentialEnvOverrides(deps.env);
+  deps.stderr.write(`${identityLine(ctx.profile, identityOverrides.length > 0 ? undefined : identityFields.account, apiUrl, identityOverrides.length > 0 ? identityOverrides : undefined, identityFields.username, identityStyle(deps, "stderr"))}
 
 `);
   if (parsed.booleans.has("--print-config")) {
@@ -102036,15 +102121,14 @@ async function runPlugin(name2, rawArgs, ctx) {
   if (split2.wallets.length > 0) {
     if (!refuseEnvPassphrase(ctx))
       return 1;
-    if (!requireTty(ctx, "candle <plugin> --wallet"))
-      return 1;
+    const promptCtx = refusePromptsWithoutTerminal(ctx, "candle <plugin> --wallet");
     const resolvedVault = vaultPathFor(ctx, { values: {}, booleans: new Set, positionals: [] });
     if ("error" in resolvedVault)
       return usage(ctx, resolvedVault.error);
     const vaultPath = resolvedVault.path;
     const resolved = await runVaultCommand(ctx, async ({ hold }) => {
       const raw = await requireVaultRaw(ctx, resolvedVault);
-      const vault = hold((await unlockInteractively(ctx, vaultPath, raw)).vault);
+      const vault = hold((await unlockInteractively(promptCtx, vaultPath, raw)).vault);
       for (const requested of split2.wallets) {
         const entry = findExternalEntry(vault.index, requested);
         if (entry === undefined) {
@@ -102734,14 +102818,20 @@ var NO_API_KEY6 = {
   message: "No API key for this profile.",
   suggestion: "Set CANDLE_API_KEY, or run `candle auth login` to store one."
 };
+var NO_TERMINAL_REASON = "not read: no terminal for its unlock";
+var NO_TERMINAL_NOTE = "The vault was not read: its unlock needs a prompt, and standard input and standard error are not both a terminal. Run it at a terminal, pass --factor touch-id or --factor passkey to unlock without a prompt, or pass --no-vault to leave it out.";
 async function portfolio(args, ctx) {
   const parsed = parseArgs(args, {
     valueFlags: ["--rpc-url", "--evm-rpc-url", "--keystore", "--chain"],
-    booleanFlags: ["--no-perps"],
+    booleanFlags: ["--no-perps", "--no-vault"],
     pathFlags: ["--keystore"]
   });
   if ("error" in parsed)
     return usage(ctx, parsed.error);
+  const noVault = parsed.booleans.has("--no-vault");
+  if (noVault && parsed.values["--keystore"] !== undefined) {
+    return usage(ctx, "--keystore names the vault to read and has no effect with --no-vault.");
+  }
   if (parsed.positionals.length > 1)
     return usage(ctx, `Unexpected argument: ${parsed.positionals[1]}`);
   const filter = parsed.positionals[0];
@@ -102788,16 +102878,30 @@ async function portfolio(args, ctx) {
     let vaultEntries;
     let evmEntries;
     let vaultReason;
+    let vaultSkipped = false;
     let known = 0;
-    const raw = await readVaultRaw(resolvedVault.path);
-    if (raw === null) {
-      vaultReason = `no vault at ${resolvedVault.path}`;
-    } else {
+    const raw = noVault ? null : await readVaultRaw(resolvedVault.path);
+    let vault;
+    if (raw !== null) {
       if (!refuseEnvPassphrase(ctx))
         return 1;
-      if (!requirePromptStreams(ctx, "portfolio"))
-        return 1;
-      const vault = hold((await unlockInteractively(ctx, resolvedVault.path, raw)).vault);
+      try {
+        const unlockCtx = refusePromptsWithoutTerminal(ctx, "portfolio");
+        vault = hold((await unlockInteractively(unlockCtx, resolvedVault.path, raw)).vault);
+      } catch (error) {
+        if (!isNoTerminalRefusal(error))
+          throw error;
+      }
+    }
+    if (noVault) {
+      vaultReason = "not read (--no-vault)";
+    } else if (raw === null) {
+      vaultReason = `no vault at ${resolvedVault.path}`;
+    } else if (vault === undefined) {
+      vaultReason = NO_TERMINAL_REASON;
+      vaultSkipped = true;
+      notice(deps, "stderr", "note", NO_TERMINAL_NOTE);
+    } else {
       vaultEntries = showSolana ? vault.index.entries.filter((entry) => entry.chain === "solana" && (entry.role === "vault" || entry.role === "external")).map((entry) => ({ address: entry.address, label: entry.label, role: entry.role })) : [];
       evmEntries = showHood ? vault.index.entries.filter((entry) => entry.chain === "evm" && entry.role === "vault").map((entry) => ({ address: entry.address, label: entry.label })) : [];
       known += vaultEntries.length + evmEntries.length;
@@ -103012,7 +103116,7 @@ async function portfolio(args, ctx) {
     const listStatus = walletListStatus(answered);
     const shownUnread = unavailable6.length > 0 || lpUnread > 0;
     const listNote = listStatus === "cut-off" ? "cut-off" : listStatus === "unknown" && !shownUnread ? "unknown" : null;
-    const complete = listNote === null && !shownUnread && !perpsPartial;
+    const complete = listNote === null && !shownUnread && !perpsPartial && !vaultSkipped;
     const totalUsd = groups.reduce((sum, g) => sum + g.valueUsd, 0);
     const unpriced = groups.reduce((sum, g) => sum + g.unpriced, 0);
     const lp = lpSection ? {
@@ -103089,6 +103193,7 @@ async function portfolio(args, ctx) {
       byChain,
       unavailableByChain,
       listNote,
+      vaultSkipped,
       lp
     });
     if (perps)
@@ -103464,7 +103569,7 @@ ${tableBlock(ctx, "LP positions", ["GROUP", "WALLET", "POSITION", "POOL", "HOLDI
   notes.push([
     "total",
     formatUsd(totals.totalUsd),
-    totals.unpriced > 0 ? `${totals.unpriced} unpriced ${totals.unpriced === 1 ? "holding" : "holdings"} not counted` : "every holding priced"
+    (totals.vaultSkipped ? "partial: the vault was not read (no terminal for its unlock). " : "") + (totals.unpriced > 0 ? `${totals.unpriced} unpriced ${totals.unpriced === 1 ? "holding" : "holdings"} not counted` : totals.vaultSkipped ? "other holdings priced" : "every holding priced")
   ]);
   const style = terminalStyle(deps, "stdout");
   const width = Math.max(...notes.map(([label]) => displayWidth(label)));
@@ -103486,6 +103591,8 @@ ${tableBlock(ctx, "LP positions", ["GROUP", "WALLET", "POSITION", "POOL", "HOLDI
   if (unavailable6 > 0) {
     warnings.push(`${unavailable6} ${unavailable6 === 1 ? "wallet" : "wallets"} could not be read in full (${unreadByChain.map(([chain2, n]) => `${n} on ${CHAIN_NAMES[chain2]}`).join(", ")}). What was not read is marked "not read" and is not in the total.`);
   }
+  if (totals.vaultSkipped)
+    warnings.push("The vault was not read: no terminal for its unlock. Its holdings are not in the total, so the total is partial (exit 3). Run it in a terminal, or pass --no-vault to leave the vault out on purpose.");
   writeNotes2(ctx, warnings);
   writeListNote(ctx, totals.listNote);
   const later = [];
@@ -103539,6 +103646,7 @@ ${financialHeading("Hyperliquid (live from Hyperliquid, not in the ledger; not i
 }
 
 // src/commands/profile.ts
+init_account();
 init_args();
 init_client();
 init_human_output();
@@ -104669,8 +104777,7 @@ async function sign5(args, ctx) {
     return usage(ctx, solana.error);
   if (!refuseEnvPassphrase(ctx))
     return 1;
-  if (!requireTty(ctx, "candle sign"))
-    return 1;
+  const promptCtx = refusePromptsWithoutTerminal(ctx, "candle sign");
   const { deps } = ctx;
   const resolvedVault = vaultPathFor(ctx, parsed);
   if ("error" in resolvedVault)
@@ -104700,7 +104807,7 @@ async function sign5(args, ctx) {
       throw error;
     }
     const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const opened = await unlockInteractively(promptCtx, path, raw, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     const vault = hold(opened.vault);
@@ -104859,8 +104966,7 @@ async function signMessage2(args, ctx) {
   const requested = lifted.values[0];
   if (!refuseEnvPassphrase(ctx))
     return 1;
-  if (!requireTty(ctx, "candle sign message"))
-    return 1;
+  const promptCtx = refusePromptsWithoutTerminal(ctx, "candle sign message");
   const { deps } = ctx;
   const resolvedVault = vaultPathFor(ctx, parsed);
   if ("error" in resolvedVault)
@@ -104874,7 +104980,7 @@ async function signMessage2(args, ctx) {
       throw new VaultError("VAULT_UNREADABLE", `The message could not be read: ${error instanceof Error ? error.message : error}.`);
     }
     const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const opened = await unlockInteractively(promptCtx, path, raw, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     const vault = hold(opened.vault);
@@ -105642,8 +105748,7 @@ async function vaultRename(args, ctx) {
   const id = parsed.values["--id"];
   if (!refuseEnvPassphrase(ctx))
     return 1;
-  if (!requireTty(ctx, "vault rename"))
-    return 1;
+  const promptCtx = refusePromptsWithoutTerminal(ctx, "vault rename");
   const { deps } = ctx;
   const resolvedVault = vaultPathFor(ctx, parsed);
   if ("error" in resolvedVault)
@@ -105664,7 +105769,7 @@ async function vaultRename(args, ctx) {
   }
   return runVaultCommand(ctx, async ({ hold }) => {
     const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const opened = await unlockInteractively(promptCtx, path, raw, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     const vault = hold(opened.vault);
@@ -105935,10 +106040,9 @@ async function teeRename(args, ctx) {
   if ("error" in vaultPath)
     return usage(ctx, vaultPath.error);
   const raw = rows.some((row2) => row2.tee) ? await readVaultRaw(vaultPath.path) : null;
-  if (raw !== null && !requireTty(ctx, "tee rename"))
-    return 1;
+  const promptCtx = refusePromptsWithoutTerminal(ctx, "tee rename");
   return runVaultCommand(ctx, async ({ hold }) => {
-    const vault = raw === null ? null : hold((await unlockInteractively(ctx, vaultPath.path, raw, {
+    const vault = raw === null ? null : hold((await unlockInteractively(promptCtx, vaultPath.path, raw, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     })).vault);
     const local = [];
@@ -111130,13 +111234,12 @@ async function vaultList(args, ctx) {
   if (balances && "error" in evmRpc)
     return usage(ctx, evmRpc.error);
   const evmRpcUrl = "url" in evmRpc ? evmRpc.url : DEFAULT_HOOD_RPC_URL;
-  if (!requirePromptStreams(ctx, "vault list"))
-    return 1;
+  const promptCtx = refusePromptsWithoutTerminal(ctx, "vault list");
   return runVaultCommand(ctx, async ({ hold }) => {
     const raw = await readVaultRaw(path);
     if (raw === null)
       throw missingVault(ctx, resolvedVault);
-    const vault = hold((await unlockInteractively(ctx, path, raw, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
+    const vault = hold((await unlockInteractively(promptCtx, path, raw, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
     const all = vault.index.entries;
     const filtered = filter === undefined ? all : all.filter((entry) => matches2(entry, filter));
     const showRetired = parsed.booleans.has("--all");
@@ -115175,6 +115278,101 @@ function walletsDisallowLaunch(args, ctx) {
   return setAllowLaunch(args, ctx, false);
 }
 
+// src/commands/wallets-allowlist.ts
+init_args();
+init_client();
+init_deps();
+init_human_output();
+init_presentation();
+init_profiles();
+init_render();
+init_key_output();
+var EMPTY_NOTE = "No approved withdrawal addresses. An agent can move funds only to the account's own wallets and its vault.";
+var MANAGED_HINT = "Approving an address needs the owner signed in to the agent console's Wallets tab; an API key cannot approve. An acting key can revoke one; a read-only key cannot.";
+async function walletsAllowlist(args, ctx) {
+  const { deps, apiUrl, json } = ctx;
+  const parsed = parseArgs(args, { booleanFlags: ["--all"] });
+  if ("error" in parsed) {
+    writeScreenUsageFailure(deps, parsed.error, json);
+    return 2;
+  }
+  if (parsed.positionals.length > 0) {
+    writeScreenUsageFailure(deps, `Unexpected argument: ${parsed.positionals[0]}`, json);
+    return 2;
+  }
+  await printIdentity(ctx);
+  const apiKey = await resolveApiKey(deps, ctx.profile);
+  if (!apiKey) {
+    writeScreenLocalFailure(deps, { code: "NO_API_KEY", message: "No API key available.", suggestion: "Run: candle keys create" }, json);
+    return 1;
+  }
+  const query3 = parsed.booleans.has("--all") ? "?includeRevoked=true" : "";
+  const result = await apiRequest(`/api/v1/agent/withdrawal-addresses${query3}`, {
+    method: "GET",
+    auth: "key",
+    credentials: { apiKey },
+    apiUrl,
+    fetch: deps.fetch,
+    env: deps.env
+  });
+  if (!result.ok) {
+    writeScreenFailure(deps, result, { apiUrl, authType: "key" }, json);
+    return 1;
+  }
+  const body = result.body;
+  if (!Array.isArray(body.addresses)) {
+    writeScreenLocalFailure(deps, { code: "INVALID_RESPONSE", message: "The withdrawal allowlist read did not return a list." }, json);
+    return 1;
+  }
+  const rows = body.addresses;
+  if (json) {
+    deps.stdout.write(`${JSON.stringify({ success: true, addresses: rows, count: rows.length })}
+`);
+    return 0;
+  }
+  const style = terminalStyle(deps, "stdout");
+  deps.stdout.write(`${heading(`Withdrawal allowlist (${rows.length})`, style)}
+
+`);
+  if (rows.length === 0) {
+    notice(deps, "stdout", "note", EMPTY_NOTE);
+    notice(deps, "stdout", "note", MANAGED_HINT);
+    return 0;
+  }
+  if (style.width < 100) {
+    for (const row2 of rows) {
+      writeFields(deps, "stdout", [
+        ["Id", row2.id],
+        ["Address", row2.address],
+        ["Label", row2.label],
+        ["Chain", row2.chain],
+        ["Revoked", row2.revokedAt ? "yes" : "no"]
+      ]);
+      deps.stdout.write(`
+`);
+    }
+  } else {
+    deps.stdout.write(`${renderTable(["Id", "Chain", "Address", "Label", "Revoked"], rows.map((row2) => [
+      row2.id,
+      row2.chain,
+      row2.address,
+      row2.label ?? symbols(style).missing,
+      row2.revokedAt ? "yes" : "no"
+    ]), {
+      style,
+      width: style.width,
+      indent: 2,
+      rule: false,
+      columns: [{ id: true }, { priority: 3 }, { id: true }, { priority: 2 }, { priority: 1 }]
+    })}
+`);
+  }
+  deps.stdout.write(`
+`);
+  notice(deps, "stdout", "note", MANAGED_HINT);
+  return 0;
+}
+
 // src/commands/wallets-authorize.ts
 init_args();
 init_client();
@@ -115877,6 +116075,7 @@ init_ownership();
 init_file_lock();
 
 // src/guard.ts
+init_account();
 init_profiles();
 async function verifyProfileAccount(ctx, config) {
   const { deps, profile } = ctx;
@@ -116144,7 +116343,8 @@ var COMMANDS = {
       "allow-launch": walletsAllowLaunch,
       "disallow-launch": walletsDisallowLaunch,
       "close-empty": walletsCloseEmpty,
-      authorize: walletsAuthorize
+      authorize: walletsAuthorize,
+      allowlist: walletsAllowlist
     },
     bare: wallets
   },

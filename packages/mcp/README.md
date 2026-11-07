@@ -1,7 +1,7 @@
 # @candledottv/mcp
 
 An MCP (Model Context Protocol) server for the Candle agent rail. The current source exposes Candle's REST API as
-eighty-seven tools over stdio, plus four Hyperliquid market reads (eighty-eight in all), so an MCP-capable agent can launch tokens (optionally seeded with a dev
+eighty-eight tools over stdio, plus four Hyperliquid market reads (eighty-nine in all), so an MCP-capable agent can launch tokens (optionally seeded with a dev
 buy in the same call), trade, convert between base assets (including across chains), read market
 and feed data, read one token's signals and tracked-wallet trades and its card data, report on-chain activity,
 check an agent profile, and backtest a strategy in hacc's strategy lab without hand-rolling HTTP calls. The five
@@ -39,7 +39,7 @@ environment.
 To mint a key for another agent without keeping it as the CLI profile's working key, run `candle keys create --access write --label agent-one --no-store` after device login. The key is printed once; put it in the intended agent's secret store. `--json` reports `stored: false` and exits 0. The profile's existing working key, prefix and scopes stay unchanged, even when it has no working key. Add `--embedded-wallet allow` at a terminal if this key needs the account's embedded wallet. This is a CLI storage option; it adds no MCP tool and does not change tool counts.
 
 `CANDLE_MCP_TOOLS` (optional) is a comma-separated allowlist of tool names; only those register.
-Unset means all eighty-seven. An unknown name fails startup with the valid names in the message, rather
+Unset means all eighty-eight. An unknown name fails startup with the valid names in the message, rather
 than silently registering the wrong surface. `candle mcp --read-only` / `--tools` set this for
 you.
 
@@ -50,6 +50,14 @@ straight back to the caller, unchanged, error responses included. `candle_trade`
 `candle_launch_and_seed` are the two exceptions: each is a small orchestration (a decimal-to-raw
 conversion, an idempotency key, a follow-up read) on top of the same REST surface, see Errors
 below.
+
+`candle_trade` takes `deferExecution: true` to quote first and spend later: it builds the trade and returns
+`status: "built"` with the quote, and nothing is signed until `candle_trade_execute` is called with the same
+`clientTradeId`. The build holds for 30 minutes (after that the execute is `QUOTE_EXPIRED` and you build
+again); rebuilding with the same `clientTradeId` re-quotes it until it has been sent to execute. There is no cancel
+yet: let an unwanted build expire. `deferExecution` cannot be combined with `paper`, and a sell that would fall
+back to the paper book is refused rather than built. One execution per build: a repeat call returns the stored
+result, or `IDEMPOTENCY_CONFLICT` while the first is unconfirmed (read `candle_get_operation`).
 
 Both take decimal amounts, never raw base units, and resolve the scale themselves:
 
@@ -161,6 +169,7 @@ tools, getting a key, funding the embedded wallet, and idempotent retries, see
 | `candle_list_agents` | The agent directory: every published agent with its strategy, declared models, all-time P&L and trade and launch counts, sorted `newest`, `active` or `pnl`, filtered by `strategy`, searched by `q` | `GET /api/v1/agent/directory` | none |
 | `candle_get_plans` | Plans: prices, fees, limits and what each can do, as JSON and a Markdown table | `GET /api/v1/agent/plans` | none |
 | `candle_trade` | Buy or sell a token | Reads the market for its decimals (or wallet balance, for a percent sell) then `POST /api/v1/trade/agent/build` | `CANDLE_AGENT_API_KEY` (`swap:write`) |
+| `candle_trade_execute` | Execute a trade built with `candle_trade` and `deferExecution: true` | `POST /api/v1/trade/agent/execute` with the `clientTradeId` only | `CANDLE_AGENT_API_KEY` (`swap:write`) |
 | `candle_launch_and_seed` | Launch a token and seed it | `POST /api/v1/launch/headless` (or `/dry-run`); a Solana seed is an atomic launch instead, `POST /api/v1/launch/atomic/build` then `/submit` (or `/atomic/dry-run`), one Jito bundle from the embedded wallet (Pro or Max, `swap:write`); then a follow-up `GET /api/v1/markets/:chain/:mint`; with `imagePath`, `POST /api/v1/uploads/agent-image` first | `CANDLE_AGENT_API_KEY` |
 | `candle_swap` | Swap between base assets | `POST /api/v1/agent/swap` | `CANDLE_AGENT_API_KEY` (`swap:write`) |
 | `candle_transfer` | Transfer an asset | `POST /api/v1/agent/transfer` | `CANDLE_AGENT_API_KEY`, Withdraw (`transfer:write`) |
@@ -170,12 +179,12 @@ tools, getting a key, funding the embedded wallet, and idempotent retries, see
 | `candle_get_profile_wallets` | Which wallets an agent profile may spend from, and whether it is scoped | `GET /api/v1/agent/keys/:prefix/wallets` | `CANDLE_AGENT_API_KEY` |
 | `candle_set_profile_wallets` | Replace the wallets an agent profile may spend from | `PUT /api/v1/agent/keys/:prefix/wallets` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_profile_pnl` | An agent profile's share of the account's P&L, the console's figures to the cent: realized on its sales, fees, and the open positions that belong to it at cost basis, marked at current prices (unpriced positions counted, not zeroed), with `totalUsd`, the closed positions as made, lost and partial sells (`closed`), dust flagged and counted apart (`openPositionsExDust`), split by wallet (`pnl.byWallet`, summing to the total) and by chain (`pnl.byChain`), with `chain` and `wallet` on every position; `sinceMs` adds a `window` of realized and open mark changes, including older holdings (see "P&L since a time") | `GET /api/v1/agent/keys/:prefix/pnl` | `CANDLE_AGENT_API_KEY` |
-| `candle_get_profile_trades` | An agent profile's orders, fills, fees and transaction hashes; page by time with `since`, `until` and `cursor` | `GET /api/v1/agent/keys/:prefix/trades` | `CANDLE_AGENT_API_KEY` |
+| `candle_get_profile_trades` | An agent profile's orders, fills, fees and transaction hashes, and its swaps (`kind: "swap"`); page by time with `since`, `until` and `cursor` | `GET /api/v1/agent/keys/:prefix/trades` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_profile_paper` | An agent profile's PAPER P&L and 50 latest paper trades, from quotes (`basis: "quote"`), never live figures | `GET /api/v1/agent/keys/:prefix/paper` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_paper_inventory` | This key's paper positions in raw units (needs `swap:write`) | `GET /api/v1/trade/agent/paper/inventory` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_account_pnl` | P&L for every agent profile on the account in one read (`candle pnl` without `--profile`) | `GET /api/v1/agent/keys/pnl` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_portfolio` | What the account's embedded and TEE wallets hold on Solana and Hood (Hood in `hood`), with prices; unpriced holdings say why, never zero | `GET /api/v1/agent/portfolio` | `CANDLE_AGENT_API_KEY` (`account:read`) |
-| `candle_execution_status` | One call before trading: wallets to spend from, tier, this key's limits, and its loss limits and stop state (a stopped key is `ready: false` with a top-level `stopped`) | Composes the wallet, tier, `GET /api/v1/agent/keys/self/limits` and `GET /api/v1/agent/keys/self/risk` reads | `CANDLE_AGENT_API_KEY` |
+| `candle_execution_status` | One call before trading: wallets to spend from, tier, this key's limits (`limits.txLimitUse` has its USD limit use and when it resets), and its loss limits and stop state (a stopped key is `ready: false` with a top-level `stopped`) | Composes the wallet, tier, `GET /api/v1/agent/keys/self/limits` and `GET /api/v1/agent/keys/self/risk` reads | `CANDLE_AGENT_API_KEY` |
 | `candle_get_operation` | Look up a trade, swap or launch by the id its write used, and whether it landed. `kind: "swap"` reads a `candle_swap` by its `clientSwapId` and answers `job.outcome` (`in_flight`, `confirmed`, `failed`, `partial` or `indeterminate`) | `GET /api/v1/trade/agent/jobs/:clientId`, `/api/v1/agent/swap/by-client-id/:clientId` or `/api/v1/launch/headless/jobs/:clientId` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_fees` | The creator fees the account's launched tokens can pay: raw amounts from chain reads, and the reason a token cannot be claimed | `GET /api/v1/agent/fees` | `CANDLE_AGENT_API_KEY` (`account:read`) |
 | `candle_atomic_launch_dry_run` | Check a Solana launch with first buys and price each buy on the curve it would deploy; builds, reserves and writes nothing | `POST /api/v1/launch/atomic/dry-run` | `CANDLE_AGENT_API_KEY` (`launch:write`, `swap:write`, Pro or Max) |
@@ -255,7 +264,7 @@ explicitly. Assets with nothing spendable report `empty`; a failed asset never s
 ## Errors
 
 This package never reinterprets an error body, and that body is not one uniform shape across all
-eighty-seven tools:
+eighty-eight tools:
 
 - `candle_token_events`, called with `kind`, is the one narrowing of a SUCCESS body, never an
   error one: the relayed `events` are filtered to that kind and the body gains `filteredByKind`.

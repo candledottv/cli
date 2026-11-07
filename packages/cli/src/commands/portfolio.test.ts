@@ -7,6 +7,7 @@
  * any request to Candle, and the only vault-derived thing Candle receives is a mint list.
  */
 import { describe, expect, setDefaultTimeout, test } from "bun:test"
+import { join } from "node:path"
 import type { Deps } from "../deps"
 import { FIXTURE_EVM_0, FIXTURE_EVM_1 } from "../evm-lite.test"
 import { humanText } from "../human-output.test-support"
@@ -328,7 +329,12 @@ function harness(opts: {
       return FIXTURE_PASSPHRASE
     },
   })
-  const candleRequests = () => requests.filter((r) => r.host === "api.example.test")
+  // BE-2677 (R32): the harness runs under a CANDLE_API_KEY override, so printIdentity asks
+  // /api/v1/agent/wallets/embedded which account the acting key belongs to before the command's
+  // own reads. That lookup is the identity line's business, not this command's, so it stays out
+  // of the Candle-request assertions (the same posture as keys-access's keyCalls).
+  const candleRequests = () =>
+    requests.filter((r) => r.host === "api.example.test" && r.path !== "/api/v1/agent/wallets/embedded")
   const rpcRequests = () => requests.filter((r) => r.host === "rpc.example.test")
   const evmRequests = () => requests.filter((r) => r.host === "evm.example.test")
   const hyperliquidRequests = () => requests.filter((r) => r.host === "api.hyperliquid.xyz")
@@ -551,11 +557,52 @@ describe("candle portfolio", () => {
     expect(h.stdout.text).toMatch(/vault\s+–\s+no vault at\s/)
   })
 
-  test("a vault to read without a terminal refuses before any request", async () => {
+  test("BE-2661 (R10): without a terminal the vault is not read, nothing is asked or sent to the RPC, and the rest answers", async () => {
     const { dir } = await vaultWith([entryAt(0, "treasury")])
     const h = harness({ dir, env: { CANDLE_SOLANA_RPC_URL: RPC_URL }, tty: false })
+    expect(await run(["portfolio", "--json"], h.deps)).toBe(3)
+    expect(h.asked).toEqual([])
+    expect(h.rpcRequests()).toEqual([])
+    const doc = JSON.parse(h.stdout.text)
+    expect(doc.complete).toBe(false)
+    expect(doc.groups[0]).toMatchObject({ group: "vault", read: false, reason: "not read: no terminal for its unlock" })
+    expect(doc.groups.find((g: { group: string }) => g.group === "embedded").wallets).toHaveLength(1)
+    expect(flat(h.stderr.text)).toContain("The vault was not read: its unlock needs a prompt")
+    expect(flat(h.stderr.text)).toContain("--no-vault")
+
+    const human = harness({ dir, env: { CANDLE_SOLANA_RPC_URL: RPC_URL }, tty: false })
+    expect(await run(["portfolio"], human.deps)).toBe(3)
+    expect(human.stdout.text).toMatch(/vault\s+–\s+not read: no terminal for its unlock/)
+    const footer = flat(human.stdout.text)
+    expect(footer).toContain("partial: the vault was not read (no terminal for its unlock)")
+    expect(footer).not.toContain("every holding priced")
+    expect(footer).toContain("the total is partial (exit 3)")
+  })
+
+  test("BE-2661 (R10): --no-vault leaves the vault out on a terminal too, and refuses --keystore", async () => {
+    const { dir } = await vaultWith([entryAt(0, "treasury")])
+    const h = harness({ dir, env: { CANDLE_SOLANA_RPC_URL: RPC_URL } })
+    expect(await run(["portfolio", "--no-vault", "--json"], h.deps)).toBe(0)
+    expect(h.asked).toEqual([])
+    expect(h.rpcRequests()).toEqual([])
+    expect(JSON.parse(h.stdout.text).complete).toBe(true)
+    expect(JSON.parse(h.stdout.text).groups[0]).toMatchObject({
+      group: "vault",
+      read: false,
+      reason: "not read (--no-vault)",
+    })
+
+    const both = harness({ dir })
+    expect(await run(["portfolio", "--no-vault", "--keystore", join(dir, "vault.enc"), "--json"], both.deps)).toBe(2)
+    expect(JSON.parse(both.stdout.text)).toMatchObject({ ok: false, code: "USAGE" })
+    expect(both.requests).toEqual([])
+  })
+
+  test("BE-2661 (R10): CANDLE_KEYSTORE_PASSPHRASE still refuses whenever a vault would be read", async () => {
+    const { dir } = await vaultWith([entryAt(0, "treasury")])
+    const h = harness({ dir, env: { CANDLE_KEYSTORE_PASSPHRASE: "x" }, tty: false })
     expect(await run(["portfolio", "--json"], h.deps)).toBe(1)
-    expect(JSON.parse(h.stdout.text)).toMatchObject({ ok: false, code: "VAULT_UNLOCK_FAILED" })
+    expect(JSON.parse(h.stdout.text)).toMatchObject({ ok: false, code: "ENV_PASSPHRASE_REFUSED" })
     expect(h.requests).toEqual([])
   })
 
@@ -1107,7 +1154,9 @@ describe("Ember 4d: Hood in candle portfolio", () => {
     const h = harness({ dir, env: { CANDLE_EVM_RPC_URL: EVM_RPC_URL }, evm: { chainId: 1 } })
     expect(await run(["portfolio"], h.deps)).toBe(1)
     expect(h.evmRequests().map((r) => (JSON.parse(r.body) as { method: string }).method)).toEqual(["eth_chainId"])
-    expect(h.candleRequests()).toEqual([])
+    // No Candle read beyond the identity line's own override-key lookup (excluded by
+    // candleRequests); the refusal happens before any portfolio data is asked for.
+    expect(h.requests.filter((r) => r.host === "api.example.test")).toHaveLength(1)
     expect(humanText(h.stderr.text)).toContain(humanText("evm.example.test answered chain id 1"))
     expect(humanText(h.stderr.text)).toContain(humanText("Hood, chain id 4663, only"))
 
