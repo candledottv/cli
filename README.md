@@ -26,8 +26,9 @@ curl -fsSL https://candle.tv/install.sh | bash
 ```
 
 The installer checks the download's SHA-256 and verifies its signature before it writes anything.
-It needs `curl`, `sha256sum` or `shasum`, and one signature verifier: `cosign` 2.2 or later, or a
-signed-in `gh`. Without a verifier it stops and installs nothing, and tells you how to get one.
+It needs only `curl` and `sha256sum` or `shasum`. It checks the signature with `cosign` 2.2 or later
+or a signed-in `gh` when one is installed, and otherwise with Candle's own `candle verify`, from a
+CLI release whose SHA-256 the script carries. If no check can run, it installs nothing.
 It installs `candle` into `~/.local/bin`.
 
 [Verify a release yourself](https://docs.candle.tv/developers/verify-a-candle-release)
