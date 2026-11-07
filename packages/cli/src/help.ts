@@ -137,7 +137,7 @@ export const ENVIRONMENT: EnvVar[] = [
   },
   {
     name: "CANDLE_CORE_TOKEN",
-    description: "A harness token for candle core mcp, when --token is not given; minted in the Candle TUI",
+    description: "A harness token for candle core mcp, when --token is not given; minted in Candle Harness",
   },
 ]
 
@@ -269,7 +269,7 @@ export const HELP: Record<string, Topic> = {
     intro: "Quote, swap and bridge on Solana or Hood; read an operation",
     summary: "Quote, confirm and swap on Solana or Hood, bridge between them; read an operation by id",
     description:
-      "Swaps run through a TEE wallet's bound key: the quote is shown and confirmed before anything is sent. The first buy after a launch is this command, unless the launch carried it with candle launch --buy. The assets decide the chain (ETH, USDG or a 0x token is Hood; SOL, USDC, CNDL or a mint is Solana) and a named wallet must be on it. A Hood TEE wallet signs one leg at a time: approve, Permit2, trade, then the fee, each only after the one before it landed. SOL or USDC to ETH or USDG, or back, is a bridge through Relay from a TEE wallet into this key's own TEE wallet on the other chain (--to names it when there are several); Candle charges no fee, only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and this machine checks Relay's deposit before it is signed. The bridge prints its deposit and returns while Relay fills; --wait follows it for up to ten minutes. While it is open, a sweep of either wallet refuses BRIDGE_IN_FLIGHT for two hours. Vault to vault: fund the Solana TEE wallet from the vault, bridge, then disable and sweep the Hood TEE wallet into its vault. Every plan can trade Candle-launched tokens and base assets, and sell a token it holds that was not launched on Candle; buying such a token needs Pro or Max (TIER_REQUIRED otherwise). Each trade pays the plan's agent fee on top; a base-pair swap or a bridge between this key's own wallets pays none. candle plans shows the fees in force. With --json, stdout is one JSON value for every swap, trade, replay and status read: kind, status, clientTradeId, signature (the primary transaction, or null), signatures (a list) and raw (the original response); every human line is on stderr. The keys older versions printed stay beside them.",
+      "Swaps run through a TEE wallet's bound key: the quote is shown and confirmed before anything is sent. The first buy after a launch is this command, unless the launch carried it with candle launch --buy. The assets decide the chain (ETH, USDG or a 0x token is Hood; SOL, USDC, CNDL or a mint is Solana) and a named wallet must be on it. A Hood TEE wallet signs one leg at a time: approve, Permit2, trade, then the fee, each only after the one before it landed. SOL or USDC to ETH or USDG, or back, is a bridge through Relay from a TEE wallet into this key's own TEE wallet on the other chain (--to names it when there are several); Candle charges no fee, only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and this machine checks Relay's deposit before it is signed. The bridge prints its deposit and returns while Relay fills; --wait follows it for up to ten minutes. While it is open, a sweep of either wallet refuses BRIDGE_IN_FLIGHT for two hours. Vault to vault: fund the Solana TEE wallet from the vault, bridge, then disable and sweep the Hood TEE wallet into its vault. Every plan can trade Candle-launched tokens and base assets, and buy or sell a token that was not launched on Candle. Each trade pays the plan's agent fee on top; a base-pair swap or a bridge between this key's own wallets pays none. candle plans shows the fees in force. With --json, stdout is one JSON value for every swap, trade, replay and status read: kind, status, clientTradeId, signature (the primary transaction, or null), signatures (a list) and raw (the original response); every human line is on stderr. The keys older versions printed stay beside them.",
     usage: ["candle swap <from> <to> [flags]", "candle swap status <id>"],
     rows: [
       {
@@ -647,7 +647,7 @@ export const HELP: Record<string, Topic> = {
     group: "Trade",
     summary: "Create a token on Solana or Hood, with an optional first buy",
     description:
-      "Creates a token from the wallet you name, with an optional first buy. Embedded launches use /launch/headless on every plan, with the key's embedded-wallet allowance and launch:write; no swap:write is needed. A Solana first buy is a creator bundle, signed by Candle. A Hood first buy is best effort after creation. TEE launches use /launch/self and require Pro or Max, launch:write, a bound key and verified authority; a server with TEE_LAUNCH_BY_SCOPE_ENABLED off also asks for the owner's allowLaunch (deprecated), and with it on a TEE first buy also needs swap:write. TEE buys need TEE_LAUNCH_BUYS_ENABLED on the server; Solana buys also need AGENT_TRADING_ENABLED and Jito. Existing server gates and ceilings apply. The embedded path previews the launch before confirmation; --dry-run stops at the preview. No buy creates only the token. Local image and banner uploads happen before confirmation and are public and permanent even if the launch is declined. Reuse --client-trade-id for recovery. On Solana, --fee-wallet <address> sets the wallet the launch's curve and pool fees earn to, an on-curve wallet by itself or a Squads v4 vault with --fee-wallet-multisig <address> and --fee-wallet-multisig-vault-index <n>; without it the fees earn to the wallet that launches the token where the server has LAUNCH_FEE_WALLET_FROM_LAUNCHER on (an embedded launch already earns to its embedded wallet), otherwise to the account wallet, and the preview, the confirm and --check all say which; a live launch also warns on stderr when it defaults, and --require-fee-wallet refuses the launch without one. --check answers first, before any of it: which launch path works on this key and server (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, with nothing uploaded, built or sent; name a wallet with --wallet to narrow it, and it exits 1 when no path works. status reads one launch by its mint or clientLaunchId: build, signed, confirmed, trading, bonded, then migrated, with the market's lifecycle and migration fields. --wait follows it until the token is trading, the launch has failed, or ten minutes pass.",
+      "Creates a token from the wallet you name, with an optional first buy. Embedded launches use /launch/headless on every plan, with the key's embedded-wallet allowance and launch:write; no swap:write is needed. A Solana first buy is a creator bundle, signed by Candle. A Hood first buy is best effort after creation. TEE launches use /launch/self and require Pro or Max, launch:write, a bound key and verified authority; a server with TEE_LAUNCH_BY_SCOPE_ENABLED off also asks for the owner's allowLaunch (deprecated), and with it on a TEE first buy also needs swap:write. TEE buys need TEE_LAUNCH_BUYS_ENABLED on the server; Solana buys also need AGENT_TRADING_ENABLED and Jito. Existing server gates and ceilings apply. The embedded path previews the launch before confirmation; --dry-run stops at the preview. No buy creates only the token. Local image and banner uploads happen before confirmation and are public and permanent even if the launch is declined. Reuse --client-trade-id for recovery. On Solana, --fee-wallet <address> sets the wallet the launch's curve and pool fees earn to, an on-curve wallet by itself or a Squads v4 vault with --fee-wallet-multisig <address> and --fee-wallet-multisig-vault-index <n>; without it the fees earn to the wallet that launches the token where the server has LAUNCH_FEE_WALLET_FROM_LAUNCHER on (an embedded launch already earns to its embedded wallet), otherwise to the account wallet, and the preview, the confirm and --check all say which; a live launch also warns on stderr when it defaults, and --require-fee-wallet refuses the launch without one. On Solana, where the server has CURVE_LAUNCH_RULES_ENABLED on, launch rules are fixed at launch and enforced by the curve program: --open-in delays the open (until then only the launching wallet may buy, up to --dev-buy-max, which defaults to the buy), --max-buy-per-wallet with --cap-window caps what each wallet spends on the curve after the open, and --allowlist <file> with --allowlist-window lets only the listed wallets buy; durations are seconds or 90m, 6h, 2d and amounts are whole quote units, each is checked here before any request, and the preview prints a Launch rules block. Nobody can change the rules after the launch. --check answers first, before any of it: which launch path works on this key and server (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, with nothing uploaded, built or sent; name a wallet with --wallet to narrow it, and it exits 1 when no path works. status reads one launch by its mint or clientLaunchId: build, signed, confirmed, trading, bonded, then migrated, with the market's lifecycle and migration fields. --wait follows it until the token is trading, the launch has failed, or ten minutes pass.",
     usage: [LAUNCH_USAGE, "candle launch status <mint-or-client-launch-id> [--wait]"],
     rows: [
       {
@@ -688,6 +688,7 @@ export const HELP: Record<string, Topic> = {
       "candle launch --name Demo --symbol DEMO --image-url https://example.com/d.png --wallet AgentOne --buy 0.1",
       "candle launch --name Demo --symbol DEMO --image-url https://example.com/d.png --wallet embedded --buy 0.1 --dry-run",
       "candle launch --name Demo --symbol DEMO --image-url https://example.com/d.png --wallet AgentOne --mode exp-custom --curve-v 4 --curve-g 20 --creator-fee-bps 100 --dry-run",
+      "candle launch --name Demo --symbol DEMO --image-url https://example.com/d.png --wallet AgentOne --buy 0.1 --open-in 10m --max-buy-per-wallet 0.5 --cap-window 1h --allowlist ./wallets.txt --allowlist-window 30m --dry-run",
       "candle launch status <mint-or-id> --wait",
     ],
     env: ENV_API,
@@ -1261,9 +1262,9 @@ export const HELP: Record<string, Topic> = {
       },
       {
         invocation:
-          "close-empty [--wallet embedded|<tee address|label>] [--keep <mint>]... [--client-trade-id <id>] [--yes]",
+          "close-empty [--wallet embedded|<tee address|label>] [--keep <mint>]... [--client-trade-id <id>] [--preview] [--yes]",
         description:
-          "Close a wallet's empty token accounts and return their rent to it, after a preview: the embedded wallet (transfer:write), or a TEE wallet bound to this key, signed by its key signer (swap:write)",
+          "Close a wallet's empty token accounts and return their rent to it, after a preview: the embedded wallet (transfer:write), or a TEE wallet bound to this key, signed by its key signer (swap:write). --preview prints what would close (one JSON document on stdout under --json) and closes nothing",
       },
     ],
     flags: [
@@ -1686,10 +1687,10 @@ export const HELP: Record<string, Topic> = {
   },
   tui: {
     group: "Start here",
-    intro: "The Candle TUI: holdings, feed, agents, approvals (preview)",
-    summary: "The Candle TUI: holdings, the feed, your agents and approval cards, in the terminal (preview)",
+    intro: "Candle Harness: holdings, feed, agents, approvals",
+    summary: "Candle Harness: holdings, the feed, your agents and approval cards, in the terminal",
     description:
-      "Starts the Candle TUI (candle-tui), which starts the local core for the profile when it is not running. Every live money action an agent proposes becomes an approval card you approve there with your vault factor. Preview: the TUI is not released yet.",
+      "Starts Candle Harness (candle-harness first, then candle-tui), which starts the local core for the profile when it is not running. Every live money action an agent proposes becomes an approval card you approve there with your vault factor. Install it from https://github.com/candledottv/harness/releases.",
     usage: ["candle tui [--profile <name>]"],
     rows: [],
     examples: ["candle tui", "candle tui --profile staging"],
@@ -1697,9 +1698,9 @@ export const HELP: Record<string, Topic> = {
   },
   core: {
     group: "Maintain",
-    summary: "Run the local Candle core the Candle TUI attaches to (preview)",
+    summary: "Run the local Candle core for Candle Harness (preview)",
     description:
-      "The local core: one process per profile, and the only thing on this machine that holds the profile's trading credentials once trading is on in the Candle TUI. Views and harnesses attach to it on a local socket; every live money action becomes an approval card you approve in the TUI with your vault factor. Preview.",
+      "The local core: one process per profile, and the only thing on this machine that holds the profile's trading credentials once trading is on in Candle Harness. Views and harnesses attach to it on a local socket; every live money action becomes an approval card you approve in the TUI with your vault factor. Preview.",
     usage: ["candle core serve [--profile <name>] [--view-token-fd <n>]", "candle core mcp [--token <harness token>]"],
     rows: [
       { invocation: "serve", description: "Start the core for the profile in play; one per profile" },

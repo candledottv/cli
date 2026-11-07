@@ -1537,6 +1537,171 @@ var LAUNCH_DEFINITION = {
       }
     },
     {
+      key: "launchRules.openDelaySecs",
+      type: "duration",
+      help: "Launch rules, Solana only, where the server has CURVE_LAUNCH_RULES_ENABLED on: how long after the launch buys open, at most 7 days (604800 seconds); before then only the launching wallet may buy. The CLI takes a duration (90m, 6h, 2d, or seconds); the request field is whole seconds.",
+      wireType: "number",
+      range: {
+        min: "0",
+        max: "604800",
+        unit: "seconds"
+      },
+      chains: [
+        "solana"
+      ],
+      surfaces: {
+        cli: {
+          flag: "--open-in",
+          value: "<duration>"
+        },
+        mcp: {
+          key: "launchRules.openDelaySecs"
+        },
+        sdk: {
+          key: "launchRules.openDelaySecs"
+        }
+      }
+    },
+    {
+      key: "launchRules.maxBuyPerWalletRaw",
+      type: "decimal",
+      help: "The most quote one wallet may spend on the curve during --cap-window, curve fee included and Candle's fee not; needs --cap-window. The CLI takes whole quote units; the request field is raw units as a decimal string.",
+      range: {
+        unit: "whole quote units"
+      },
+      chains: [
+        "solana"
+      ],
+      requires: [
+        "launchRules.capWindowSecs"
+      ],
+      surfaces: {
+        cli: {
+          flag: "--max-buy-per-wallet",
+          value: "<amount>"
+        },
+        mcp: {
+          key: "launchRules.maxBuyPerWalletRaw"
+        },
+        sdk: {
+          key: "launchRules.maxBuyPerWalletRaw"
+        }
+      }
+    },
+    {
+      key: "launchRules.capWindowSecs",
+      type: "duration",
+      help: "How long the per-wallet cap holds, counted from the open: 1 second to 24 hours (86400 seconds); needs --max-buy-per-wallet.",
+      wireType: "number",
+      range: {
+        min: "1",
+        max: "86400",
+        unit: "seconds"
+      },
+      chains: [
+        "solana"
+      ],
+      requires: [
+        "launchRules.maxBuyPerWalletRaw"
+      ],
+      surfaces: {
+        cli: {
+          flag: "--cap-window",
+          value: "<duration>"
+        },
+        mcp: {
+          key: "launchRules.capWindowSecs"
+        },
+        sdk: {
+          key: "launchRules.capWindowSecs"
+        }
+      }
+    },
+    {
+      key: "launchRules.allowlist",
+      type: "file",
+      help: "Only these wallets may buy during --allowlist-window: 1 to 4,096 distinct Solana addresses; needs --allowlist-window. The CLI reads a file, one address per line or comma separated; the request field is the list.",
+      wireType: "string[]",
+      range: {
+        min: "1",
+        max: "4096",
+        unit: "wallets"
+      },
+      chains: [
+        "solana"
+      ],
+      requires: [
+        "launchRules.allowlistWindowSecs"
+      ],
+      surfaces: {
+        cli: {
+          flag: "--allowlist",
+          value: "<path>"
+        },
+        mcp: {
+          key: "launchRules.allowlist"
+        },
+        sdk: {
+          key: "launchRules.allowlist"
+        }
+      }
+    },
+    {
+      key: "launchRules.allowlistWindowSecs",
+      type: "duration",
+      help: "How long the allowlist phase holds, counted from the open: 1 second to 24 hours (86400 seconds); needs --allowlist.",
+      wireType: "number",
+      range: {
+        min: "1",
+        max: "86400",
+        unit: "seconds"
+      },
+      chains: [
+        "solana"
+      ],
+      requires: [
+        "launchRules.allowlist"
+      ],
+      surfaces: {
+        cli: {
+          flag: "--allowlist-window",
+          value: "<duration>"
+        },
+        mcp: {
+          key: "launchRules.allowlistWindowSecs"
+        },
+        sdk: {
+          key: "launchRules.allowlistWindowSecs"
+        }
+      }
+    },
+    {
+      key: "launchRules.devBuyMaxRaw",
+      type: "decimal",
+      help: "The most the launching wallet may buy before the open, only with --open-in: at least the launch's own buy, at most the dev-buy ceiling, and the buy by default. That spend counts toward the per-wallet cap after the open. The CLI takes whole quote units; the request field is raw units as a decimal string.",
+      range: {
+        unit: "whole quote units"
+      },
+      chains: [
+        "solana"
+      ],
+      requires: [
+        "launchRules.openDelaySecs"
+      ],
+      surfaces: {
+        cli: {
+          flag: "--dev-buy-max",
+          value: "<amount>"
+        },
+        mcp: {
+          key: "launchRules.devBuyMaxRaw"
+        },
+        sdk: {
+          key: "launchRules.devBuyMaxRaw"
+        }
+      }
+    },
+    {
       key: "dryRun",
       type: "boolean",
       help: "Print the launch preview without building, signing or recording a launch; local image uploads still become public and permanent.",
@@ -1558,7 +1723,7 @@ var LAUNCH_DEFINITION = {
 
 // src/launch-schema.ts
 var M2_TOP_KEYS = new Set(["wallet", "buy", "feeWallet", "feeWalletMultisig"]);
-var GROUPED_TOP_KEYS = new Set(["socials", "curve", "poolFee"]);
+var GROUPED_TOP_KEYS = new Set(["socials", "curve", "poolFee", "launchRules"]);
 function mcpKey(field) {
   const surface = field.surfaces.mcp;
   return "key" in surface ? surface.key : undefined;
@@ -1683,6 +1848,20 @@ function poolFeeSchema() {
     }).strict()
   ]).optional().describe([tierHelp, startHelp, endHelp, minutesHelp].join(" "));
 }
+function launchRulesSchema() {
+  const helps = [];
+  const shape = {};
+  for (const field of mcpLaunchFields()) {
+    const key = mcpKey(field);
+    if (!key?.startsWith("launchRules."))
+      continue;
+    const wire = "wireType" in field ? field.wireType : undefined;
+    const schema = wire === "number" ? z3.number().int() : wire === "string[]" ? z3.array(z3.string()) : z3.string();
+    shape[key.slice("launchRules.".length)] = schema.optional().describe(field.help);
+    helps.push(field.help);
+  }
+  return z3.object(shape).passthrough().optional().describe(helps.join(" "));
+}
 function scalarSchema(field) {
   const values = "values" in field ? field.values : undefined;
   let schema;
@@ -1714,6 +1893,7 @@ function buildLaunchTokenShape() {
   shape.socials = socialsSchema();
   shape.curve = curveSchema();
   shape.poolFee = poolFeeSchema();
+  shape.launchRules = launchRulesSchema();
   shape.buyAmount = z3.union([z3.string(), z3.number()]).optional().describe(BUY_AMOUNT_DESCRIPTION);
   return shape;
 }
@@ -6306,6 +6486,7 @@ var TOOL_NAMES = [
   "candle_vamp_candidates",
   "candle_token_events",
   "candle_token_card",
+  "candle_get_price_history",
   "candle_token_edit",
   "candle_token_history",
   "candle_token_page_about",
@@ -6489,6 +6670,21 @@ function buildRequest(name, args, cfg) {
       const { chain, mint } = args;
       return {
         url: `${base2}/api/v1/markets/${encodeURIComponent(chain)}/${encodeURIComponent(mint)}`,
+        init: { method: "GET", headers: jsonHeaders() }
+      };
+    }
+    case "candle_get_price_history": {
+      const { chain, mint, interval, limit, to } = args;
+      const query2 = new URLSearchParams;
+      if (interval !== undefined)
+        query2.set("interval", interval);
+      if (limit !== undefined)
+        query2.set("limit", String(limit));
+      if (to !== undefined)
+        query2.set("to", String(to));
+      const qs = query2.size > 0 ? `?${query2}` : "";
+      return {
+        url: `${base2}/api/v1/markets/${encodeURIComponent(chain ?? "solana")}/${encodeURIComponent(mint)}/candles${qs}`,
         init: { method: "GET", headers: jsonHeaders() }
       };
     }
@@ -6725,9 +6921,10 @@ function buildRequest(name, args, cfg) {
     }
     case "candle_get_profile_pnl": {
       const apiKey = requireApiKey2(cfg);
-      const { keyPrefix } = args;
+      const { keyPrefix, sinceMs } = args;
+      const query2 = sinceMs !== undefined ? `?sinceMs=${encodeURIComponent(String(sinceMs))}` : "";
       return {
-        url: `${base2}/api/v1/agent/keys/${encodeURIComponent(keyPrefix)}/pnl`,
+        url: `${base2}/api/v1/agent/keys/${encodeURIComponent(keyPrefix)}/pnl${query2}`,
         init: { method: "GET", headers: jsonHeaders(apiKey) }
       };
     }
@@ -6834,6 +7031,13 @@ async function swap(args, cfg, doFetch) {
 var getMarketShape = {
   chain: z9.string().describe('"solana" or "hood"'),
   mint: z9.string().describe("Token mint (solana) or contract address (hood)")
+};
+var priceHistoryShape = {
+  chain: z9.string().optional().describe('"solana" (the default). Hood is refused with the REST route that serves it'),
+  mint: z9.string().describe("Token mint"),
+  interval: z9.enum(["1m", "5m", "15m", "1h", "4h", "1d"]).optional().describe("Bar length. Default 1h"),
+  limit: z9.number().int().min(1).max(500).optional().describe("How many bars, 1-500. Default 100"),
+  to: z9.number().int().positive().optional().describe("Unix seconds: the newest bar opens at or before this. Default now; page back with the oldest bar's time")
 };
 var TOKEN_EVENTS_LIMIT_MESSAGE = "limit must be a whole number from 1 to 1000";
 var tokenEventsLimit = z9.preprocess((value) => {
@@ -6952,7 +7156,8 @@ var profileWalletsShape = {
   keyPrefix: z9.string().describe("The profile's API key prefix, as listed by candle keys list or in the dashboard")
 };
 var profilePnlShape = {
-  keyPrefix: z9.string().describe("The profile's API key prefix")
+  keyPrefix: z9.string().describe("The profile's API key prefix"),
+  sinceMs: z9.number().int().nonnegative().optional().describe("Unix time in milliseconds. Adds a `window` block: realized and open mark changes since then, including older holdings. Buy and sell fees are charged once. Read complete and incompleteReasons; windowedUsd is null when incomplete. The all-time `pnl` is unchanged.")
 };
 var profileTradesShape = {
   keyPrefix: z9.string().describe("The profile's API key prefix"),
@@ -6975,7 +7180,7 @@ var tradeShape = {
   side: z9.enum(["buy", "sell"]),
   amount: z9.string().optional().describe("Decimal amount. Buys: how much of THIS TOKEN'S OWN quote asset to spend (SOL for a " + 'SOL-launched token, USDC for a USDC-quoted one, and so on: e.g. "0.5"). Sells: how many ' + "TOKENS to sell. Pass exactly one of amount or percent."),
   percent: z9.number().optional().describe("Sells only: sell this percent (integer 1-100) of the holding. Live trades size against the " + "embedded wallet. Paper trades (`paper: true`) size against this key's paper inventory -- " + "the position a previous paper buy credited -- because paper never moves the live wallet."),
-  quoteAsset: z9.string().optional().describe('What the wallet spends on a buy or receives on a sell: "sol", "usdc" or "cndl" on Solana, ' + '"eth" or "usdg" on Hood. Echoing the `quoteAsset` a quote (POST /api/v1/trade/agent/quote) returned is safe. On Solana it applies only ' + "to an arbitrary mint Candle never launched (a buy needs Pro or Max; a sell works on any plan) and is ignored for a Candle token, " + "whose quote comes from the token itself. On Hood it is the settlement asset of a DEX " + "trade; a USDG buy adds an approval transaction an ETH buy does not. It is not the route: " + "the cheapest path to the asset is chosen separately. Defaults to sol / ETH settlement."),
+  quoteAsset: z9.string().optional().describe('What the wallet spends on a buy or receives on a sell: "sol", "usdc" or "cndl" on Solana, ' + '"eth" or "usdg" on Hood. Echoing the `quoteAsset` a quote (POST /api/v1/trade/agent/quote) returned is safe. On Solana it applies only ' + "to an arbitrary mint Candle never launched (a buy or sell works on any plan) and is ignored for a Candle token, " + "whose quote comes from the token itself. On Hood it is the settlement asset of a DEX " + "trade; a USDG buy adds an approval transaction an ETH buy does not. It is not the route: " + "the cheapest path to the asset is chosen separately. Defaults to sol / ETH settlement."),
   maxSlippageBps: z9.number().int().min(0).max(5000).optional().describe("Slippage bound in bps, 0-5000 (50%). Server defaults to 100 (1%)"),
   clientTradeId: z9.string().optional().describe("Idempotency key. Auto-generated when omitted and echoed in the result. Retrying with the " + "SAME id is safe (idempotent replay); a new id is a SECOND trade."),
   paper: z9.preprocess((value) => value === "true" || value === 1 || value === "1" ? true : value === "false" || value === 0 || value === "0" ? false : value, z9.boolean().optional().describe("Rehearse instead of trading. The request passes every admission rule a live trade passes " + "-- the same planner, spend gate, key cap and loss limits -- and records the quote, but " + "nothing is ever broadcast and no funds move. Use it to check that a strategy is admitted " + "before risking anything on it. A paper fill is optimistic by construction: it books the " + "quoted price, so the gap between a paper arm and a live one IS the execution cost. " + "A sell of a mint this key already paper-bought also closes that paper book when the " + "live wallet is empty, even if this flag is omitted."))
@@ -7196,6 +7401,11 @@ function registerToolSubset(server, options) {
     inputSchema: tokenHistoryShape,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
   }, async (args) => callAndRelay("candle_token_history", args, getConfig(), doFetch));
+  register("candle_get_price_history", {
+    title: "Get price history",
+    description: "One Solana token's price history: OHLC bars in USD per token, oldest first, the same bars as the token's chart on Candle. interval 1m, 5m, 15m, 1h, 4h or 1d (default 1h); limit 1-500 (default 100); to is unix seconds (default now). The answer is up to limit bars at or before to (limit is a maximum). Coverage is bounded by source: Candle's own bars come from the latest 1,500 active minutes and a bar whose start cannot be established is left out; the indexer is searched only (limit + 1) x interval seconds back from to. A quiet token can therefore return fewer bars than limit, and a minute with no trades has no bar, so read each bar's time rather than assuming a gapless series. source says which answered: candle (Candle's own curve bars, volumeUnit usd) or birdeye (the indexer's, volumeUnit token). An empty candles list means no bars in the searched coverage, not no history and not a zero price; page back with to. No key needed and none is sent. Hood is refused (400 VALIDATION_FAILED naming GET /api/v1/hood/token/:address/candles). For the current price and 5m/1h/24h change, read candle_get_market.",
+    inputSchema: priceHistoryShape
+  }, async (args) => callAndRelay("candle_get_price_history", args, getConfig(), doFetch));
   register("candle_token_events", {
     title: "Token events",
     description: `One token's event list, newest first: every signal (pattern and summary, new_ticker included), every callout, and every tracked-wallet trade (buys and sells, W or L on a sell whose outcome is known), plus trades Candle's own agents and users made. Each wallet carries its display name or short address, its kind (dev, kol, smart, agent, tracked) and its public group names. No key needed; none is sent even when one is configured, so group names follow the public tier. Off on a deployment until it switches TOKEN_EVENTS on: off, the call answers 503 TOKEN_EVENTS_DISABLED (retryable: false) and that is the server's answer, not a broken tool.
@@ -7356,7 +7566,7 @@ function registerToolSubset(server, options) {
   }, async (args) => callAndRelay("candle_set_profile_wallets", args, getConfig(), doFetch));
   register("candle_get_profile_pnl", {
     title: "Read an agent profile's P&L",
-    description: "Optional `board` beside `pnl` carries profileId, creatorFeesUsd, feeClaimsUnvalued, feeClaimsPartial and " + "totalPnlUsd (absent before a board entry exists): the all-time public board total, including fee claims " + "at their value when claimed, credited to the agent that launched the token when the claiming account " + "is the launching account. `feesUsd` is fees paid; `creatorFeesUsd` is fees earned. Check feeClaimsPartial " + "and feeClaimsUnvalued. `board` is absent on an older backend or a failed board read; it does not change " + "ledger pnl.totalUsd. Staking rewards are held at zero cost; claim value is informational, never added again. " + "This profile's share of the account's P&L: realized profit on the sales it made and on positions its buy opened that closed through a sale made by hand in the web app or an exit outside Candle (the fee and trade count stay under Manual), the Candle fees " + "charged against it, and the positions that belong to it (the wallet's bound key, else the key " + "whose buy opened them) with their cost basis, each MARKED at Candle's current price where one " + "exists: `markPriceUsd`, `marketValueUsd` and `unrealizedUsd` per position, and `unrealizedUsd` " + "overall. A position with no price is counted in `unmarkedPositions` and left out of unrealized, " + "never valued at zero; `oldestMarkAt` says how old the marks are. Deposits and withdrawals are " + "excluded: funding a wallet is not profit. Check `unvalued` and `truncated` before quoting the " + "number; they mean the total is partial. The figures come from the account's one P&L read, the " + "same as the console's, to the cent: `pnl.totalUsd` (realized net plus unrealized) is the " + "console's P&L, plus the Hyperliquid net when `perpsInTotal` is true. Positions live in wallets: each wallet is its own average-cost pool, the total " + "is the sum of `pnl.byWallet` (one row per wallet, main or linked, with the linked wallet's " + "label; `unknown:solana` or `unknown:hood` is the row for fills no record places in a wallet), " + "and one token held in two wallets is two positions, each with its `wallet`. A recorded move " + "between the account's wallets carries its cost and realizes nothing. Moved-in positions and " + "`closedPositions` carry additive `transferredIn`, `basisSource` and `basisComplete`; " + "`basisSource` says whether cost comes from Candle history, on-chain trades or the arrival price; " + "`zero-cost` (with `zeroCostQuantity`) is Solana CNDL with no purchase found, carried at $0. " + "Public `realizedFromTransfersUsd` and `unrealizedFromTransfersUsd` are shares already included in " + "total P&L and rank; do not add them again. Moved-in closes count toward W/L and eligibility. Each position carries " + "`agent` (the key it belongs to) and `dust` when it is worth under one cent; dust stays listed " + "and counted, and `openPositionsExDust` leaves it out. `closed` gives the closed positions as " + "`madeUsd` + `lostUsd` + `partialSellsUsd` = `realizedNetUsd`, with `wins` and `losses`. " + "`lookback` and `truncated` are the account's activity bound, and `tradesConsidered` counts this " + "key's ledger fills. Since 2026-10-02 the total is the sum of wallets rather than one pool across " + "them, so realized figures can differ from earlier reads; a server that predates it omits " + "`totalUsd`, `closed`, `openPositionsExDust`, `wallet`, `agent` and `dust`. " + "Every open position and every `byWallet` row (and its positions) carries `chain` ('solana' or " + "'hood'), and `pnl.byChain` has the total's figures over each chain's fills alone, both chains " + "always present, with `openPositions` there a count (the positions are in `pnl.openPositions`, by " + "`chain`). The two chains sum to the total. A " + "server that predates per-chain P&L omits `chain` and `byChain`. " + PROFILE_PNL_HYPERLIQUID + " Reads only.",
+    description: "Optional `board` beside `pnl` carries profileId, creatorFeesUsd, feeClaimsUnvalued, feeClaimsPartial and " + "totalPnlUsd (absent before a board entry exists): the all-time public board total, including fee claims " + "at their value when claimed, credited to the agent that launched the token when the claiming account " + "is the launching account. `feesUsd` is fees paid; `creatorFeesUsd` is fees earned. Check feeClaimsPartial " + "and feeClaimsUnvalued. `board` is absent on an older backend or a failed board read; it does not change " + "ledger pnl.totalUsd. Staking rewards are held at zero cost; claim value is informational, never added again. " + "This profile's share of the account's P&L: realized profit on the sales it made and on positions its buy opened that closed through a sale made by hand in the web app or an exit outside Candle (the fee and trade count stay under Manual), the Candle fees " + "charged against it, and the positions that belong to it (the wallet's bound key, else the key " + "whose buy opened them) with their cost basis, each MARKED at Candle's current price where one " + "exists: `markPriceUsd`, `marketValueUsd` and `unrealizedUsd` per position, and `unrealizedUsd` " + "overall. A position with no price is counted in `unmarkedPositions` and left out of unrealized, " + "never valued at zero; `oldestMarkAt` says how old the marks are. Deposits and withdrawals are " + "excluded: funding a wallet is not profit. Check `unvalued` and `truncated` before quoting the " + "number; they mean the total is partial. The figures come from the account's one P&L read, the " + "same as the console's, to the cent: `pnl.totalUsd` (realized net plus unrealized) is the " + "console's P&L, plus the Hyperliquid net when `perpsInTotal` is true. Positions live in wallets: each wallet is its own average-cost pool, the total " + "is the sum of `pnl.byWallet` (one row per wallet, main or linked, with the linked wallet's " + "label; `unknown:solana` or `unknown:hood` is the row for fills no record places in a wallet), " + "and one token held in two wallets is two positions, each with its `wallet`. A recorded move " + "between the account's wallets carries its cost and realizes nothing. Moved-in positions and " + "`closedPositions` carry additive `transferredIn`, `basisSource` and `basisComplete`; " + "`basisSource` says whether cost comes from Candle history, on-chain trades or the arrival price; " + "`zero-cost` (with `zeroCostQuantity`) is Solana CNDL with no purchase found, carried at $0. " + "Public `realizedFromTransfersUsd` and `unrealizedFromTransfersUsd` are shares already included in " + "total P&L and rank; do not add them again. Moved-in closes count toward W/L and eligibility. Each position carries " + "`agent` (the key it belongs to) and `dust` when it is worth under one cent; dust stays listed " + "and counted, and `openPositionsExDust` leaves it out. `closed` gives the closed positions as " + "`madeUsd` + `lostUsd` + `partialSellsUsd` = `realizedNetUsd`, with `wins` and `losses`. " + "`lookback` and `truncated` are the account's activity bound, and `tradesConsidered` counts this " + "key's ledger fills. Since 2026-10-02 the total is the sum of wallets rather than one pool across " + "them, so realized figures can differ from earlier reads; a server that predates it omits " + "`totalUsd`, `closed`, `openPositionsExDust`, `wallet`, `agent` and `dust`. " + "Every open position and every `byWallet` row (and its positions) carries `chain` ('solana' or " + "'hood'), and `pnl.byChain` has the total's figures over each chain's fills alone, both chains " + "always present, with `openPositions` there a count (the positions are in `pnl.openPositions`, by " + "`chain`). The two chains sum to the total. A " + "server that predates per-chain P&L omits `chain` and `byChain`. " + PROFILE_PNL_HYPERLIQUID + " Pass `sinceMs` for a `window` block beside all-time `pnl`: existing holdings start at the last " + "completed historical minute candle's close, returned in `boundary.marks` with its timestamp. " + "Sales and open positions use that window basis, with later buys at trade cost. `feesUsd` includes " + "both buy and sell fees once, separately from basis. `windowedUsd` is " + "realizedNetUsd plus unrealizedUsd. Missing boundary/current marks or incomplete history return " + "complete:false, incompleteReasons and windowedUsd:null; component sums are partial then. " + "This is spot trading P&L; LP, perps and fee income remain separate. Reads only.",
     inputSchema: profilePnlShape
   }, async (args) => callAndRelay("candle_get_profile_pnl", args, getConfig(), doFetch));
   register("candle_get_profile_trades", {
@@ -7432,7 +7642,7 @@ function registerToolSubset(server, options) {
 
 ` + "Arguments: `mint` and `side` are required. Amounts are DECIMAL, never raw base units " + '(amount: "0.5", not lamports). Omitting the amount on a sell sells the whole ' + `position.
 
-` + "Plans: every plan can buy and sell Candle-launched tokens and base assets, and SELL a token it holds that " + "Candle did not launch. BUYING such a token needs Pro or Max (TIER_REQUIRED otherwise). Each trade pays the " + `plan's agent fee on top (feeBps in candle_get_plans).
+` + "Plans: every plan can buy and sell Candle-launched tokens, base assets, and a token " + "Candle did not launch. Each trade pays the " + `plan's agent fee on top (feeBps in candle_get_plans).
 
 ` + "Pass `paper: true` to rehearse: every admission rule runs and the quote is recorded, but " + "nothing broadcasts and no funds move. A paper buy credits this key's paper inventory, " + "including for external Solana mints routed through Jupiter. A later sell by amount or " + "percent closes that book without reading the live wallet and without MARKET_NOT_FOUND " + "-- including when `paper` is omitted on the exit, as long as the paper position exists. " + "Do this before the first live trade of a new strategy, and whenever you are unsure a " + `trade would be admitted at all.
 
@@ -7656,8 +7866,9 @@ async function registerEligibleProfileTool(server, env = process.env, doFetch = 
 // src/server.ts
 var INSTRUCTIONS = `Candle is a trading and token-launch rail for agents. You hold a scoped API key, never a private key; signing and funding stay with the key owner's wallet.
 
-START HERE — fourteen tools need NO credential. Call these first to confirm the server is wired before asking anyone for anything:
+START HERE — fifteen tools need NO credential. Call these first to confirm the server is wired before asking anyone for anything:
   candle_get_market       price, market cap, volume, curve state for one token
+  candle_get_price_history one Solana token's OHLC bars in USD (1m to 1d, up to 500, page back with to); source and volumeUnit say whose bars
   candle_get_feed         the roster: hot streak, new pairs, graduated, final stretch, blue chip (final stretch is refused where it is not switched on; use another bucket)
   candle_token_page_about public About summary, switches default off
   candle_token_page_burns completed CNDL burn history

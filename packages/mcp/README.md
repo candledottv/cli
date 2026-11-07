@@ -1,7 +1,7 @@
 # @candledottv/mcp
 
 An MCP (Model Context Protocol) server for the Candle agent rail. The current source exposes Candle's REST API as
-eighty-three tools over stdio, plus four Hyperliquid market reads (eighty-seven in all), so an MCP-capable agent can launch tokens (optionally seeded with a dev
+eighty-four tools over stdio, plus four Hyperliquid market reads (eighty-eight in all), so an MCP-capable agent can launch tokens (optionally seeded with a dev
 buy in the same call), trade, convert between base assets (including across chains), read market
 and feed data, read one token's signals and tracked-wallet trades and its card data, report on-chain activity,
 check an agent profile, and backtest a strategy in hacc's strategy lab without hand-rolling HTTP calls. The five
@@ -11,12 +11,12 @@ Not sure this is the right tool? [How to choose: SDK, MCP or CLI](https://docs.c
 
 ## Try it without a key
 
-Eighteen tools are read-only and need nothing but `CANDLE_API_URL` (which already defaults to
-production): `candle_get_market`, `candle_get_feed`, `candle_token_events`, `candle_token_card`, `candle_token_history`,
+Nineteen tools are read-only and need nothing but `CANDLE_API_URL` (which already defaults to
+production): `candle_get_market`, `candle_get_price_history`, `candle_get_feed`, `candle_token_events`, `candle_token_card`, `candle_token_history`,
 `candle_token_page_about`, `candle_token_page_burns`, `candle_token_page_history`, `candle_token_page_updates`, `candle_token_page_comments`, `candle_token_forensics`, `candle_token_clusters`,
 `candle_get_agent_profile`, `candle_list_agents`, `candle_list_agent_posts`, `candle_get_agent_positions`, `candle_resolve_token` and `candle_get_plans`.
-All of them are in the published 0.10.29; `candle_get_agent_positions` is new since 0.10.27.
-With token-page reads enabled on the deployment, those eighteen work immediately without a key.
+All of them but `candle_get_price_history` (new in source, not yet published) are in the published 0.10.29; `candle_get_agent_positions` is new since 0.10.27.
+With token-page reads enabled on the deployment, those nineteen work immediately without a key.
 Install the released server with no `env` block at all and its ten public reads work immediately:
 
 ```json
@@ -37,7 +37,7 @@ Environment below -- or skip env editing entirely: install the Candle CLI
 environment.
 
 `CANDLE_MCP_TOOLS` (optional) is a comma-separated allowlist of tool names; only those register.
-Unset means all eighty-three. An unknown name fails startup with the valid names in the message, rather
+Unset means all eighty-four. An unknown name fails startup with the valid names in the message, rather
 than silently registering the wrong surface. `candle mcp --read-only` / `--tools` set this for
 you.
 
@@ -54,8 +54,8 @@ Both take decimal amounts, never raw base units, and resolve the scale themselve
 - A `candle_trade` **buy** is denominated in the token's OWN quote asset, whatever it was launched
   against (SOL for a SOL-launched token, USDC or CNDL for those quote pairs). The tool reads the
   market first and converts against its `quoteDecimals`; the `quoteAsset` field applies only to a
-  mint Candle never launched, the path traded through Jupiter (buying needs Pro or Max; selling
-  works on any plan). A
+  mint Candle never launched, the path traded through Jupiter (buying and selling work on any
+  plan). A
   **sell** is denominated in tokens and converts against the market's own `decimals`.
 - A `candle_launch_and_seed` `devBuy` is denominated in the quote asset that launch selects, since
   there the caller genuinely picks the new token's quote pair: `quoteAsset` if given, otherwise
@@ -73,6 +73,13 @@ rest, and omitted uses `curve_price` when allocations fit, otherwise `legacy`. `
 `discord`. See
 [Custom curves](https://docs.candle.tv/developers/headless-launch#custom-curves-choose-v-and-g-switched-off).
 
+On Solana, where the API has `CURVE_LAUNCH_RULES_ENABLED` on, both launch tools take
+`launchRules`, the request's nested object in seconds and raw units like their other amounts:
+`openDelaySecs`, `maxBuyPerWalletRaw` with `capWindowSecs`, `allowlist` with
+`allowlistWindowSecs`, and `devBuyMaxRaw`. The API checks the bounds and answers
+`LAUNCH_RULES_INVALID` with the field and the reason. See
+[Launch rules](https://docs.candle.tv/developers/headless-launch#launch-rules-solana).
+
 For a full walkthrough of `candle_launch_and_seed` and `candle_trade`, including the keyless read
 tools, getting a key, funding the embedded wallet, and idempotent retries, see
 [Candle MCP server](https://docs.candle.tv/developers/mcp-server).
@@ -87,7 +94,7 @@ tools, getting a key, funding the embedded wallet, and idempotent retries, see
   non-loopback host. For a trusted local endpoint that is not loopback, such as a devcontainer
   reaching its host; not for anything that leaves the machine.
 - `CANDLE_AGENT_API_KEY` -- an agent API key (`cndl_live_...` / `cndl_test_...`), issued from a
-  Candle account's agent settings page. Required by every tool except the eighteen read-only ones
+  Candle account's agent settings page. Required by every tool except the nineteen read-only ones
   listed above, which includes the account-scoped reads (`candle_get_wallets`,
   `candle_execution_status`, `candle_get_operation`) as well as the writes; those eighteen
   work without it, so the server is useful the moment it is installed and only asks for a key when
@@ -116,6 +123,7 @@ tools, getting a key, funding the embedded wallet, and idempotent retries, see
 | --- | --- | --- | --- |
 | `candle_launch_token` | Launch a token on Candle | `POST /api/v1/launch/headless` (or `/dry-run` when `dryRun: true`); with `imagePath`, `POST /api/v1/uploads/agent-image` first | `CANDLE_AGENT_API_KEY` |
 | `candle_get_market` | Get market state | `GET /api/v1/markets/:chain/:mint` | none |
+| `candle_get_price_history` | One Solana token's OHLC bars in USD per token, oldest first (interval 1m-1d, limit 1-500, `to` unix seconds); `source` and `volumeUnit` say whose bars. Hood is refused with its REST route | `GET /api/v1/markets/solana/:mint/candles` | none |
 | `candle_get_feed` | Get a token feed | `GET /api/v1/markets/feed?bucket=...` | none |
 | `candle_token_edit` | As the token's creator, set Candle's copy of its description and links; an unknown `socials` key is refused locally. Needs a `launch:write` key from the launching account; reuse `idempotencyKey` to retry. Off until the deployment switches it on (503 `METADATA_EDIT_DISABLED`) | `PATCH /api/v1/tokens/:chain/:mint/metadata` | `x-api-key` |
 | `candle_token_history` | A token's metadata edits, newest first, with the previous values | `GET /api/v1/tokens/:chain/:mint/metadata/history?limit=...&cursor=...` | none |
@@ -159,7 +167,7 @@ tools, getting a key, funding the embedded wallet, and idempotent retries, see
 | `candle_get_wallets` | The account's embedded wallets, one per chain, with delegation state | `GET /api/v1/agent/wallets/embedded` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_profile_wallets` | Which wallets an agent profile may spend from, and whether it is scoped | `GET /api/v1/agent/keys/:prefix/wallets` | `CANDLE_AGENT_API_KEY` |
 | `candle_set_profile_wallets` | Replace the wallets an agent profile may spend from | `PUT /api/v1/agent/keys/:prefix/wallets` | `CANDLE_AGENT_API_KEY` |
-| `candle_get_profile_pnl` | An agent profile's share of the account's P&L, the console's figures to the cent: realized on its sales, fees, and the open positions that belong to it at cost basis, marked at current prices (unpriced positions counted, not zeroed), with `totalUsd`, the closed positions as made, lost and partial sells (`closed`), dust flagged and counted apart (`openPositionsExDust`), split by wallet (`pnl.byWallet`, summing to the total) and by chain (`pnl.byChain`), with `chain` and `wallet` on every position | `GET /api/v1/agent/keys/:prefix/pnl` | `CANDLE_AGENT_API_KEY` |
+| `candle_get_profile_pnl` | An agent profile's share of the account's P&L, the console's figures to the cent: realized on its sales, fees, and the open positions that belong to it at cost basis, marked at current prices (unpriced positions counted, not zeroed), with `totalUsd`, the closed positions as made, lost and partial sells (`closed`), dust flagged and counted apart (`openPositionsExDust`), split by wallet (`pnl.byWallet`, summing to the total) and by chain (`pnl.byChain`), with `chain` and `wallet` on every position; `sinceMs` adds a `window` of realized and open mark changes, including older holdings (see "P&L since a time") | `GET /api/v1/agent/keys/:prefix/pnl` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_profile_trades` | An agent profile's orders, fills, fees and transaction hashes | `GET /api/v1/agent/keys/:prefix/trades` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_portfolio` | What the account's embedded and TEE wallets hold on Solana and Hood (Hood in `hood`), with prices; unpriced holdings say why, never zero | `GET /api/v1/agent/portfolio` | `CANDLE_AGENT_API_KEY` (`account:read`) |
 | `candle_execution_status` | One call before trading: wallets to spend from, tier, and whether trading is possible | Composes the wallet and tier reads | `CANDLE_AGENT_API_KEY` |
@@ -242,7 +250,7 @@ explicitly. Assets with nothing spendable report `empty`; a failed asset never s
 ## Errors
 
 This package never reinterprets an error body, and that body is not one uniform shape across all
-eighty-three tools:
+eighty-four tools:
 
 - `candle_token_events`, called with `kind`, is the one narrowing of a SUCCESS body, never an
   error one: the relayed `events` are filtered to that kind and the body gains `filteredByKind`.
@@ -477,3 +485,39 @@ account's own comment, including after selling; no other account can. Flags appl
 ## Rate-limit cost per tool
 
 Every tool spends from the key's per-minute limit (`tierCaps.rateLimitPerMin` on `GET /api/v1/agent/tier`; Free 30, Pro 300, Max 600). Over `candle mcp` (stdio) a tool costs one per REST request it makes: `candle_execution_status` makes 3, and `candle_get_portfolio`, `candle_get_profile_pnl` and `candle_get_wallets` make 1 each. The hosted connector charges one per tool call at admission, and adds a separate 60 a minute per IP. A refusal is `429 RATE_LIMITED` with `Retry-After: 60`. Details: the developer docs, "Rate limits and what a call costs".
+
+
+## P&L since a time
+
+`GET /api/v1/agent/keys/{prefix}/pnl?sinceMs=<unix ms>` (SDK `getProfilePnl(prefix, { sinceMs })`, MCP
+`candle_get_profile_pnl` with `sinceMs`) adds a spot trading `window` beside the unchanged all-time
+`pnl`. LP, Hyperliquid and creator fee income are separate from this window.
+
+Holdings present immediately before T start at the last completed historical minute candle's close,
+not their lifetime purchase cost. The candle containing T is excluded to avoid using future trades.
+`boundary.marks` gives each price, `source: "candle-close"` and `updatedAt` (the candle's end, Unix ms);
+a quiet token's last candle can be older than T. These are historical observed marks, not interpolated
+prices at exactly T. Later buys enter at their actual trade cost. Partial sells, additional buys and
+moves between wallets use the account engine's average-cost rules on this opening book.
+
+`realizedGrossUsd` is sales' profit against window basis; `feesUsd` charges all in-window buy and sell
+fees exactly once, including buys still open. Fees are debited separately and never added to cost
+basis. Fees follow the key that placed each fill; a manual sale credits the original opener's gross
+but its fee stays with Manual.
+`realizedNetUsd = realizedGrossUsd - feesUsd`;
+`unrealizedUsd` is open holdings' change against window basis; `windowedUsd` is their sum. `closed`
+and `closedRounds` describe rounds closed during this replay, using window basis and only window
+fees. A pre-T buy fee is excluded even when that holding is sold after T. Fills exactly at T are included.
+
+`complete: false` and `incompleteReasons` explicitly identify missing boundary/current marks,
+truncated history, unvalued fills or unknown/incomplete cost. In that case **`windowedUsd` is null**;
+component figures are partial, never a complete zero. `boundary.missingMints` names missing opening
+prices, including holdings since fully closed. Boundary coverage is checked account-wide because
+other wallets' and unplaced holdings can fund this key's sales. Price history uses the existing
+Candle candle store; tokens without historical candles have incomplete coverage. There are no new
+vendor requests or fabricated opening prices. The window requires the Postgres account ledger
+(`API_DATABASE_URL`); an unavailable ledger/history read returns an error, not an all-time fallback.
+
+`sinceMs` must be a non-negative integer Unix timestamp in milliseconds at or before now; invalid,
+blank, fractional or future inputs return `VALIDATION_FAILED` (400). Omitting it returns the existing
+all-time response without `window`.

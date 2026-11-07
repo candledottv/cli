@@ -142,6 +142,9 @@ export const TOOL_NAMES = [
   // BE-2119: the token card's data for one token, over the public card route. Keyless and the
   // same for every caller.
   "candle_token_card",
+  // BE-2654 (R2): one Solana token's price history, over the public market candles route. Keyless
+  // like the market read.
+  "candle_get_price_history",
   // BE-2140: the creator metadata edit (keyed, launch:write) and its public history (keyless).
   "candle_token_edit",
   "candle_token_history",
@@ -424,6 +427,27 @@ export function buildRequest(name: RestToolName, args: Record<string, unknown>, 
       const { chain, mint } = args as { chain: string; mint: string }
       return {
         url: `${base}/api/v1/markets/${encodeURIComponent(chain)}/${encodeURIComponent(mint)}`,
+        init: { method: "GET", headers: jsonHeaders() },
+      }
+    }
+
+    case "candle_get_price_history": {
+      // Keyless like the market read: the bars are the same for every caller. The route is the
+      // validator (interval, limit, to, and the Hood refusal that names Hood's own route).
+      const { chain, mint, interval, limit, to } = args as {
+        chain?: string
+        mint: string
+        interval?: string
+        limit?: number
+        to?: number
+      }
+      const query = new URLSearchParams()
+      if (interval !== undefined) query.set("interval", interval)
+      if (limit !== undefined) query.set("limit", String(limit))
+      if (to !== undefined) query.set("to", String(to))
+      const qs = query.size > 0 ? `?${query}` : ""
+      return {
+        url: `${base}/api/v1/markets/${encodeURIComponent(chain ?? "solana")}/${encodeURIComponent(mint)}/candles${qs}`,
         init: { method: "GET", headers: jsonHeaders() },
       }
     }
@@ -734,9 +758,10 @@ export function buildRequest(name: RestToolName, args: Record<string, unknown>, 
 
     case "candle_get_profile_pnl": {
       const apiKey = requireApiKey(cfg)
-      const { keyPrefix } = args as { keyPrefix: string }
+      const { keyPrefix, sinceMs } = args as { keyPrefix: string; sinceMs?: number }
+      const query = sinceMs !== undefined ? `?sinceMs=${encodeURIComponent(String(sinceMs))}` : ""
       return {
-        url: `${base}/api/v1/agent/keys/${encodeURIComponent(keyPrefix)}/pnl`,
+        url: `${base}/api/v1/agent/keys/${encodeURIComponent(keyPrefix)}/pnl${query}`,
         init: { method: "GET", headers: jsonHeaders(apiKey) },
       }
     }
@@ -900,6 +925,21 @@ async function swap(args: Record<string, unknown>, cfg: RequestConfig, doFetch: 
 const getMarketShape = {
   chain: z.string().describe('"solana" or "hood"'),
   mint: z.string().describe("Token mint (solana) or contract address (hood)"),
+}
+
+const priceHistoryShape = {
+  chain: z.string().optional().describe('"solana" (the default). Hood is refused with the REST route that serves it'),
+  mint: z.string().describe("Token mint"),
+  interval: z.enum(["1m", "5m", "15m", "1h", "4h", "1d"]).optional().describe("Bar length. Default 1h"),
+  limit: z.number().int().min(1).max(500).optional().describe("How many bars, 1-500. Default 100"),
+  to: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "Unix seconds: the newest bar opens at or before this. Default now; page back with the oldest bar's time",
+    ),
 }
 
 const TOKEN_EVENTS_LIMIT_MESSAGE = "limit must be a whole number from 1 to 1000"
@@ -1142,6 +1182,14 @@ const profileWalletsShape = {
 
 const profilePnlShape = {
   keyPrefix: z.string().describe("The profile's API key prefix"),
+  sinceMs: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe(
+      "Unix time in milliseconds. Adds a `window` block: realized and open mark changes since then, including older holdings. Buy and sell fees are charged once. Read complete and incompleteReasons; windowedUsd is null when incomplete. The all-time `pnl` is unchanged.",
+    ),
 }
 
 const profileTradesShape = {
@@ -1217,7 +1265,7 @@ const tradeShape = {
     .describe(
       'What the wallet spends on a buy or receives on a sell: "sol", "usdc" or "cndl" on Solana, ' +
         '"eth" or "usdg" on Hood. Echoing the `quoteAsset` a quote (POST /api/v1/trade/agent/quote) returned is safe. On Solana it applies only ' +
-        "to an arbitrary mint Candle never launched (a buy needs Pro or Max; a sell works on any plan) and is ignored for a Candle token, " +
+        "to an arbitrary mint Candle never launched (a buy or sell works on any plan) and is ignored for a Candle token, " +
         "whose quote comes from the token itself. On Hood it is the settlement asset of a DEX " +
         "trade; a USDG buy adds an approval transaction an ETH buy does not. It is not the route: " +
         "the cheapest path to the asset is chosen separately. Defaults to sol / ETH settlement.",
@@ -1737,6 +1785,17 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
   )
 
   register(
+    "candle_get_price_history",
+    {
+      title: "Get price history",
+      description:
+        "One Solana token's price history: OHLC bars in USD per token, oldest first, the same bars as the token's chart on Candle. interval 1m, 5m, 15m, 1h, 4h or 1d (default 1h); limit 1-500 (default 100); to is unix seconds (default now). The answer is up to limit bars at or before to (limit is a maximum). Coverage is bounded by source: Candle's own bars come from the latest 1,500 active minutes and a bar whose start cannot be established is left out; the indexer is searched only (limit + 1) x interval seconds back from to. A quiet token can therefore return fewer bars than limit, and a minute with no trades has no bar, so read each bar's time rather than assuming a gapless series. source says which answered: candle (Candle's own curve bars, volumeUnit usd) or birdeye (the indexer's, volumeUnit token). An empty candles list means no bars in the searched coverage, not no history and not a zero price; page back with to. No key needed and none is sent. Hood is refused (400 VALIDATION_FAILED naming GET /api/v1/hood/token/:address/candles). For the current price and 5m/1h/24h change, read candle_get_market.",
+      inputSchema: priceHistoryShape,
+    },
+    async (args) => callAndRelay("candle_get_price_history", args, getConfig(), doFetch),
+  )
+
+  register(
     "candle_token_events",
     {
       title: "Token events",
@@ -2178,7 +2237,13 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
         "`chain`). The two chains sum to the total. A " +
         "server that predates per-chain P&L omits `chain` and `byChain`. " +
         PROFILE_PNL_HYPERLIQUID +
-        " Reads only.",
+        " Pass `sinceMs` for a `window` block beside all-time `pnl`: existing holdings start at the last " +
+        "completed historical minute candle's close, returned in `boundary.marks` with its timestamp. " +
+        "Sales and open positions use that window basis, with later buys at trade cost. `feesUsd` includes " +
+        "both buy and sell fees once, separately from basis. `windowedUsd` is " +
+        "realizedNetUsd plus unrealizedUsd. Missing boundary/current marks or incomplete history return " +
+        "complete:false, incompleteReasons and windowedUsd:null; component sums are partial then. " +
+        "This is spot trading P&L; LP, perps and fee income remain separate. Reads only.",
       inputSchema: profilePnlShape,
     },
     async (args) => callAndRelay("candle_get_profile_pnl", args, getConfig(), doFetch),
@@ -2356,8 +2421,8 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
         "Arguments: `mint` and `side` are required. Amounts are DECIMAL, never raw base units " +
         '(amount: "0.5", not lamports). Omitting the amount on a sell sells the whole ' +
         "position.\n\n" +
-        "Plans: every plan can buy and sell Candle-launched tokens and base assets, and SELL a token it holds that " +
-        "Candle did not launch. BUYING such a token needs Pro or Max (TIER_REQUIRED otherwise). Each trade pays the " +
+        "Plans: every plan can buy and sell Candle-launched tokens, base assets, and a token " +
+        "Candle did not launch. Each trade pays the " +
         "plan's agent fee on top (feeBps in candle_get_plans).\n\n" +
         "Pass `paper: true` to rehearse: every admission rule runs and the quote is recorded, but " +
         "nothing broadcasts and no funds move. A paper buy credits this key's paper inventory, " +
