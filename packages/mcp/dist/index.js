@@ -2409,8 +2409,28 @@ async function resolveToken(args, cfg, doFetch) {
     return read.err;
   return { text: JSON.stringify({ success: true, chain, mint: args.mint, market: read.market }, null, 2) };
 }
+var TEE_SPEND_SCOPES = ["swap:write", "transfer:write", "launch:write"];
+function teePayers(body) {
+  const page = body;
+  if (!Array.isArray(page?.page))
+    return;
+  const paused = page.paused === true;
+  const scopes = Array.isArray(page.scopes) ? page.scopes.filter((s) => typeof s === "string") : [];
+  const spendAuthorized = TEE_SPEND_SCOPES.some((scope) => scopes.includes(scope));
+  const wallets = page.page.map((row) => ({
+    id: String(row.id),
+    address: String(row.address),
+    chain: String(row.chain),
+    ...typeof row.label === "string" ? { label: row.label } : {},
+    active: row.active === true,
+    allowLaunch: row.allowLaunch === true,
+    spendable: row.active === true && !paused && spendAuthorized
+  }));
+  return { paused, scopes, wallets, complete: page.isDone === true };
+}
 var STOP_CLEARED_BY = "An account owner reviews the profile and resumes it from the agent console; an API key cannot resume it.";
-async function executionStatus(cfg, doFetch) {
+async function executionStatus(cfg, doFetch, options = {}) {
+  const readTee = options.teeWallets !== false;
   const apiKey = requireApiKey(cfg);
   const get = async (path) => {
     const res = await doFetch(`${base(cfg)}${path}`, { method: "GET", headers: headers(apiKey) });
@@ -2424,14 +2444,17 @@ async function executionStatus(cfg, doFetch) {
     }
     return { ok: res.ok, status: res.status, body };
   };
-  const [wallets, tier, limits, risk] = await Promise.all([
+  const [wallets, trading, tier, limits, risk] = await Promise.all([
     get("/api/v1/agent/wallets/embedded"),
+    readTee ? get("/api/v1/agent/wallets/trading") : Promise.resolve(undefined),
     get("/api/v1/agent/tier"),
     get("/api/v1/agent/keys/self/limits"),
     get("/api/v1/agent/keys/self/risk")
   ]);
+  const tee = trading?.ok ? teePayers(trading.body) : undefined;
   const unreadable = [
     ["wallets", wallets],
+    ...trading ? [["tee", tee ? trading : { ok: false }]] : [],
     ["tier", tier],
     ["limits", limits],
     ["risk", risk]
@@ -2448,6 +2471,11 @@ async function executionStatus(cfg, doFetch) {
       updateAvailable: updateAvailable() ?? undefined,
       unreadable: unreadable.length > 0 ? unreadable.map(([name]) => name) : undefined,
       wallets: wallets.body,
+      tee: tee?.wallets,
+      teeScopes: tee ? tee.scopes : undefined,
+      teePaused: tee ? tee.paused : undefined,
+      teeComplete: tee ? tee.complete : undefined,
+      teeError: trading && !tee ? trading.body : undefined,
       tier: tier.body,
       limits: limits.body,
       risk: risk.body
@@ -6170,7 +6198,8 @@ var PLAN_CAPABILITY_LABELS = {
   createLinkedWallets: "Create linked wallets",
   importLinkedWallets: "Import linked wallets",
   limitOrders: "Limit orders",
-  quant: "Quant deep analyses (Max)"
+  quant: "Quant deep analyses (Max)",
+  strategyLab: "Strategy lab (saved strategies stay Max)"
 };
 var PLAN_LABELS = { free: "Free", believer: "Believer", pro: "Pro", max: "Max" };
 function planLabel(plan) {
@@ -6199,6 +6228,9 @@ function planTableRows(table) {
     row("Uploads per minute", (e) => count(e.limits.uploadsPerMin)),
     row("Linked wallets", (e) => count(e.limits.linkedWallets))
   ];
+  if (plans.some((e) => typeof e.limits.labReplaysPerDay === "number")) {
+    rows.push(row("Strategy lab replays", (e) => typeof e.limits.labReplaysPerDay === "number" ? `${count(e.limits.labReplaysPerDay)} a day` : "-"));
+  }
   const known = Object.keys(PLAN_CAPABILITY_LABELS);
   const served = new Set;
   for (const entry of plans)
@@ -6499,6 +6531,7 @@ var stakingWriteShape = {
 var TOOL_NAMES = [
   "candle_launch_token",
   "candle_get_market",
+  "candle_quote",
   "candle_get_feed",
   "candle_vamp_candidates",
   "candle_token_events",
@@ -6542,6 +6575,8 @@ var TOOL_NAMES = [
   "candle_transfer",
   "candle_sweep",
   "candle_get_wallets",
+  "candle_get_trading_wallets",
+  "candle_get_spendable_balances",
   "candle_get_profile_wallets",
   "candle_set_profile_wallets",
   "candle_get_profile_pnl",
@@ -6692,6 +6727,26 @@ function buildRequest(name, args, cfg) {
       return {
         url: `${base2}/api/v1/markets/${encodeURIComponent(chain)}/${encodeURIComponent(mint)}`,
         init: { method: "GET", headers: jsonHeaders() }
+      };
+    }
+    case "candle_quote": {
+      const apiKey = requireApiKey2(cfg);
+      const { chain, mint, side, amountRaw, quoteAsset, poolKey, includeRoundTrip } = args;
+      return {
+        url: `${base2}/api/v1/trade/agent/quote`,
+        init: {
+          method: "POST",
+          headers: jsonHeaders(apiKey),
+          body: JSON.stringify({
+            chain,
+            mint,
+            side,
+            amountRaw,
+            ...quoteAsset !== undefined && quoteAsset !== "" ? { quoteAsset } : {},
+            ...poolKey !== undefined ? { poolKey } : {},
+            ...includeRoundTrip !== undefined ? { includeRoundTrip } : {}
+          })
+        }
       };
     }
     case "candle_get_price_history": {
@@ -6931,6 +6986,28 @@ function buildRequest(name, args, cfg) {
         init: { method: "GET", headers: jsonHeaders(apiKey) }
       };
     }
+    case "candle_get_trading_wallets": {
+      const apiKey = requireApiKey2(cfg);
+      const { cursor } = args;
+      const query2 = cursor === undefined ? "" : `?cursor=${encodeURIComponent(cursor)}`;
+      return {
+        url: `${base2}/api/v1/agent/wallets/trading${query2}`,
+        init: { method: "GET", headers: jsonHeaders(apiKey) }
+      };
+    }
+    case "candle_get_spendable_balances": {
+      const apiKey = requireApiKey2(cfg);
+      const { cursor, mints } = args;
+      const params = new URLSearchParams;
+      if (cursor !== undefined)
+        params.set("cursor", cursor);
+      if (mints !== undefined && mints.length > 0)
+        params.set("mints", mints.join(","));
+      return {
+        url: `${base2}/api/v1/agent/wallets/self/balances${params.size ? `?${params}` : ""}`,
+        init: { method: "GET", headers: jsonHeaders(apiKey) }
+      };
+    }
     case "candle_get_profile_wallets": {
       const apiKey = requireApiKey2(cfg);
       const { keyPrefix } = args;
@@ -7087,6 +7164,15 @@ var getMarketShape = {
   chain: z9.string().describe('"solana" or "hood"'),
   mint: z9.string().describe("Token mint (solana) or contract address (hood)")
 };
+var quoteShape = {
+  chain: z9.enum(["solana", "hood"]),
+  mint: z9.string().describe("Token mint (solana) or contract address (hood)"),
+  side: z9.enum(["buy", "sell"]),
+  amountRaw: z9.string().describe("Positive integer in base units: the quote asset's for a buy, the token's for a sell"),
+  quoteAsset: z9.string().optional().describe('Asset to price in, e.g. "sol" or "usdc" on Solana, "eth" or "usdg" on Hood'),
+  poolKey: z9.unknown().optional().describe("Hood only: a pool hint for a pool nobody has indexed yet"),
+  includeRoundTrip: z9.boolean().optional().describe("Hood only: also return the buy-then-sell cost in basis points")
+};
 var priceHistoryShape = {
   chain: z9.string().optional().describe('"solana" (the default). Hood is refused with the REST route that serves it'),
   mint: z9.string().describe("Token mint"),
@@ -7131,7 +7217,7 @@ var feedLimit = z9.preprocess((value) => {
   return /^[0-9]+$/.test(trimmed) ? Number(trimmed) : value;
 }, z9.number({ invalid_type_error: FEED_LIMIT_MESSAGE }).int(FEED_LIMIT_MESSAGE).min(1, FEED_LIMIT_MESSAGE).max(200, FEED_LIMIT_MESSAGE).optional().describe("Max rows to return, an integer from 1 to 200."));
 var getFeedShape = {
-  bucket: z9.enum(["new", "graduated", "onfire", "bluechip", "finalstretch"]).describe("finalstretch: pump.fun tokens at 50% or more of their bonding curve, most complete first; no delta, read the whole list. Where it is not switched on it is refused as an unknown bucket: use another bucket. bluechip is deprecated and will be removed."),
+  bucket: z9.enum(["new", "graduated", "onfire", "bluechip", "finalstretch"]).describe('finalstretch: pump.fun tokens at 50% or more of their bonding curve, most complete first, at most the 200 most complete (limit 200 reads all of them); no delta, read the whole list. Narrow it to tokens near graduation with where {"progress":{"gte":0.9}}. Where it is not switched on it is refused as an unknown bucket: use another bucket. bluechip is deprecated and will be removed.'),
   chain: z9.string().optional().describe("Optional chain filter"),
   where: z9.string().optional().describe('JSON filter, e.g. {"marketCap":{"lt":150000},"liquidityUsd":{"gte":25000},"mintAuthorityDisabled":{"eq":true}}. ' + "Comparators: eq, ne, lt, lte, gt, gte, present. An ABSENT field satisfies none of them except " + "present:false, so a filter for mintAuthorityDisabled eq true returns only tokens that actually say " + "true, never ones where the flag is simply missing. Use present:false to find the tokens with no data."),
   sort: z9.string().optional().describe('Sort as "field" or "field:asc" / "field:desc". A bare field means desc.'),
@@ -7206,6 +7292,13 @@ var claimFeesShape = {
 };
 var resolveTokenShape = {
   mint: z9.string().describe("Token mint (Solana, base58) or contract address (Hood, 0x-prefixed)")
+};
+var tradingWalletsShape = {
+  cursor: z9.string().optional().describe("The continueCursor of the previous page. Omit for the first page")
+};
+var spendableBalancesShape = {
+  cursor: z9.string().optional().describe("The continueCursor of the previous page. Omit for the first page"),
+  mints: z9.array(z9.string()).max(10).optional().describe("Up to 10 extra tokens to read beside the base assets: Solana mints or Hood (0x) token addresses. " + "Each is read on the wallets of its own chain")
 };
 var profileWalletsShape = {
   keyPrefix: z9.string().describe("The profile's API key prefix, as listed by candle keys list or in the dashboard")
@@ -7427,6 +7520,12 @@ function registerToolSubset(server, options) {
     description: "Read Candle and indexed external markets, including indexed-but-not-routable tokens. No key needed. " + EXTERNAL_MARKET_DISCLOSURE + " " + "Read candleLaunched, launchpad, venue and trade.routable; jupiterOk and discovery flags are distinct. " + "Routability is stored eligibility, not a quote or permission. General quotes use POST /api/v1/trade/agent/quote. " + "Curve quotes and lifecycle describe Candle launches. MARKET_NOT_FOUND is a legacy code: read " + "error.routing.reason, error.discovery and sibling error.retryable. A curve-only 404 does not mean untradeable.",
     inputSchema: getMarketShape
   }, async (args) => callAndRelay("candle_get_market", args, getConfig(), doFetch));
+  register("candle_quote", {
+    title: "Quote a trade",
+    description: "Price a buy or sell before making it. Moves nothing. Needs an API key with the swap:write scope: a read-only key (account:read) is refused, so use candle_get_market for state instead. " + "Returns amountOut (base units), venue, quoteAsset, quoteDecimals and quotedAt; Hood answers also carry fee and price impact. " + "route is present only on some answers, so do not assume it. A quote is a snapshot (Hood quotes are cached for 10 seconds), not a promise of the fill. " + "Limited to 600 quotes a minute per key, and counted against the key's own limit. Pass amountRaw in base units; candle_trade and candle_swap take decimals.",
+    inputSchema: quoteShape,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+  }, async (args) => callAndRelay("candle_quote", args, getConfig(), doFetch));
   register("candle_token_forensics", {
     title: "Token forensics",
     description: "Gate a buy before making it: who launched it (resolved on-chain; pump.fun's shared updateAuthority is never the developer; when no developer is on chain, deployer.attribution names the launchpad or issuer instead, e.g. launched via stonk.fun or issued by xStocks), their went-to-zero rate and last coins, who bought in the deploy window (the creator's own wallets are marked disclosed; strangers in the same slot are the bundle signal), same-funder insider share, same-funder deployer cluster, and safety.summary with six sourced flags (mintAuthority, freezeAuthority, tokenExtensions, lpLock, sellability, liquidityDrain). Refuse an unprompted buy when flagged; incomplete or unknown is not clearance. deployer.priorLaunches is counted (pump.fun curves for a curve creator; record.count says the source); deployer.launcher is the wallet that sent the launch, often a launch tool's signer, never the developer; launch.deployerLaunches is that wallet's inclusive informational count, never a warning. Every measurement carries a coverage note -- 'unavailable' is not 'clean'. No key needed.\n\nMARKET_NOT_FOUND means Candle has no market for that token and this could not run. That is also not 'clean': report that you could not check it, rather than reporting the token as safe. That refusal now carries error.coverage -- covered:false, a reason ('external_launchpad' when the token launched somewhere else, 'unknown_mint' when nobody has indexed it), the launchpad when known, and every check that consequently did not run. Read it instead of guessing. Most of the feed, and any Solana mint Jupiter's index knows, now answers with a partial report instead. On Hood, a token Candle did not launch names its launch account (deployer.method cvc_launch_account) for pons.family and pools.trade launches, with no record of earlier coins; other Hood launchpads return no developer.",
@@ -7617,6 +7716,16 @@ function registerToolSubset(server, options) {
     description: "The account's EMBEDDED wallets, one per chain, with their delegation state. These are " + "the wallets candle_trade, candle_swap and candle_transfer spend from, so this is how an " + "agent finds its own funding addresses. Reads only; moves nothing. Not the same as the " + "account's LINKED wallets, which are the owner's own wallets and are not spent from here. " + "Balances are not included: read a specific one with the market and balance endpoints.",
     inputSchema: {}
   }, async () => callAndRelay("candle_get_wallets", {}, getConfig(), doFetch));
+  register("candle_get_trading_wallets", {
+    title: "List the TEE wallets bound to this key",
+    description: "The TEE wallets bound to THIS key, on Solana (`chain: solana`) and Hood (`chain: evm`): the wallets " + "it may pay from beside the embedded ones in candle_get_wallets. Each row has its id, address, label, " + "`active` (true when the wallet's signing authority is verified active; a false row cannot pay) and " + "`allowLaunch`. The body also carries this key's `scopes` and `paused` (true while the owner has paused " + "the key, which then spends from nothing; spending also needs one of the spend scopes — " + "swap:write, transfer:write or launch:write — and `scopes` says which this key holds). A TEE wallet is signed on your own machine with the key " + "signer: the perps tools here and the candle CLI (`candle swap --wallet <id|address|label>`) pay from " + "it, while candle_trade and candle_swap spend the embedded wallet. Answers for any scope and on a " + "paused key. Paged: pass `continueCursor` back as `cursor` until `isDone`. Reads only; moves nothing.",
+    inputSchema: tradingWalletsShape
+  }, async (args) => callAndRelay("candle_get_trading_wallets", args, getConfig(), doFetch));
+  register("candle_get_spendable_balances", {
+    title: "Read the balances of every wallet this key may spend from",
+    description: "Every wallet THIS key may spend from, and no other, with its balances: the embedded wallets when " + "the owner allows this key to spend them, the TEE wallets bound to it with an active signing " + "authority, and the linked wallets its wallet scope admits. Each row has `kind` (embedded, tee or " + "linked), `chain` (solana or evm), `address`, and `id` and `label` for a linked or TEE wallet. " + "`balances` always holds the base assets (SOL, USDC and CNDL on Solana; ETH and USDG on Hood) plus " + "the `mints` you name (at most 10), each in raw units with the slot or block it was read at. A read " + "that failed is in `unavailable`, never reported as zero. A key with no spend scope (swap:write, " + "transfer:write or launch:write) can spend from nothing and gets an empty page, not an error. " + "`complete: false` means the account's wallet list was cut off. 50 wallets a page: pass " + "`continueCursor` back as `cursor` until `isDone`. Needs no account:read; candle_get_portfolio is " + "the whole-account read. Reads only; moves nothing.",
+    inputSchema: spendableBalancesShape
+  }, async (args) => callAndRelay("candle_get_spendable_balances", args, getConfig(), doFetch));
   register("candle_get_profile_wallets", {
     title: "Read which wallets an agent profile can spend from",
     description: "An agent profile (API key) either spends from EVERY wallet on its account or only from " + "the ones assigned to it. Read walletScope before drawing any conclusion from the list: " + "an empty list means 'every wallet' under scope 'all' and 'none at all' under 'selected'. " + "Reads only; moves nothing.",
@@ -7673,10 +7782,12 @@ function registerToolSubset(server, options) {
   });
   register("candle_execution_status", {
     title: "Can this key execute right now",
-    description: "One call before trading: the embedded wallets to spend from, the tier that decides what " + "may be traded, this key's own spend limits, and its loss limits and stop state (risk: " + "lossLimits, state, stopped, tripped). A stopped key reports ready: false and a top-level " + "stopped naming the bound that broke; every trade answers RISK_LIMIT_REACHED until an " + "account owner resumes it, so stop trading and say why rather than retrying. Any scope " + "can read its own. Reads only; moves nothing. Call it when " + "a run starts, or after an authorization error, rather than inferring readiness from a " + "failed trade. If a read could not be completed the tool says which one and does NOT " + "claim the account is unready: an unreachable endpoint and a missing tier are different " + "problems with different fixes.",
+    description: "One call before trading: the embedded wallets to spend from, the TEE wallets bound to this " + "key, the tier that decides what may be traded, this key's own spend limits, and its loss " + "limits and stop state (risk: lossLimits, state, stopped, tripped). `wallets` is the embedded " + "read. `tee` lists the first page of TEE wallets with `chain` (solana or evm), `active` and " + "`spendable` (active, the key not paused — `teePaused` says whether it is — and the key " + "holding a spend scope: swap:write, transfer:write or launch:write; `teeScopes` lists the " + "key's scopes, so a read-only key shows its wallets with `spendable: false`); " + "`teeComplete: false` means more, which candle_get_trading_wallets lists. candle_trade and " + "candle_swap spend the embedded wallet; a TEE wallet is signed locally (the perps tools, the " + "candle CLI's --wallet). A stopped key reports ready: false and a top-level stopped naming " + "the bound that broke; every trade answers RISK_LIMIT_REACHED until an account owner resumes " + "it, so stop trading and say why rather than retrying. Any scope can read its own. Reads " + "only; moves nothing. Call it when " + "a run starts, or after an authorization error, rather than inferring readiness from a " + "failed trade. If a read could not be completed the tool says which one and does NOT " + "claim the account is unready: an unreachable endpoint and a missing tier are different " + "problems with different fixes.",
     inputSchema: {}
   }, async () => {
-    const result = await executionStatus(getConfig(), doFetch);
+    const result = await executionStatus(getConfig(), doFetch, {
+      teeWallets: options.embeddedExecutionStatus !== true
+    });
     return { content: [{ type: "text", text: result.text }], ...result.isError ? { isError: true } : {} };
   });
   register("candle_swap", {

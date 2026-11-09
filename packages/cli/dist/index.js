@@ -532,7 +532,7 @@ var init_terminal_theme = __esm(() => {
 });
 
 // src/version.ts
-var CLI_VERSION = "0.13.18";
+var CLI_VERSION = "0.13.19";
 
 // src/presentation.ts
 function terminalStyle(deps, stream, machine = false) {
@@ -10551,8 +10551,8 @@ function createSolanaRpc(url, fetchFn, sleep) {
       const r = await read("simulateTransaction", [
         txBase64,
         withMinContextSlot({
-          sigVerify: false,
-          replaceRecentBlockhash: true,
+          sigVerify: opts?.sigVerify ?? false,
+          replaceRecentBlockhash: !opts?.sigVerify,
           commitment: "finalized",
           encoding: "base64",
           accounts: { encoding: "base64", addresses }
@@ -10686,6 +10686,7 @@ function withContextFloor(rpc, floor) {
   const finalized = (opts) => {
     const base = required(opts);
     return {
+      ...opts?.sigVerify !== undefined ? { sigVerify: opts.sigVerify } : {},
       get minContextSlot() {
         return base.minContextSlot;
       },
@@ -12448,6 +12449,7 @@ var init_errors2 = __esm(() => {
     "VAULT_FIELD_UNKNOWN",
     "VAULT_KDF_OUT_OF_BOUNDS",
     "VAULT_UNLOCK_FAILED",
+    "VAULT_TERMINAL_REQUIRED",
     "VAULT_BLOB_TAMPERED",
     "VAULT_INDEX_INVALID",
     "VAULT_OLDER_COPY",
@@ -15328,24 +15330,44 @@ function teeWalletList(rows) {
   return rows.map(describeWallet).join("; ");
 }
 async function completeTradingWallet(ctx, row, appId, scope, chain2 = "solana", key) {
+  const inspected = await inspectTradingWallet(ctx, row, appId, scope, chain2, key, true);
+  if (inspected.failures[0])
+    throw inspected.failures[0];
+  return inspected.row;
+}
+async function inspectTradingWallet(ctx, row, appId, scope, chain2 = "solana", key, firstOnly = false) {
+  const failures = [];
   if (rowChain(row) !== chain2)
-    throw chainMismatch(`TEE wallet ${describeWallet(row)}`, rowChain(row), chain2);
+    failures.push(chainMismatch(`TEE wallet ${describeWallet(row)}`, rowChain(row), chain2));
+  if (firstOnly && failures.length)
+    return { failures };
   if (!row.active)
-    throw new TradingError("TEE_WALLET_INACTIVE", `The payer must be a verified-active ${chainName(chain2)} TEE wallet.`);
+    failures.push(new TradingError("TEE_WALLET_INACTIVE", `The payer must be a verified-active ${chainName(chain2)} TEE wallet.`));
+  if (firstOnly && failures.length)
+    return { failures };
   if (scope === "launch:write" && row.allowLaunch !== true)
-    throw new TradingError("LAUNCH_NOT_ALLOWED", `The account owner must turn on allowLaunch for wallet ${row.id}: run candle wallets allow-launch ${row.id} on a profile signed in with candle auth login. An agent key cannot.`);
+    failures.push(new TradingError("LAUNCH_NOT_ALLOWED", `The account owner must turn on allowLaunch for wallet ${row.id}: run candle wallets allow-launch ${row.id} on a profile signed in with candle auth login. An agent key cannot.`));
+  if (firstOnly && failures.length)
+    return { failures };
   if (!appId || !row.privyWalletId)
-    throw new TradingError("SIGNER_UNAVAILABLE", "The server did not return its relay public identifiers.");
+    failures.push(new TradingError("SIGNER_UNAVAILABLE", "The server did not return its relay public identifiers."));
+  if (firstOnly && failures.length)
+    return { failures };
   const signer = await localSignerFor(ctx.deps, row.id, row.signerQuorumId);
   if (!signer)
-    throw new TradingError("SIGNER_UNAVAILABLE", await signerUnavailableMessage(ctx, row, key));
+    failures.push(new TradingError("SIGNER_UNAVAILABLE", await signerUnavailableMessage(ctx, row, key)));
+  if (failures.length || !signer || !row.privyWalletId)
+    return { failures };
   return {
-    id: row.id,
-    address: row.address,
-    privyWalletId: row.privyWalletId,
-    appId,
-    signer: signer.pem,
-    chain: row.chain === "evm" ? "evm" : "solana"
+    failures,
+    row: {
+      id: row.id,
+      address: row.address,
+      privyWalletId: row.privyWalletId,
+      appId,
+      signer: signer.pem,
+      chain: row.chain === "evm" ? "evm" : "solana"
+    }
   };
 }
 async function signerUnavailableMessage(ctx, row, key) {
@@ -15378,7 +15400,18 @@ async function tradingWallet(ctx, key, name, scope, chain2 = "solana") {
   return { ...wallet, scopes };
 }
 async function tradingPayer(ctx, key, name, scope = "swap:write", chain2 = "solana") {
-  const { rows, appId, scopes, keyPrefix } = await listTradingWallets(ctx, key, scope);
+  const listing = await listTradingWallets(ctx, key, scope);
+  const selected = await selectTradingPayer(ctx, key, name, listing, chain2);
+  if (selected.kind === "embedded")
+    return selected;
+  const wallet = await completeTradingWallet(ctx, selected.row, listing.appId, scope, chain2, {
+    apiKey: key,
+    keyPrefix: listing.keyPrefix
+  });
+  return { kind: "tee", wallet, scopes: listing.scopes };
+}
+async function selectTradingPayer(ctx, key, name, listing, chain2 = "solana") {
+  const { rows, scopes, keyPrefix } = listing;
   const discovered = embeddedSchema.parse(await request(ctx, key, "/api/v1/agent/wallets/embedded"));
   const wallets = discovered.wallets;
   const embeddedOn = {
@@ -15397,14 +15430,7 @@ async function tradingPayer(ctx, key, name, scope = "swap:write", chain2 = "sola
   ].join("; ");
   if (name === undefined) {
     if (onChain.length === 1 && !embedded)
-      return {
-        kind: "tee",
-        wallet: await completeTradingWallet(ctx, onChain[0], appId, scope, chain2, {
-          apiKey: key,
-          keyPrefix
-        }),
-        scopes
-      };
+      return { kind: "tee", row: onChain[0] };
     if (onChain.length === 0 && embedded)
       return asEmbedded();
     if (onChain.length === 0 && deniedAddress !== undefined)
@@ -15413,14 +15439,7 @@ async function tradingPayer(ctx, key, name, scope = "swap:write", chain2 = "sola
   }
   const matches = rows.filter((row) => matchesName(row, name));
   if (matches.length === 1)
-    return {
-      kind: "tee",
-      wallet: await completeTradingWallet(ctx, matches[0], appId, scope, chain2, {
-        apiKey: key,
-        keyPrefix
-      }),
-      scopes
-    };
+    return { kind: "tee", row: matches[0] };
   if (matches.length === 0) {
     if (embedded !== undefined && sameAddress(embedded, name))
       return asEmbedded();
@@ -16949,8 +16968,431 @@ var init_solana_verify = __esm(() => {
   ]);
 });
 
-// src/commands/swap.ts
+// src/trading-checks.ts
 import { randomUUID } from "node:crypto";
+function failure2(id, error) {
+  if (error instanceof TradingUsage)
+    throw error;
+  return {
+    id,
+    status: "fail",
+    code: error instanceof TradingError ? error.code : "INVALID_RESPONSE",
+    message: error instanceof Error ? describeRpcFailure(error) : "The check could not complete.",
+    ...error instanceof TradingError && error.suggestion ? { suggestion: error.suggestion } : {}
+  };
+}
+function balanceProblem(value) {
+  return /InsufficientFunds(?:ForFee)?|AccountNotFound|insufficient[_ ](?:funds|balance|lamports)/i.test(value instanceof Error ? `${value instanceof TradingError ? value.code : ""} ${value.message}` : String(value));
+}
+function needsBalance(id) {
+  return {
+    id,
+    status: "skipped",
+    needs: "balance",
+    message: "This check needs balance; fund the wallet and check again."
+  };
+}
+async function diagnosticListing(ctx, key) {
+  try {
+    return await listTradingWallets(ctx, key);
+  } catch (error) {
+    if (error instanceof exports_external.ZodError)
+      throw new TradingError("INVALID_RESPONSE", "Trading wallet discovery returned a malformed page.");
+    throw error;
+  }
+}
+async function readWalletRecords(ctx, key) {
+  const rows = [];
+  const seen = new Set;
+  let cursor;
+  for (let page = 0;page < 25; page++) {
+    const result = exports_external.object({
+      page: exports_external.array(linkedRow),
+      isDone: exports_external.boolean(),
+      continueCursor: exports_external.string().nullable().optional()
+    }).safeParse(await request(ctx, key, `/api/v1/agent/wallets?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`));
+    if (!result.success)
+      throw new TradingError("INVALID_RESPONSE", "Wallet records did not return a valid page.");
+    rows.push(...result.data.page);
+    if (result.data.isDone)
+      return rows;
+    cursor = result.data.continueCursor ?? undefined;
+    if (!cursor || seen.has(cursor))
+      break;
+    seen.add(cursor);
+  }
+  throw new TradingError("INVALID_RESPONSE", "Wallet records did not complete.");
+}
+function walletRecordCheck(row, trading, records) {
+  const found = records.filter((record) => record.address === row.address);
+  const differences = {};
+  const other = found[0];
+  const count = trading.filter((record) => record.address === row.address).length;
+  if (count !== 1 || found.length !== 1)
+    differences.addressCount = { trading: count, wallets: found.length };
+  for (const [left, right] of [
+    ["id", "_id"],
+    ["signerQuorumId", "signerQuorumId"],
+    ["chain", "chain"],
+    ["label", "label"],
+    ["address", "address"]
+  ]) {
+    if (!other || row[left] !== other[right])
+      differences[left] = { trading: row[left] ?? null, wallets: other?.[right] ?? null };
+  }
+  if (!other || !["ember-tee", "ember-hot"].includes(other.profile ?? ""))
+    differences.profile = { trading: "TEE", wallets: other?.profile ?? null };
+  if (other?.revokedAt !== undefined)
+    differences.revokedAt = { trading: null, wallets: other.revokedAt };
+  return Object.keys(differences).length ? {
+    id: "record",
+    status: "fail",
+    code: "WALLET_RECORD_MISMATCH",
+    message: `Trading and wallet records differ: ${JSON.stringify(differences)}.`,
+    differences
+  } : pass("record");
+}
+async function inspectReport(ctx, key, row, listing, records, payable, name) {
+  const checks = [pass("key"), payable ? failure2("payable", payable) : pass("payable")];
+  checks.push(listing.scopes.includes("swap:write") ? pass("scope") : failure2("scope", new TradingError("SCOPE_MISSING", "The bound key needs swap:write.")));
+  const report = {
+    ...row ? { id: row.id, address: row.address, label: row.label } : { name },
+    ok: false,
+    checks
+  };
+  if (!row) {
+    checks.push(...["record", "active", "signer"].map((id) => skipped(id, "payable")));
+    return { report };
+  }
+  checks.push(walletRecordCheck(row, listing.rows, records));
+  const inspected = await inspectTradingWallet(ctx, row, listing.appId, "swap:write", "solana", {
+    apiKey: key,
+    keyPrefix: listing.keyPrefix
+  });
+  const active = inspected.failures.filter((error) => error.code !== "SIGNER_UNAVAILABLE");
+  checks.push(...active.length ? active.map((error) => failure2("active", error)) : [pass("active")]);
+  const signer = inspected.failures.find((error) => error.code === "SIGNER_UNAVAILABLE");
+  checks.push(signer ? failure2("signer", signer) : pass("signer"));
+  return { report, wallet: inspected.row };
+}
+function printWalletReports(ctx, reports, swap = false) {
+  for (const report of reports)
+    report.ok = !report.checks.some((check) => check.status === "fail");
+  const failed = reports.filter((report) => !report.ok).length;
+  const summary = { total: reports.length, pass: reports.length - failed, fail: failed };
+  if (ctx.json) {
+    ctx.deps.stdout.write(`${JSON.stringify({
+      success: failed === 0,
+      dryRun: true,
+      wallets: reports,
+      summary,
+      ...swap ? { checks: reports[0]?.checks, quote: reports[0]?.quote } : {}
+    })}
+`);
+  } else {
+    for (const report of reports) {
+      const first = report.checks.find((check) => check.status === "fail");
+      ctx.deps.stdout.write(`${safeText(report.label ?? report.name ?? report.id ?? "wallet")}  ${safeText(report.address ?? "")}  ${report.ok ? "PASS" : "FAIL"}${first ? `  ${first.id}/${first.code}` : ""}
+`);
+      if (reports.length === 1) {
+        for (const check of report.checks)
+          ctx.deps.stdout.write(`  ${check.id}  ${check.status}${check.code ? `  ${check.code}` : ""}${check.message ? `  ${safeText(check.message)}` : ""}${check.because ? ` (${check.because})` : ""}
+`);
+        if (report.quote)
+          ctx.deps.stdout.write(`  quote  ${safeText(JSON.stringify(report.quote))}
+`);
+      }
+    }
+    if (reports.length > 1)
+      ctx.deps.stdout.write(`${summary.pass} pass, ${summary.fail} fail
+`);
+  }
+  return failed ? 1 : 0;
+}
+async function buildCheck(ctx, key, wallet, report, from, to, amount, slippage, rpcUrl, sign3) {
+  const checks = report.checks;
+  const blocked = checks.find((check) => check.status === "fail");
+  if (blocked) {
+    checks.push(skipped("quote", blocked.id), skipped("spend", "quote"));
+    if (sign3)
+      checks.push(skipped("sign", "spend"));
+    return;
+  }
+  const solana = lazySolanaClient(ctx, rpcUrl);
+  let transaction;
+  let quote;
+  let amountRaw;
+  let minimumRaw;
+  let feeRaw;
+  const fromBase = baseAsset(from);
+  const toBase = baseAsset(to);
+  const kind = fromBase && toBase ? "swap" : "trade";
+  try {
+    const decimals = await decimalsFor(ctx, from, solana);
+    const outDecimals = await decimalsFor(ctx, to, solana);
+    amountRaw = rawAmount(amount, decimals);
+    if (BigInt(amountRaw) > BigInt(Number.MAX_SAFE_INTEGER))
+      throw new TradingError("INVALID_AMOUNT", "Amount exceeds the venue's exact integer range.");
+    const payer = { type: "linked", linkedWalletId: wallet.id };
+    const clientTradeId = `swap-${randomUUID()}`;
+    const built = kind === "swap" ? await request(ctx, key, "/api/v1/agent/swap/build", {
+      clientTradeId,
+      from,
+      to,
+      amountRaw,
+      maxSlippageBps: slippage,
+      payer
+    }) : await request(ctx, key, "/api/v1/trade/agent/build", {
+      clientTradeId,
+      chain: "solana",
+      mint: fromBase ? to : from,
+      side: fromBase ? "buy" : "sell",
+      quoteAsset: (fromBase ?? toBase)?.toLowerCase(),
+      amountRaw,
+      maxSlippageBps: slippage,
+      payer
+    });
+    const parsed = swapBuildSchema.safeParse(kind === "swap" ? built.payload : built);
+    if (!parsed.success || built.job || built.status === "executed")
+      throw new TradingError("INVALID_RESPONSE", "Candle did not return a complete built quote.");
+    const data = parsed.data;
+    if (kind === "swap" && (data.venue !== "jupiter" || data.recipient !== wallet.address))
+      throw new TradingError("INVALID_RESPONSE", "A base swap must use Jupiter and return to its payer.");
+    if (kind === "trade" && (built.chain !== "solana" || built.walletAddress !== wallet.address))
+      throw new TradingError("INVALID_RESPONSE", "The token build does not name the requested Solana payer.");
+    const artifacts = kind === "swap" ? data : data.artifacts;
+    if (!artifacts)
+      throw new TradingError("INVALID_RESPONSE", "Missing quote artifacts.");
+    if (kind === "trade" && data.artifacts?.quoteAsset !== (fromBase ?? toBase)?.toLowerCase())
+      throw new TradingError("PAIR_UNSUPPORTED", "The token settles in a different quote asset.");
+    if (data.expiresAt <= ctx.deps.now())
+      throw new TradingError("QUOTE_EXPIRED", "The quote expired; build a fresh check.");
+    minimumRaw = !fromBase && artifacts.venue === "curve" ? (BigInt(data.minOutRaw) > BigInt(data.fee.feeRaw) ? BigInt(data.minOutRaw) - BigInt(data.fee.feeRaw) : 0n).toString() : data.minOutRaw;
+    quote = {
+      venue: (kind === "trade" ? data.artifacts?.quoteSource : undefined) ?? artifacts.venue,
+      priceImpactPct: artifacts.priceImpactPct ?? null,
+      fee: data.fee,
+      minimumReceived: `${decimalAmount(minimumRaw, outDecimals)} ${to}`,
+      minOutRaw: data.minOutRaw,
+      minimumReceivedRaw: minimumRaw,
+      tokenRisks: artifacts.tokenRisks ?? []
+    };
+    const tx = kind === "swap" ? data.transactionsBase64?.[0] : data.artifacts?.transactionBase64;
+    if (!tx || kind === "swap" && data.transactionsBase64?.length !== 1)
+      throw new TradingError("INVALID_RESPONSE", "A TEE swap must contain exactly one same-chain transaction.");
+    transaction = tx;
+    feeRaw = BigInt(data.fee.feeRaw);
+    report.quote = quote;
+    checks.push(pass("quote"));
+  } catch (error) {
+    checks.push(balanceProblem(error) ? needsBalance("quote") : failure2("quote", error), skipped("spend", "quote"));
+    if (sign3)
+      checks.push(skipped("sign", "spend"));
+    return;
+  }
+  const assetOf2 = (asset) => asset === "SOL" ? "SOL" : BASES[asset]?.mint ?? asset;
+  let reader;
+  try {
+    reader = await solana();
+    const problem = await tradingRead(ctx, reader, () => solanaSpendProblem(transaction, wallet.address, reader.rpc, {
+      kind: "swap",
+      spend: assetOf2(from),
+      maxSpendRaw: BigInt(amountRaw) + (kind === "trade" && fromBase ? feeRaw : 0n),
+      receive: { asset: assetOf2(to), minRaw: BigInt(minimumRaw) }
+    }));
+    if (problem) {
+      checks.push(balanceProblem(problem) ? needsBalance("spend") : failure2("spend", new TradingError("INVALID_RESPONSE", `The transaction Candle built does not match the quote (${safeText(problem)}); nothing was signed.`)));
+      if (sign3)
+        checks.push(skipped("sign", "spend"));
+      return;
+    }
+    checks.push(pass("spend"));
+  } catch (error) {
+    checks.push(balanceProblem(error) ? needsBalance("spend") : failure2("spend", error));
+    if (sign3)
+      checks.push(skipped("sign", "spend"));
+    return;
+  }
+  if (!sign3)
+    return;
+  try {
+    const signed = await relaySign(ctx, key, wallet, transaction);
+    const decoded = decodeTransaction(decodeStrictBase64(signed));
+    const original = decodeTransaction(decodeStrictBase64(transaction));
+    if (decoded.message.staticKeys[0] !== wallet.address || !Buffer.from(decoded.message.bytes).equals(Buffer.from(original.message.bytes)) || !ed25519.verify(decoded.signatures[0], decoded.message.bytes, base58.decode(wallet.address)))
+      throw new TradingError("SIGNATURE_INVALID", "The relay did not return the payer's signature over the built message.");
+    checks.push(pass("sign"));
+    try {
+      const simulation = await tradingRead(ctx, reader, () => reader.rpc.simulateTransaction(signed, [], { sigVerify: true }));
+      const problem = simulation.err == null ? undefined : JSON.stringify(simulation.err);
+      if (!problem)
+        checks.push(pass("simulation"));
+      else if (balanceProblem(problem))
+        checks.push(needsBalance("simulation"));
+      else if (/BlockhashNotFound|blockhash not found|blockhash.*expir|block.?height.*exceed/i.test(problem))
+        checks.push({ id: "simulation", status: "skipped", message: "The blockhash expired; run a fresh check." });
+      else
+        checks.push({
+          ...failure2("simulation", new TradingError("SIGN_FAILED", "Signed simulation failed.")),
+          cause: problem
+        });
+    } catch (error) {
+      const problem = error instanceof Error ? error.message : String(error);
+      if (balanceProblem(problem))
+        checks.push(needsBalance("simulation"));
+      else if (/BlockhashNotFound|blockhash not found|blockhash.*expir|block.?height.*exceed/i.test(problem))
+        checks.push({ id: "simulation", status: "skipped", message: "The blockhash expired; run a fresh check." });
+      else if (error instanceof TradingError && error.code === "RPC_RATE_LIMITED")
+        checks.push(failure2("simulation", error));
+      else
+        checks.push({
+          ...failure2("simulation", new TradingError("SIGN_FAILED", "Signed simulation could not complete.")),
+          cause: error instanceof TradingError ? error.code : "RPC_FAILED"
+        });
+    }
+  } catch (error) {
+    checks.push({
+      ...failure2("sign", new TradingError("SIGN_FAILED", "The signer did not produce a verified signature.")),
+      cause: error instanceof TradingError ? error.code : "INVALID_RESPONSE"
+    });
+  }
+}
+async function teeCheck(args, ctx) {
+  const parsed = parseArgs(args, { valueFlags: ["--label-prefix", "--max", "--rpc-url"], booleanFlags: ["--sign"] });
+  if ("error" in parsed) {
+    writeUsageFailure(ctx.deps, parsed.error, ctx.json);
+    return 2;
+  }
+  const max = Number(parsed.values["--max"] ?? "10");
+  if (!parsed.positionals.length && parsed.values["--label-prefix"] === undefined || !Number.isSafeInteger(max) || max < 1) {
+    writeUsageFailure(ctx.deps, "Usage: candle tee check <address|id|label>... [--label-prefix <p>] [--sign] [--max <n>] [--rpc-url <url>]", ctx.json);
+    return 2;
+  }
+  try {
+    const key = await tradingKey(ctx);
+    const listing = await diagnosticListing(ctx, key);
+    const names = [...new Set(parsed.positionals)];
+    const prefix = parsed.values["--label-prefix"];
+    if (prefix !== undefined) {
+      const selected2 = listing.rows.filter((row) => row.label?.startsWith(prefix));
+      if (!selected2.length)
+        throw new TradingError("TEE_WALLET_REQUIRED", `No TEE wallet matches this prefix. Bound to this key: ${listing.rows.map(describeWallet).join("; ") || "none"}.`);
+      for (const row of selected2)
+        names.push(row.id);
+    }
+    const selected = new Set;
+    const targets = names.filter((name) => {
+      const matches = listing.rows.filter((row) => matchesName(row, name));
+      const id = matches.length === 1 ? matches[0].id : `name:${name}`;
+      if (selected.has(id))
+        return false;
+      selected.add(id);
+      return true;
+    });
+    const sign3 = parsed.booleans.has("--sign");
+    if (sign3 && targets.length > max)
+      throw new TradingError("VALIDATION_FAILED", `Signing ${targets.length} wallets exceeds the batch cap ${max}; raise it explicitly with --max.`);
+    const records = await readWalletRecords(ctx, key);
+    const reports = [];
+    for (const name of targets) {
+      const matches = listing.rows.filter((row) => matchesName(row, name));
+      const payable = matches.length === 1 ? undefined : new TradingError("TEE_WALLET_REQUIRED", `"${safeText(name)}" matches ${matches.length} TEE wallets. Bound to this key: ${listing.rows.map(describeWallet).join("; ") || "no TEE wallets bound to this key"}.`);
+      const { report, wallet } = await inspectReport(ctx, key, matches.length === 1 ? matches[0] : undefined, listing, records, payable, name);
+      if (sign3 && wallet)
+        await buildCheck(ctx, key, wallet, report, "SOL", "USDC", "0.000001", 50, parsed.values["--rpc-url"], true);
+      else
+        report.checks.push(skipped("sign", sign3 ? report.checks.find((check) => check.status === "fail")?.id ?? "signer" : "--sign not set"));
+      reports.push(report);
+    }
+    return printWalletReports(ctx, reports);
+  } catch (error) {
+    return tradingFailure(ctx, error);
+  }
+}
+async function swapCheck(args, ctx) {
+  const parsed = parseArgs(args, {
+    valueFlags: ["--amount", "--percent", "--wallet", "--to", "--client-trade-id", "--slippage-bps", "--rpc-url"],
+    booleanFlags: ["--dry-run", "--yes", "--wait"]
+  });
+  if ("error" in parsed) {
+    writeUsageFailure(ctx.deps, parsed.error, ctx.json);
+    return 2;
+  }
+  try {
+    if (parsed.booleans.has("--yes") || parsed.values["--client-trade-id"] !== undefined || parsed.values["--percent"] !== undefined)
+      throw new TradingError("VALIDATION_FAILED", "--dry-run refuses --yes, --client-trade-id and --percent.");
+    if (parsed.positionals.length !== 2 || !parsed.values["--amount"]) {
+      writeUsageFailure(ctx.deps, "Usage: candle swap <from> <to> --amount <n> [--wallet <w>] --dry-run", ctx.json);
+      return 2;
+    }
+    const slippage = Number(parsed.values["--slippage-bps"] ?? "50");
+    if (!Number.isInteger(slippage) || slippage < 0 || slippage > 5000) {
+      writeUsageFailure(ctx.deps, "Slippage must be an integer from 0 to 5000 bps.", ctx.json);
+      return 2;
+    }
+    const from = classifyAsset(parsed.positionals[0]);
+    const to = classifyAsset(parsed.positionals[1]);
+    if (from.chain !== "solana" || to.chain !== "solana")
+      throw new TradingError("VALIDATION_FAILED", "Dry run checks Solana TEE pairs; Hood and bridge pairs are unsupported.");
+    if (parsed.values["--to"] !== undefined || parsed.booleans.has("--wait")) {
+      writeUsageFailure(ctx.deps, "--to and --wait are for a bridge.", ctx.json);
+      return 2;
+    }
+    if (from.asset === to.asset || !from.base && !to.base)
+      throw new TradingError("PAIR_UNSUPPORTED", "Choose distinct assets with SOL, USDC or CNDL on one side.");
+    rawAmount(parsed.values["--amount"], 18);
+    const key = await tradingKey(ctx);
+    const listing = await diagnosticListing(ctx, key);
+    let row;
+    let payable;
+    try {
+      const selected = await selectTradingPayer(ctx, key, parsed.values["--wallet"], listing);
+      if (selected.kind === "embedded")
+        throw new TradingError("VALIDATION_FAILED", "dry run checks TEE payers");
+      row = selected.row;
+    } catch (error) {
+      if (error instanceof TradingError && error.code === "VALIDATION_FAILED")
+        throw error;
+      if (!(error instanceof TradingError))
+        throw error;
+      payable = error;
+    }
+    const records = await readWalletRecords(ctx, key);
+    const { report, wallet } = await inspectReport(ctx, key, row, listing, records, payable, parsed.values["--wallet"]);
+    if (wallet)
+      await buildCheck(ctx, key, wallet, report, from.asset, to.asset, parsed.values["--amount"], slippage, parsed.values["--rpc-url"], false);
+    else
+      report.checks.push(skipped("quote", report.checks.find((check) => check.status === "fail")?.id ?? "signer"), skipped("spend", "quote"));
+    return printWalletReports(ctx, [report], true);
+  } catch (error) {
+    return tradingFailure(ctx, error);
+  }
+}
+var pass = (id) => ({ id, status: "pass" }), skipped = (id, because) => ({ id, status: "skipped", because }), linkedRow;
+var init_trading_checks = __esm(() => {
+  init_ed25519();
+  init_esm();
+  init_zod();
+  init_args();
+  init_swap();
+  init_render();
+  init_solana_alt();
+  init_solana_endpoint();
+  init_solana_verify();
+  init_trading();
+  linkedRow = exports_external.object({
+    _id: exports_external.string(),
+    address: exports_external.string(),
+    chain: exports_external.string(),
+    label: exports_external.string().optional(),
+    signerQuorumId: exports_external.string().optional(),
+    profile: exports_external.string().optional(),
+    revokedAt: exports_external.number().optional()
+  });
+});
+
+// src/commands/swap.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
 function tradingFailure(ctx, error, id) {
   if (error instanceof TradingUsage) {
     writeUsageFailure(ctx.deps, error.message, ctx.json);
@@ -17184,6 +17626,8 @@ async function assertDeferredExecuteSupported(ctx, key, id) {
   throw new TradingError("INVALID_RESPONSE", "The execute route answered for a trade that does not exist.");
 }
 async function swap(args, ctx) {
+  if (args.includes("--dry-run"))
+    return swapCheck(args, ctx);
   const parsed = parseArgs(args, {
     valueFlags: ["--amount", "--percent", "--wallet", "--to", "--client-trade-id", "--slippage-bps", "--rpc-url"],
     booleanFlags: ["--yes", "--wait"]
@@ -17193,7 +17637,7 @@ async function swap(args, ctx) {
     return 2;
   }
   const flags = parsed.values;
-  const id = flags["--client-trade-id"] ?? `swap-${randomUUID()}`;
+  const id = flags["--client-trade-id"] ?? `swap-${randomUUID2()}`;
   const slippage = Number(flags["--slippage-bps"] ?? "50");
   if (!Number.isInteger(slippage) || slippage < 0 || slippage > AGENT_MAX_SLIPPAGE_BPS) {
     writeUsageFailure(ctx.deps, SLIPPAGE_RANGE_MESSAGE, ctx.json);
@@ -17414,17 +17858,17 @@ async function hoodDecimals(asset, rpc) {
   return decimals;
 }
 async function recordTradedToken(ctx, wallet, token) {
-  const skipped = (reason) => `Notice: the sealed EVM record was not updated for ${token} (${reason}). The leg landed. A later sweep still finds this token with --token ${token}, or with --from-block.`;
+  const skipped2 = (reason) => `Notice: the sealed EVM record was not updated for ${token} (${reason}). The leg landed. A later sweep still finds this token with --token ${token}, or with --from-block.`;
   const append = ctx.deps.appendEvmRecord;
   let notice2;
   if (!append)
-    notice2 = skipped("this CLI build has no sealed EVM record writer");
+    notice2 = skipped2("this CLI build has no sealed EVM record writer");
   else {
     try {
       const outcome = await append(ctx, { kind: "token", wallet: toChecksumAddress(wallet), token });
-      notice2 = outcome.appended ? outcome.notice : skipped(outcome.notice);
+      notice2 = outcome.appended ? outcome.notice : skipped2(outcome.notice);
     } catch (error) {
-      notice2 = skipped(error instanceof Error ? error.message : "the append failed");
+      notice2 = skipped2(error instanceof Error ? error.message : "the append failed");
     }
   }
   if (notice2)
@@ -17872,6 +18316,7 @@ var init_swap = __esm(() => {
   init_solana_lite();
   init_solana_verify();
   init_trading();
+  init_trading_checks();
   SLIPPAGE_RANGE_MESSAGE = `maxSlippageBps must be an integer in bps, between 0 and ${AGENT_MAX_SLIPPAGE_BPS}`;
   settlementSchema = exports_external.object({
     state: exports_external.enum(["settled", "pending", "failed", "uncertain"]),
@@ -17925,11 +18370,11 @@ function writeScreenFailure(deps, result, context, json) {
 `)}
 `);
 }
-function writeScreenLocalFailure(deps, failure2, json) {
+function writeScreenLocalFailure(deps, failure3, json) {
   if (json)
-    writeLocalFailure(deps, failure2, json);
+    writeLocalFailure(deps, failure3, json);
   else
-    writeScreenMessage(deps, failure2.message, failure2.suggestion);
+    writeScreenMessage(deps, failure3.message, failure3.suggestion);
 }
 function writeScreenUsageFailure(deps, message, json, screen) {
   if (json)
@@ -18033,14 +18478,14 @@ async function readSignerRoles(rpc, addresses, opts) {
   let requests = 0;
   let rateLimited = 0;
   let settled = 0;
-  let skipped = 0;
+  let skipped2 = 0;
   let next = 0;
   let active = 0;
   const progress = () => {
     opts.onProgress?.({
-      completed: settled + skipped,
+      completed: settled + skipped2,
       settled,
-      skipped,
+      skipped: skipped2,
       total: planned,
       refusedGroups: failed.size,
       elapsedMs: opts.now() - startedAt
@@ -18185,7 +18630,7 @@ async function readSignerRoles(rpc, addresses, opts) {
       while (active < cap && next < tasks.length) {
         const task = tasks[next++];
         if (failed.has(task.group.id)) {
-          skipped += 1;
+          skipped2 += 1;
           skippedAny = true;
           continue;
         }
@@ -29067,7 +29512,7 @@ async function askForOwnPassphrase(ctx, promptText) {
 function requireTty(ctx, what) {
   if (ctx.deps.isTTY.stdin && ctx.deps.isTTY.stdout)
     return true;
-  writeVaultFailure(ctx, new VaultError("VAULT_UNLOCK_FAILED", `${what} needs a terminal: this CLI reads a vault passphrase or a security key PIN from a hidden prompt and from nowhere else.`, {
+  writeVaultFailure(ctx, new VaultError("VAULT_TERMINAL_REQUIRED", `${what} needs a terminal: this CLI reads a vault passphrase or a security key PIN from a hidden prompt and from nowhere else.`, {
     suggestion: "There is no environment variable and no flag that supplies one."
   }));
   return false;
@@ -29076,7 +29521,7 @@ function refusePromptsWithoutTerminal(ctx, what) {
   if (ctx.deps.isTTY.stdin && ctx.deps.isTTY.stderr)
     return ctx;
   const refuse2 = async () => {
-    throw tagNoTerminal(new VaultError("VAULT_UNLOCK_FAILED", `${what} needs a terminal here: this unlock reads a vault passphrase, a security key PIN or a choice from a prompt, and standard input and standard error must both be a terminal for that. Standard output may be redirected.`, {
+    throw tagNoTerminal(new VaultError("VAULT_TERMINAL_REQUIRED", `${what} needs a terminal here: this unlock reads a vault passphrase, a security key PIN or a choice from a prompt, and standard input and standard error must both be a terminal for that. Standard output may be redirected.`, {
       suggestion: "Run it from a terminal, or pass --factor touch-id or --factor passkey to unlock with a factor that reads no prompt. No environment variable or flag supplies a passphrase or PIN."
     }));
   };
@@ -29860,9 +30305,9 @@ async function reconcileGrant(ctx, entry, opts = {}) {
   if (!stranded.complete) {
     return { kind: "unreadable", reason: stranded.incompleteReason ?? "the stranded-import read was incomplete" };
   }
-  const failure2 = stranded.failures.find((candidate) => sameWalletAddress(candidate.address, entry.address));
-  if (failure2?.stage === "convex_link") {
-    return { kind: "strand-final", account: wallets.account, failure: failure2 };
+  const failure3 = stranded.failures.find((candidate) => sameWalletAddress(candidate.address, entry.address));
+  if (failure3?.stage === "convex_link") {
+    return { kind: "strand-final", account: wallets.account, failure: failure3 };
   }
   return { kind: "unresolved", account: wallets.account };
 }
@@ -33994,23 +34439,23 @@ async function walletsImport(args, ctx) {
     deps
   });
   if (!flow.ok) {
-    const failure2 = flow.failure;
-    if (failure2.kind === "api") {
-      writeScreenFailure(deps, failure2.response, { apiUrl, authType: "key" }, json);
+    const failure3 = flow.failure;
+    if (failure3.kind === "api") {
+      writeScreenFailure(deps, failure3.response, { apiUrl, authType: "key" }, json);
       return 1;
     }
-    if (failure2.kind === "signer-store") {
+    if (failure3.kind === "signer-store") {
       writeScreenLocalFailure(deps, {
         code: "SIGNER_STORE_FAILED",
-        message: `Could not store the new signer in the ${deps.backend} store: ${failure2.error instanceof Error ? failure2.error.message : failure2.error}`,
+        message: `Could not store the new signer in the ${deps.backend} store: ${failure3.error instanceof Error ? failure3.error.message : failure3.error}`,
         suggestion: "Nothing was imported. Unlock the store (or fix the error above) and run the command again."
       }, json);
       return 1;
     }
     writeScreenLocalFailure(deps, {
       code: "SIGNER_COMMIT_FAILED",
-      message: `Wallet ${failure2.walletId} was imported, but its signer could not be stored under the wallet's own ` + `ref: ${failure2.error instanceof Error ? failure2.error.message : failure2.error}`,
-      suggestion: `The signer is not lost: it is in the ${deps.backend} store under "${failure2.pendingRef}". Copy it to ` + `"${walletSignerRef(failure2.walletId)}", or revoke the wallet with: candle wallets revoke ${failure2.walletId}`
+      message: `Wallet ${failure3.walletId} was imported, but its signer could not be stored under the wallet's own ` + `ref: ${failure3.error instanceof Error ? failure3.error.message : failure3.error}`,
+      suggestion: `The signer is not lost: it is in the ${deps.backend} store under "${failure3.pendingRef}". Copy it to ` + `"${walletSignerRef(failure3.walletId)}", or revoke the wallet with: candle wallets revoke ${failure3.walletId}`
     }, json);
     return 1;
   }
@@ -35486,8 +35931,8 @@ function releaseActiveTee(active) {
   if (active.source === "vault")
     releaseResolvedTee(active.resolved);
 }
-function writeCommitFailure(ctx, failure2, consequence) {
-  writeLocalFailure(ctx.deps, { code: failure2.code, message: failure2.message, suggestion: consequence }, ctx.json);
+function writeCommitFailure(ctx, failure3, consequence) {
+  writeLocalFailure(ctx.deps, { code: failure3.code, message: failure3.message, suggestion: consequence }, ctx.json);
 }
 async function openExistingTeeStore(ctx, parsed) {
   const { deps, json } = ctx;
@@ -35788,13 +36233,13 @@ async function teeEnable(args, ctx) {
     vaultDestination: vault
   });
   if (!flow.ok) {
-    const failure2 = flow.failure;
-    if (failure2.kind === "api")
-      writeFailure(deps, failure2.response, { apiUrl, authType: "key" }, json);
+    const failure3 = flow.failure;
+    if (failure3.kind === "api")
+      writeFailure(deps, failure3.response, { apiUrl, authType: "key" }, json);
     else {
       writeLocalFailure(deps, {
-        code: failure2.kind === "signer-store" ? "SIGNER_STORE_FAILED" : "SIGNER_COMMIT_FAILED",
-        message: `${address}: ${failure2.error instanceof Error ? failure2.error.message : failure2.error}`,
+        code: failure3.kind === "signer-store" ? "SIGNER_STORE_FAILED" : "SIGNER_COMMIT_FAILED",
+        message: `${address}: ${failure3.error instanceof Error ? failure3.error.message : failure3.error}`,
         suggestion: "The key is still sealed locally. Fix the error above and run enable again."
       }, json);
     }
@@ -40333,7 +40778,7 @@ var init_market_disclosure = __esm(() => {
 });
 
 // ../mcp/src/orchestrate.ts
-import { randomUUID as randomUUID3 } from "node:crypto";
+import { randomUUID as randomUUID4 } from "node:crypto";
 function requireApiKey(cfg) {
   if (!cfg.apiKey) {
     throw new Error("CANDLE_AGENT_API_KEY is required for this tool. Set it in the environment or MCP client config.");
@@ -40446,7 +40891,7 @@ async function readPaperInventory(cfg, doFetch, extra) {
 }
 async function executeTrade(args, cfg, doFetch) {
   const apiKey = requireApiKey(cfg);
-  const clientTradeId = args.clientTradeId ?? randomUUID3();
+  const clientTradeId = args.clientTradeId ?? randomUUID4();
   if (args.amount !== undefined && args.percent !== undefined) {
     return errText("pass exactly one of amount or percent, not both", { clientTradeId });
   }
@@ -40595,7 +41040,7 @@ async function executeTrade(args, cfg, doFetch) {
 }
 async function executeLaunchAndSeed(args, cfg, doFetch, imageDir, imageFs, opts = {}) {
   const apiKey = requireApiKey(cfg);
-  const clientLaunchId = args.clientLaunchId ?? randomUUID3();
+  const clientLaunchId = args.clientLaunchId ?? randomUUID4();
   const socialsProblem = socialsRefusal(args.socials);
   if (socialsProblem)
     return { text: imageRefusalBody(socialsProblem, { clientLaunchId }), isError: true };
@@ -40824,7 +41269,26 @@ async function resolveToken(args, cfg, doFetch) {
     return read.err;
   return { text: JSON.stringify({ success: true, chain: chain2, mint: args.mint, market: read.market }, null, 2) };
 }
-async function executionStatus(cfg, doFetch) {
+function teePayers(body) {
+  const page = body;
+  if (!Array.isArray(page?.page))
+    return;
+  const paused = page.paused === true;
+  const scopes = Array.isArray(page.scopes) ? page.scopes.filter((s) => typeof s === "string") : [];
+  const spendAuthorized = TEE_SPEND_SCOPES.some((scope) => scopes.includes(scope));
+  const wallets2 = page.page.map((row2) => ({
+    id: String(row2.id),
+    address: String(row2.address),
+    chain: String(row2.chain),
+    ...typeof row2.label === "string" ? { label: row2.label } : {},
+    active: row2.active === true,
+    allowLaunch: row2.allowLaunch === true,
+    spendable: row2.active === true && !paused && spendAuthorized
+  }));
+  return { paused, scopes, wallets: wallets2, complete: page.isDone === true };
+}
+async function executionStatus(cfg, doFetch, options = {}) {
+  const readTee = options.teeWallets !== false;
   const apiKey = requireApiKey(cfg);
   const get = async (path) => {
     const res = await doFetch(`${base(cfg)}${path}`, { method: "GET", headers: headers(apiKey) });
@@ -40838,14 +41302,17 @@ async function executionStatus(cfg, doFetch) {
     }
     return { ok: res.ok, status: res.status, body };
   };
-  const [wallets2, tier, limits, risk] = await Promise.all([
+  const [wallets2, trading, tier, limits, risk] = await Promise.all([
     get("/api/v1/agent/wallets/embedded"),
+    readTee ? get("/api/v1/agent/wallets/trading") : Promise.resolve(undefined),
     get("/api/v1/agent/tier"),
     get("/api/v1/agent/keys/self/limits"),
     get("/api/v1/agent/keys/self/risk")
   ]);
+  const tee = trading?.ok ? teePayers(trading.body) : undefined;
   const unreadable2 = [
     ["wallets", wallets2],
+    ...trading ? [["tee", tee ? trading : { ok: false }]] : [],
     ["tier", tier],
     ["limits", limits],
     ["risk", risk]
@@ -40862,6 +41329,11 @@ async function executionStatus(cfg, doFetch) {
       updateAvailable: updateAvailable() ?? undefined,
       unreadable: unreadable2.length > 0 ? unreadable2.map(([name]) => name) : undefined,
       wallets: wallets2.body,
+      tee: tee?.wallets,
+      teeScopes: tee ? tee.scopes : undefined,
+      teePaused: tee ? tee.paused : undefined,
+      teeComplete: tee ? tee.complete : undefined,
+      teeError: trading && !tee ? trading.body : undefined,
       tier: tier.body,
       limits: limits.body,
       risk: risk.body
@@ -40869,7 +41341,7 @@ async function executionStatus(cfg, doFetch) {
     ...unreadable2.length > 0 ? { isError: true } : {}
   };
 }
-var SOLANA_SEED_CEILINGS, MAIN_PAYER, SWEEP_BASE_ASSETS, STOP_CLEARED_BY = "An account owner reviews the profile and resumes it from the agent console; an API key cannot resume it.";
+var SOLANA_SEED_CEILINGS, MAIN_PAYER, SWEEP_BASE_ASSETS, TEE_SPEND_SCOPES, STOP_CLEARED_BY = "An account owner reviews the profile and resumes it from the agent console; an API key cannot resume it.";
 var init_orchestrate = __esm(() => {
   init_convert();
   init_image();
@@ -40885,6 +41357,7 @@ var init_orchestrate = __esm(() => {
     solana: ["USDC", "CNDL", "SOL"],
     hood: ["USDG", "ETH"]
   };
+  TEE_SPEND_SCOPES = ["swap:write", "transfer:write", "launch:write"];
 });
 
 // ../mcp/src/hyperliquid.ts
@@ -44605,6 +45078,9 @@ function planTableRows(table) {
     row2("Uploads per minute", (e) => count(e.limits.uploadsPerMin)),
     row2("Linked wallets", (e) => count(e.limits.linkedWallets))
   ];
+  if (plans.some((e) => typeof e.limits.labReplaysPerDay === "number")) {
+    rows.push(row2("Strategy lab replays", (e) => typeof e.limits.labReplaysPerDay === "number" ? `${count(e.limits.labReplaysPerDay)} a day` : "-"));
+  }
   const known = Object.keys(PLAN_CAPABILITY_LABELS);
   const served = new Set;
   for (const entry of plans)
@@ -44649,13 +45125,14 @@ var init_plans = __esm(() => {
     createLinkedWallets: "Create linked wallets",
     importLinkedWallets: "Import linked wallets",
     limitOrders: "Limit orders",
-    quant: "Quant deep analyses (Max)"
+    quant: "Quant deep analyses (Max)",
+    strategyLab: "Strategy lab (saved strategies stay Max)"
   };
   PLAN_LABELS = { free: "Free", believer: "Believer", pro: "Pro", max: "Max" };
 });
 
 // ../mcp/src/token-metadata.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
+import { randomUUID as randomUUID5 } from "node:crypto";
 function editSocialsSchema() {
   const shape = {};
   for (const key of SOCIAL_KEYS) {
@@ -44706,7 +45183,7 @@ function tokenEditBody(args) {
   return { body };
 }
 function tokenEditRequest(base2, apiKey, args, body) {
-  const key = typeof args.idempotencyKey === "string" && args.idempotencyKey ? args.idempotencyKey : randomUUID4();
+  const key = typeof args.idempotencyKey === "string" && args.idempotencyKey ? args.idempotencyKey : randomUUID5();
   return {
     url: `${base2}/api/v1/tokens/${encodeURIComponent(String(args.chain))}/${encodeURIComponent(String(args.mint))}/metadata`,
     init: {
@@ -44934,7 +45411,7 @@ __export(exports_tools, {
   OPERATION_NOT_FOUND_RULE: () => OPERATION_NOT_FOUND_RULE,
   LAB_TOOL_NAMES: () => LAB_TOOL_NAMES
 });
-import { randomUUID as randomUUID5 } from "node:crypto";
+import { randomUUID as randomUUID6 } from "node:crypto";
 function resolveToolAllowlist(env) {
   const raw = env.CANDLE_MCP_TOOLS?.trim();
   if (!raw)
@@ -45033,6 +45510,26 @@ function buildRequest(name, args, cfg) {
       return {
         url: `${base2}/api/v1/markets/${encodeURIComponent(chain2)}/${encodeURIComponent(mint)}`,
         init: { method: "GET", headers: jsonHeaders() }
+      };
+    }
+    case "candle_quote": {
+      const apiKey = requireApiKey2(cfg);
+      const { chain: chain2, mint, side, amountRaw, quoteAsset, poolKey, includeRoundTrip } = args;
+      return {
+        url: `${base2}/api/v1/trade/agent/quote`,
+        init: {
+          method: "POST",
+          headers: jsonHeaders(apiKey),
+          body: JSON.stringify({
+            chain: chain2,
+            mint,
+            side,
+            amountRaw,
+            ...quoteAsset !== undefined && quoteAsset !== "" ? { quoteAsset } : {},
+            ...poolKey !== undefined ? { poolKey } : {},
+            ...includeRoundTrip !== undefined ? { includeRoundTrip } : {}
+          })
+        }
       };
     }
     case "candle_get_price_history": {
@@ -45272,6 +45769,28 @@ function buildRequest(name, args, cfg) {
         init: { method: "GET", headers: jsonHeaders(apiKey) }
       };
     }
+    case "candle_get_trading_wallets": {
+      const apiKey = requireApiKey2(cfg);
+      const { cursor } = args;
+      const query2 = cursor === undefined ? "" : `?cursor=${encodeURIComponent(cursor)}`;
+      return {
+        url: `${base2}/api/v1/agent/wallets/trading${query2}`,
+        init: { method: "GET", headers: jsonHeaders(apiKey) }
+      };
+    }
+    case "candle_get_spendable_balances": {
+      const apiKey = requireApiKey2(cfg);
+      const { cursor, mints } = args;
+      const params = new URLSearchParams;
+      if (cursor !== undefined)
+        params.set("cursor", cursor);
+      if (mints !== undefined && mints.length > 0)
+        params.set("mints", mints.join(","));
+      return {
+        url: `${base2}/api/v1/agent/wallets/self/balances${params.size ? `?${params}` : ""}`,
+        init: { method: "GET", headers: jsonHeaders(apiKey) }
+      };
+    }
     case "candle_get_profile_wallets": {
       const apiKey = requireApiKey2(cfg);
       const { keyPrefix } = args;
@@ -45402,7 +45921,7 @@ async function getOperation(args, cfg, doFetch) {
   };
 }
 async function swap2(args, cfg, doFetch) {
-  const clientSwapId = typeof args.clientSwapId === "string" && args.clientSwapId.length > 0 ? args.clientSwapId : randomUUID5();
+  const clientSwapId = typeof args.clientSwapId === "string" && args.clientSwapId.length > 0 ? args.clientSwapId : randomUUID6();
   const { url, init } = buildRequest("candle_swap", { ...args, clientSwapId }, cfg);
   let ok;
   let body;
@@ -45577,6 +46096,12 @@ function registerToolSubset(server, options) {
     description: "Read Candle and indexed external markets, including indexed-but-not-routable tokens. No key needed. " + EXTERNAL_MARKET_DISCLOSURE + " " + "Read candleLaunched, launchpad, venue and trade.routable; jupiterOk and discovery flags are distinct. " + "Routability is stored eligibility, not a quote or permission. General quotes use POST /api/v1/trade/agent/quote. " + "Curve quotes and lifecycle describe Candle launches. MARKET_NOT_FOUND is a legacy code: read " + "error.routing.reason, error.discovery and sibling error.retryable. A curve-only 404 does not mean untradeable.",
     inputSchema: getMarketShape
   }, async (args) => callAndRelay("candle_get_market", args, getConfig(), doFetch));
+  register("candle_quote", {
+    title: "Quote a trade",
+    description: "Price a buy or sell before making it. Moves nothing. Needs an API key with the swap:write scope: a read-only key (account:read) is refused, so use candle_get_market for state instead. " + "Returns amountOut (base units), venue, quoteAsset, quoteDecimals and quotedAt; Hood answers also carry fee and price impact. " + "route is present only on some answers, so do not assume it. A quote is a snapshot (Hood quotes are cached for 10 seconds), not a promise of the fill. " + "Limited to 600 quotes a minute per key, and counted against the key's own limit. Pass amountRaw in base units; candle_trade and candle_swap take decimals.",
+    inputSchema: quoteShape,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+  }, async (args) => callAndRelay("candle_quote", args, getConfig(), doFetch));
   register("candle_token_forensics", {
     title: "Token forensics",
     description: "Gate a buy before making it: who launched it (resolved on-chain; pump.fun's shared updateAuthority is never the developer; when no developer is on chain, deployer.attribution names the launchpad or issuer instead, e.g. launched via stonk.fun or issued by xStocks), their went-to-zero rate and last coins, who bought in the deploy window (the creator's own wallets are marked disclosed; strangers in the same slot are the bundle signal), same-funder insider share, same-funder deployer cluster, and safety.summary with six sourced flags (mintAuthority, freezeAuthority, tokenExtensions, lpLock, sellability, liquidityDrain). Refuse an unprompted buy when flagged; incomplete or unknown is not clearance. deployer.priorLaunches is counted (pump.fun curves for a curve creator; record.count says the source); deployer.launcher is the wallet that sent the launch, often a launch tool's signer, never the developer; launch.deployerLaunches is that wallet's inclusive informational count, never a warning. Every measurement carries a coverage note -- 'unavailable' is not 'clean'. No key needed.\n\nMARKET_NOT_FOUND means Candle has no market for that token and this could not run. That is also not 'clean': report that you could not check it, rather than reporting the token as safe. That refusal now carries error.coverage -- covered:false, a reason ('external_launchpad' when the token launched somewhere else, 'unknown_mint' when nobody has indexed it), the launchpad when known, and every check that consequently did not run. Read it instead of guessing. Most of the feed, and any Solana mint Jupiter's index knows, now answers with a partial report instead. On Hood, a token Candle did not launch names its launch account (deployer.method cvc_launch_account) for pons.family and pools.trade launches, with no record of earlier coins; other Hood launchpads return no developer.",
@@ -45767,6 +46292,16 @@ function registerToolSubset(server, options) {
     description: "The account's EMBEDDED wallets, one per chain, with their delegation state. These are " + "the wallets candle_trade, candle_swap and candle_transfer spend from, so this is how an " + "agent finds its own funding addresses. Reads only; moves nothing. Not the same as the " + "account's LINKED wallets, which are the owner's own wallets and are not spent from here. " + "Balances are not included: read a specific one with the market and balance endpoints.",
     inputSchema: {}
   }, async () => callAndRelay("candle_get_wallets", {}, getConfig(), doFetch));
+  register("candle_get_trading_wallets", {
+    title: "List the TEE wallets bound to this key",
+    description: "The TEE wallets bound to THIS key, on Solana (`chain: solana`) and Hood (`chain: evm`): the wallets " + "it may pay from beside the embedded ones in candle_get_wallets. Each row has its id, address, label, " + "`active` (true when the wallet's signing authority is verified active; a false row cannot pay) and " + "`allowLaunch`. The body also carries this key's `scopes` and `paused` (true while the owner has paused " + "the key, which then spends from nothing; spending also needs one of the spend scopes — " + "swap:write, transfer:write or launch:write — and `scopes` says which this key holds). A TEE wallet is signed on your own machine with the key " + "signer: the perps tools here and the candle CLI (`candle swap --wallet <id|address|label>`) pay from " + "it, while candle_trade and candle_swap spend the embedded wallet. Answers for any scope and on a " + "paused key. Paged: pass `continueCursor` back as `cursor` until `isDone`. Reads only; moves nothing.",
+    inputSchema: tradingWalletsShape
+  }, async (args) => callAndRelay("candle_get_trading_wallets", args, getConfig(), doFetch));
+  register("candle_get_spendable_balances", {
+    title: "Read the balances of every wallet this key may spend from",
+    description: "Every wallet THIS key may spend from, and no other, with its balances: the embedded wallets when " + "the owner allows this key to spend them, the TEE wallets bound to it with an active signing " + "authority, and the linked wallets its wallet scope admits. Each row has `kind` (embedded, tee or " + "linked), `chain` (solana or evm), `address`, and `id` and `label` for a linked or TEE wallet. " + "`balances` always holds the base assets (SOL, USDC and CNDL on Solana; ETH and USDG on Hood) plus " + "the `mints` you name (at most 10), each in raw units with the slot or block it was read at. A read " + "that failed is in `unavailable`, never reported as zero. A key with no spend scope (swap:write, " + "transfer:write or launch:write) can spend from nothing and gets an empty page, not an error. " + "`complete: false` means the account's wallet list was cut off. 50 wallets a page: pass " + "`continueCursor` back as `cursor` until `isDone`. Needs no account:read; candle_get_portfolio is " + "the whole-account read. Reads only; moves nothing.",
+    inputSchema: spendableBalancesShape
+  }, async (args) => callAndRelay("candle_get_spendable_balances", args, getConfig(), doFetch));
   register("candle_get_profile_wallets", {
     title: "Read which wallets an agent profile can spend from",
     description: "An agent profile (API key) either spends from EVERY wallet on its account or only from " + "the ones assigned to it. Read walletScope before drawing any conclusion from the list: " + "an empty list means 'every wallet' under scope 'all' and 'none at all' under 'selected'. " + "Reads only; moves nothing.",
@@ -45823,10 +46358,12 @@ function registerToolSubset(server, options) {
   });
   register("candle_execution_status", {
     title: "Can this key execute right now",
-    description: "One call before trading: the embedded wallets to spend from, the tier that decides what " + "may be traded, this key's own spend limits, and its loss limits and stop state (risk: " + "lossLimits, state, stopped, tripped). A stopped key reports ready: false and a top-level " + "stopped naming the bound that broke; every trade answers RISK_LIMIT_REACHED until an " + "account owner resumes it, so stop trading and say why rather than retrying. Any scope " + "can read its own. Reads only; moves nothing. Call it when " + "a run starts, or after an authorization error, rather than inferring readiness from a " + "failed trade. If a read could not be completed the tool says which one and does NOT " + "claim the account is unready: an unreachable endpoint and a missing tier are different " + "problems with different fixes.",
+    description: "One call before trading: the embedded wallets to spend from, the TEE wallets bound to this " + "key, the tier that decides what may be traded, this key's own spend limits, and its loss " + "limits and stop state (risk: lossLimits, state, stopped, tripped). `wallets` is the embedded " + "read. `tee` lists the first page of TEE wallets with `chain` (solana or evm), `active` and " + "`spendable` (active, the key not paused — `teePaused` says whether it is — and the key " + "holding a spend scope: swap:write, transfer:write or launch:write; `teeScopes` lists the " + "key's scopes, so a read-only key shows its wallets with `spendable: false`); " + "`teeComplete: false` means more, which candle_get_trading_wallets lists. candle_trade and " + "candle_swap spend the embedded wallet; a TEE wallet is signed locally (the perps tools, the " + "candle CLI's --wallet). A stopped key reports ready: false and a top-level stopped naming " + "the bound that broke; every trade answers RISK_LIMIT_REACHED until an account owner resumes " + "it, so stop trading and say why rather than retrying. Any scope can read its own. Reads " + "only; moves nothing. Call it when " + "a run starts, or after an authorization error, rather than inferring readiness from a " + "failed trade. If a read could not be completed the tool says which one and does NOT " + "claim the account is unready: an unreachable endpoint and a missing tier are different " + "problems with different fixes.",
     inputSchema: {}
   }, async () => {
-    const result = await executionStatus(getConfig(), doFetch);
+    const result = await executionStatus(getConfig(), doFetch, {
+      teeWallets: options.embeddedExecutionStatus !== true
+    });
     return { content: [{ type: "text", text: result.text }], ...result.isError ? { isError: true } : {} };
   });
   register("candle_swap", {
@@ -46097,7 +46634,7 @@ async function registerEligibleProfileTool(server, env = process.env, doFetch = 
   }
   return eligible;
 }
-var VAMP_CANDIDATES_DESCRIPTION, localProfileTools, STAKING_DISCLOSURE = "No instant unstake. Read pool.withdrawalTimelockSeconds for the wait. Solana rewards accrue to the holding wallet. sCNDL in any eligible account wallet counts toward Pro and earns the account's Hood staking reward, except a wallet another account also claims, wallets past the 200-wallet cap, and an account with no EVM wallet. CNDL in a pending withdrawal counts toward nothing for Pro.", stakingWriteShape, TOOL_NAMES, LAB_TOOL_NAMES, PROFILE_EDIT_TOOL_NAMES, isProfileEditTool = (name) => PROFILE_EDIT_TOOL_NAMES.includes(name), OPERATION_NOT_FOUND_RULE, getMarketShape, priceHistoryShape, TOKEN_EVENTS_LIMIT_MESSAGE = "limit must be a whole number from 1 to 1000", tokenEventsLimit, TOKEN_EVENTS_KIND_NOTE = "kept back from the request and applied to the returned page by this server, so a filtered page can be shorter than limit while older events of other kinds remain: page with nextCursor as before until it is null", tokenCardShape, tokenEventsShape, tokenForensicsShape, FEED_LIMIT_MESSAGE = "limit must be a whole number from 1 to 200", feedLimit, getFeedShape, reportActivityShape, getAgentProfileShape, listAgentsShape, createPostShape, deletePostShape, listAgentPostsShape, getAgentPositionsShape, getOperationShape, vampCandidatesShape, getFeesShape, atomicPayerShape, atomicLaunchDryRunShape, claimFeesShape, resolveTokenShape, profileWalletsShape, profilePnlShape, profileTradesShape, noArgsShape, setProfileWalletsShape, swapShape, tradeShape, tradeExecuteShape, tokenImageUrl, tokenBannerUrl, localImageShape, localLaunchTokenShape, localLaunchAndSeedShape, IMAGE_PATH_DISCLOSURE, transferShape, sweepShape, PROFILE_PNL_HYPERLIQUID;
+var VAMP_CANDIDATES_DESCRIPTION, localProfileTools, STAKING_DISCLOSURE = "No instant unstake. Read pool.withdrawalTimelockSeconds for the wait. Solana rewards accrue to the holding wallet. sCNDL in any eligible account wallet counts toward Pro and earns the account's Hood staking reward, except a wallet another account also claims, wallets past the 200-wallet cap, and an account with no EVM wallet. CNDL in a pending withdrawal counts toward nothing for Pro.", stakingWriteShape, TOOL_NAMES, LAB_TOOL_NAMES, PROFILE_EDIT_TOOL_NAMES, isProfileEditTool = (name) => PROFILE_EDIT_TOOL_NAMES.includes(name), OPERATION_NOT_FOUND_RULE, getMarketShape, quoteShape, priceHistoryShape, TOKEN_EVENTS_LIMIT_MESSAGE = "limit must be a whole number from 1 to 1000", tokenEventsLimit, TOKEN_EVENTS_KIND_NOTE = "kept back from the request and applied to the returned page by this server, so a filtered page can be shorter than limit while older events of other kinds remain: page with nextCursor as before until it is null", tokenCardShape, tokenEventsShape, tokenForensicsShape, FEED_LIMIT_MESSAGE = "limit must be a whole number from 1 to 200", feedLimit, getFeedShape, reportActivityShape, getAgentProfileShape, listAgentsShape, createPostShape, deletePostShape, listAgentPostsShape, getAgentPositionsShape, getOperationShape, vampCandidatesShape, getFeesShape, atomicPayerShape, atomicLaunchDryRunShape, claimFeesShape, resolveTokenShape, tradingWalletsShape, spendableBalancesShape, profileWalletsShape, profilePnlShape, profileTradesShape, noArgsShape, setProfileWalletsShape, swapShape, tradeShape, tradeExecuteShape, tokenImageUrl, tokenBannerUrl, localImageShape, localLaunchTokenShape, localLaunchAndSeedShape, IMAGE_PATH_DISCLOSURE, transferShape, sweepShape, PROFILE_PNL_HYPERLIQUID;
 var init_tools = __esm(() => {
   init_zod();
   init_client2();
@@ -46126,6 +46663,7 @@ var init_tools = __esm(() => {
   TOOL_NAMES = [
     "candle_launch_token",
     "candle_get_market",
+    "candle_quote",
     "candle_get_feed",
     "candle_vamp_candidates",
     "candle_token_events",
@@ -46169,6 +46707,8 @@ var init_tools = __esm(() => {
     "candle_transfer",
     "candle_sweep",
     "candle_get_wallets",
+    "candle_get_trading_wallets",
+    "candle_get_spendable_balances",
     "candle_get_profile_wallets",
     "candle_set_profile_wallets",
     "candle_get_profile_pnl",
@@ -46232,6 +46772,15 @@ var init_tools = __esm(() => {
     chain: exports_external.string().describe('"solana" or "hood"'),
     mint: exports_external.string().describe("Token mint (solana) or contract address (hood)")
   };
+  quoteShape = {
+    chain: exports_external.enum(["solana", "hood"]),
+    mint: exports_external.string().describe("Token mint (solana) or contract address (hood)"),
+    side: exports_external.enum(["buy", "sell"]),
+    amountRaw: exports_external.string().describe("Positive integer in base units: the quote asset's for a buy, the token's for a sell"),
+    quoteAsset: exports_external.string().optional().describe('Asset to price in, e.g. "sol" or "usdc" on Solana, "eth" or "usdg" on Hood'),
+    poolKey: exports_external.unknown().optional().describe("Hood only: a pool hint for a pool nobody has indexed yet"),
+    includeRoundTrip: exports_external.boolean().optional().describe("Hood only: also return the buy-then-sell cost in basis points")
+  };
   priceHistoryShape = {
     chain: exports_external.string().optional().describe('"solana" (the default). Hood is refused with the REST route that serves it'),
     mint: exports_external.string().describe("Token mint"),
@@ -46273,7 +46822,7 @@ var init_tools = __esm(() => {
     return /^[0-9]+$/.test(trimmed) ? Number(trimmed) : value;
   }, exports_external.number({ invalid_type_error: FEED_LIMIT_MESSAGE }).int(FEED_LIMIT_MESSAGE).min(1, FEED_LIMIT_MESSAGE).max(200, FEED_LIMIT_MESSAGE).optional().describe("Max rows to return, an integer from 1 to 200."));
   getFeedShape = {
-    bucket: exports_external.enum(["new", "graduated", "onfire", "bluechip", "finalstretch"]).describe("finalstretch: pump.fun tokens at 50% or more of their bonding curve, most complete first; no delta, read the whole list. Where it is not switched on it is refused as an unknown bucket: use another bucket. bluechip is deprecated and will be removed."),
+    bucket: exports_external.enum(["new", "graduated", "onfire", "bluechip", "finalstretch"]).describe('finalstretch: pump.fun tokens at 50% or more of their bonding curve, most complete first, at most the 200 most complete (limit 200 reads all of them); no delta, read the whole list. Narrow it to tokens near graduation with where {"progress":{"gte":0.9}}. Where it is not switched on it is refused as an unknown bucket: use another bucket. bluechip is deprecated and will be removed.'),
     chain: exports_external.string().optional().describe("Optional chain filter"),
     where: exports_external.string().optional().describe('JSON filter, e.g. {"marketCap":{"lt":150000},"liquidityUsd":{"gte":25000},"mintAuthorityDisabled":{"eq":true}}. ' + "Comparators: eq, ne, lt, lte, gt, gte, present. An ABSENT field satisfies none of them except " + "present:false, so a filter for mintAuthorityDisabled eq true returns only tokens that actually say " + "true, never ones where the flag is simply missing. Use present:false to find the tokens with no data."),
     sort: exports_external.string().optional().describe('Sort as "field" or "field:asc" / "field:desc". A bare field means desc.'),
@@ -46348,6 +46897,13 @@ var init_tools = __esm(() => {
   };
   resolveTokenShape = {
     mint: exports_external.string().describe("Token mint (Solana, base58) or contract address (Hood, 0x-prefixed)")
+  };
+  tradingWalletsShape = {
+    cursor: exports_external.string().optional().describe("The continueCursor of the previous page. Omit for the first page")
+  };
+  spendableBalancesShape = {
+    cursor: exports_external.string().optional().describe("The continueCursor of the previous page. Omit for the first page"),
+    mints: exports_external.array(exports_external.string()).max(10).optional().describe("Up to 10 extra tokens to read beside the base assets: Solana mints or Hood (0x) token addresses. " + "Each is read on the wallets of its own chain")
   };
   profileWalletsShape = {
     keyPrefix: exports_external.string().describe("The profile's API key prefix, as listed by candle keys list or in the dashboard")
@@ -76191,7 +76747,7 @@ var HELP = {
     group: "Trade",
     intro: "Quote, swap and bridge on Solana or Hood; read an operation",
     summary: "Quote, confirm and swap on Solana or Hood, bridge between them; read an operation by id",
-    description: "Swaps run through a TEE wallet's bound key: the quote is shown and confirmed before anything is sent. The first buy after a launch is this command, unless the launch carried it with candle launch --buy. The assets decide the chain (ETH, USDG or a 0x token is Hood; SOL, USDC, CNDL or a mint is Solana) and a named wallet must be on it. A Hood TEE wallet signs one leg at a time: approve, Permit2, trade, then the fee, each only after the one before it landed. SOL or USDC to ETH or USDG, or back, is a bridge through Relay from a TEE wallet into this key's own TEE wallet on the other chain (--to names it when there are several); Candle charges no fee, only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and this machine checks Relay's deposit before it is signed. The bridge prints its deposit and returns while Relay fills; --wait follows it for up to ten minutes. While it is open, a sweep of either wallet refuses BRIDGE_IN_FLIGHT for two hours. Vault to vault: fund the Solana TEE wallet from the vault, bridge, then disable and sweep the Hood TEE wallet into its vault. Every plan can trade Candle-launched tokens and base assets, and buy or sell a token that was not launched on Candle. Each trade pays the plan's agent fee on top; a base-pair swap or a bridge between this key's own wallets pays none. candle plans shows the fees in force. With --json, stdout is one JSON value for every swap, trade, replay and status read: kind, status, clientTradeId, signature (the primary transaction, or null), signatures (a list) and raw (the original response); every human line is on stderr. The keys older versions printed stay beside them.",
+    description: "Swaps run through a TEE wallet's bound key: the quote is shown and confirmed before anything is sent. The first buy after a launch is this command, unless the launch carried it with candle launch --buy. The assets decide the chain (ETH, USDG or a 0x token is Hood; SOL, USDC, CNDL or a mint is Solana) and a named wallet must be on it. A Hood TEE wallet signs one leg at a time: approve, Permit2, trade, then the fee, each only after the one before it landed. SOL or USDC to ETH or USDG, or back, is a bridge through Relay from a TEE wallet into this key's own TEE wallet on the other chain (--to names it when there are several); Candle charges no fee, only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and this machine checks Relay's deposit before it is signed. The bridge prints its deposit and returns while Relay fills; --wait follows it for up to ten minutes. While it is open, a sweep of either wallet refuses BRIDGE_IN_FLIGHT for two hours. Vault to vault: fund the Solana TEE wallet from the vault, bridge, then disable and sweep the Hood TEE wallet into its vault. Every plan can trade Candle-launched tokens and base assets, and buy or sell a token that was not launched on Candle. Each trade pays the plan's agent fee on top; a base-pair swap or a bridge between this key's own wallets pays none. candle plans shows the fees in force. With --dry-run, stdout reports per-check results and the quote; nothing is signed or sent. Otherwise with --json, stdout is one JSON value for every swap, trade, replay and status read: kind, status, clientTradeId, signature (the primary transaction, or null), signatures (a list) and raw (the original response); every human line is on stderr. The keys older versions printed stay beside them.",
     usage: ["candle swap <from> <to> [flags]", "candle swap status <id>"],
     rows: [
       {
@@ -76203,7 +76759,14 @@ var HELP = {
         description: "Read an operation without resending it; --wait follows a bridge until it ends"
       }
     ],
+    flags: [
+      {
+        invocation: "--dry-run",
+        description: "Check a Solana TEE payer, build the quote and check spend, then stop. Never signs, sends, prompts or saves an operation. Refuses --yes, --percent and --client-trade-id; embedded, Hood and bridge payers are unsupported"
+      }
+    ],
     examples: [
+      "candle swap SOL USDC --amount 0.001 --wallet AgentOne --dry-run --json",
       "candle swap SOL USDC --amount 0.5 --wallet AgentOne",
       "candle swap USDC SOL --percent 100 --wallet AgentOne",
       "candle swap ETH USDG --amount 0.05 --wallet HoodOne",
@@ -76504,9 +77067,10 @@ var HELP = {
     group: "Trade",
     intro: "Move funds out of a TEE wallet to your wallets or its vault",
     summary: "Move funds out of a TEE wallet to your own wallets or its vault, through its bound key",
-    description: "Moves one asset out of a TEE wallet this machine can sign for. The bound key must be a Withdraw key (transfer:bound); from that wallet, Candle allows only its own pinned vault or another of the account's wallets you linked while signed in or marked trusted, and, where the server has TEE_WITHDRAWALS_ENABLED on, an address on the account's withdrawal allowlist (named by its label, id or address). To a linked wallet or an approved address only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and the asset must be a base asset; to the vault any token and max are allowed. Candle builds the transaction, this machine approves the relay, Privy signs, Candle broadcasts. The destination and its kind are shown before you confirm. The asset decides the chain: ETH, USDG or --token is Hood, from a Hood TEE wallet, where this machine checks the one leg moves exactly what you confirmed before it is signed, and ETH max leaves the gas reserve.",
+    description: "Moves one asset out of a TEE wallet this machine can sign for. The bound key must be a Withdraw key (transfer:bound); from that wallet, Candle allows only its own pinned vault or another of the account's wallets you linked while signed in or marked trusted, and, where the server has TEE_WITHDRAWALS_ENABLED on, an address on the account's withdrawal allowlist (named by its label, id or address). To a linked wallet or an approved address only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and the asset must be a base asset; to the vault any token and max are allowed. Candle builds the transaction, this machine approves the relay, Privy signs, Candle broadcasts. The destination and its kind are shown before you confirm. candle transfer status <id> reads a transfer by its id or your --client-id: built, expired, submitted with its signature, unconfirmed (check the chain or candle activity before using a new client id), or failed (kept for 24 hours; older transfers are in candle activity). The asset decides the chain: ETH, USDG or --token is Hood, from a Hood TEE wallet, where this machine checks the one leg moves exactly what you confirmed before it is signed, and ETH max leaves the gas reserve.",
     usage: [
-      "candle transfer --to <address|wallet name|allowlist label|vault> --asset <SOL|USDC|CNDL|ETH|USDG>|--mint <mint>|--token <0x...> --amount <decimal|max> [--wallet <tee>] [--yes] [--json]"
+      "candle transfer --to <address|wallet name|allowlist label|vault> --asset <SOL|USDC|CNDL|ETH|USDG>|--mint <mint>|--token <0x...> --amount <decimal|max> [--wallet <tee>] [--client-id <id>] [--yes] [--json]",
+      "candle transfer status <transfer id|client id> [--json]"
     ],
     rows: [],
     flags: [
@@ -76526,10 +77090,15 @@ var HELP = {
         invocation: "--rpc-url <url>",
         description: "Your own Solana RPC, or on Hood the EVM RPC a --token's decimals are read over (optional)"
       },
+      {
+        invocation: "--client-id <id>",
+        description: "Your own id for this transfer (1 to 128 of letters, digits, . _ : -). An id already used for a built or sent transfer is refused with IDEMPOTENCY_CONFLICT naming that transfer, so a retry never sends twice; read it with candle transfer status <id>"
+      },
       { invocation: "--yes", description: "Skip the confirmation prompt (the destination is still printed)" }
     ],
     examples: [
-      "candle transfer --to vault --asset SOL --amount max --wallet AgentOne",
+      "candle transfer --to vault --asset SOL --amount max --wallet AgentOne --client-id sweep-2026-11-07",
+      "candle transfer status sweep-2026-11-07",
       "candle transfer --to treasury --asset USDC --amount 250 --wallet AgentOne --yes --json",
       "candle transfer --to vault --asset ETH --amount max --wallet HoodAgent"
     ],
@@ -77329,6 +77898,10 @@ var HELP = {
     usage: ["candle tee <subcommand> [flags]"],
     rows: [
       {
+        invocation: "check <address|id|label>... [--label-prefix <p>] [--sign] [--max <n>] [--rpc-url <url>]",
+        description: "Check payable membership, record parity and this machine's signer without spending. --sign builds a tiny SOL/USDC quote, checks spend, signs and simulates; never broadcasts (default cap 10). Needs swap:write"
+      },
+      {
         invocation: "new [--label <name>]",
         description: "Add a Solana key to an existing tee-wallets.enc. With no store, refuses: candle vault new-key --chain solana, then candle vault promote --from <label> --to-key <prefix>. --factor does not apply"
       },
@@ -77390,6 +77963,8 @@ var HELP = {
       }
     ],
     examples: [
+      "candle tee check --label-prefix pool- --json",
+      "candle tee check AgentOne --sign --rpc-url <url>",
       "candle tee new --label AgentOne",
       "candle tee status AgentOneAddress",
       "candle tee sweep AgentOneAddress",
@@ -77956,13 +78531,14 @@ class AgentProfiles {
 // src/core/cards.ts
 init_render();
 init_canonical_json();
-import { createHash as createHash3, randomBytes as randomBytes5, randomUUID as randomUUID2 } from "node:crypto";
+import { createHash as createHash3, randomBytes as randomBytes5, randomUUID as randomUUID3 } from "node:crypto";
 
 // src/core/classify.ts
 var READ = { class: "read" };
 var card = (kind, idKey = "coreOpId") => ({ class: "card", kind, idKey });
 var TOOL_CLASSES = {
   candle_get_market: READ,
+  candle_quote: READ,
   candle_get_feed: READ,
   candle_vamp_candidates: READ,
   candle_token_events: READ,
@@ -77986,6 +78562,8 @@ var TOOL_CLASSES = {
   candle_get_agent_positions: READ,
   candle_get_plans: READ,
   candle_get_wallets: READ,
+  candle_get_trading_wallets: READ,
+  candle_get_spendable_balances: READ,
   candle_get_profile_wallets: READ,
   candle_get_profile_pnl: READ,
   candle_get_profile_trades: READ,
@@ -79820,8 +80398,8 @@ class CardBook {
     if (idKey === "clientId")
       return `0x${randomBytes5(16).toString("hex")}`;
     if (idKey === "clientDepositId")
-      return `deposit-${randomUUID2()}`;
-    return randomUUID2();
+      return `deposit-${randomUUID3()}`;
+    return randomUUID3();
   }
   view(card2) {
     return JSON.parse(JSON.stringify(card2));
@@ -80680,18 +81258,18 @@ async function readJournal(path) {
   const tornTail = text2.length > 0 && !text2.endsWith(`
 `);
   const rows = [];
-  let skipped = 0;
+  let skipped2 = 0;
   for (const line of text2.split(`
 `)) {
     if (line.trim() === "")
       continue;
     const row2 = parseRow(line);
     if (row2 === undefined)
-      skipped++;
+      skipped2++;
     else
       rows.push(row2);
   }
-  return { rows, skipped, tornTail };
+  return { rows, skipped: skipped2, tornTail };
 }
 function parseRow(line) {
   let value;
@@ -80752,10 +81330,10 @@ function registerLaunchHandlers(server, deps) {
   server.handle("launch.dryRun", async (params, { client }) => deps.cards.dryRun({ cardId: params.cardId, factor: parseFactor(params.factor) }, client.clientId));
 }
 function coded(error, fallback) {
-  const failure2 = error;
-  if (failure2 !== null && typeof failure2 === "object" && "rpcCode" in failure2)
+  const failure3 = error;
+  if (failure3 !== null && typeof failure3 === "object" && "rpcCode" in failure3)
     return error;
-  return refused(typeof failure2?.code === "string" ? failure2.code : fallback, typeof failure2?.message === "string" ? failure2.message : String(error));
+  return refused(typeof failure3?.code === "string" ? failure3.code : fallback, typeof failure3?.message === "string" ? failure3.message : String(error));
 }
 
 // src/commands/core.ts
@@ -81159,7 +81737,7 @@ ${text2}` : text2;
     const sleep = this.deps.sleep ?? defaultSleep;
     let tooMany = 0;
     let lost = 0;
-    let failure2;
+    let failure3;
     while (!poll.stopped) {
       const answer2 = await client.events(poll.turnId, poll.next, { signal: poll.abort.signal });
       if (poll.stopped)
@@ -81194,7 +81772,7 @@ ${text2}` : text2;
       if (refusal2.code === "too_many_polls") {
         tooMany++;
         if (tooMany > TOO_MANY_POLLS_RETRIES) {
-          failure2 = "too_many_polls";
+          failure3 = "too_many_polls";
           break;
         }
         await sleep(TOO_MANY_POLLS_WAIT_MS);
@@ -81203,13 +81781,13 @@ ${text2}` : text2;
       if (refusal2.shape === "transport") {
         lost++;
         if (lost > LOST_POLL_RETRIES) {
-          failure2 = "QUANT_UNREACHABLE";
+          failure3 = "QUANT_UNREACHABLE";
           break;
         }
         await sleep(Math.min(1000 * lost, 5000));
         continue;
       }
-      failure2 = refusal2.code;
+      failure3 = refusal2.code;
       break;
     }
     if (this.poll !== poll)
@@ -81220,11 +81798,11 @@ ${text2}` : text2;
       this.ended.delete(this.ended.values().next().value);
     if (this.turn?.turnId === poll.turnId)
       this.turn.running = false;
-    if (failure2 !== undefined) {
+    if (failure3 !== undefined) {
       this.publish({
         turnId: poll.turnId,
         kind: "poll_failed",
-        data: { code: failure2 },
+        data: { code: failure3 },
         seq: poll.next,
         origin: poll.origin
       });
@@ -83261,8 +83839,8 @@ async function prepare(params, call2, deps) {
     try {
       preview = await deps.reads.previewVault(parsed, wallet3);
     } catch (error) {
-      const failure2 = error;
-      throw refused(typeof failure2.code === "string" ? failure2.code : "TRANSFER_PREVIEW_FAILED", `${terminalText(typeof failure2.message === "string" ? failure2.message : String(error))} Nothing was prepared.`);
+      const failure3 = error;
+      throw refused(typeof failure3.code === "string" ? failure3.code : "TRANSFER_PREVIEW_FAILED", `${terminalText(typeof failure3.message === "string" ? failure3.message : String(error))} Nothing was prepared.`);
     }
   } else {
     const withdraw = deps.trading.withdrawState();
@@ -84636,8 +85214,8 @@ async function readTargetSigner(ctx, deviceToken, keyPrefix) {
 }
 async function preflightToKey(ctx, raw, opts) {
   const { deps, json } = ctx;
-  const refuse3 = (failure2) => {
-    writeLocalFailure(deps, failure2, json);
+  const refuse3 = (failure3) => {
+    writeLocalFailure(deps, failure3, json);
     return { ok: false, exit: 1 };
   };
   const deviceToken = await resolveDeviceToken(deps, ctx.profile);
@@ -84789,8 +85367,8 @@ async function rebindPromoted(ctx, deviceToken, toKeyPrefix, wallets2, pinnedSpk
     if (!committed.ok) {
       run2.ok = false;
       if ("missing" in committed) {
-        const failure2 = missingSignerFailure(committed.missing);
-        run2.failure = { ...failure2, status: 409, chunk: at2 + 1 };
+        const failure3 = missingSignerFailure(committed.missing);
+        run2.failure = { ...failure3, status: 409, chunk: at2 + 1 };
       } else if ("changed" in committed) {
         run2.failure = { ...committed.changed, status: 409, chunk: at2 + 1 };
       } else {
@@ -85574,8 +86152,8 @@ async function moveToLiveKey(ctx, deviceToken, source, toKeyRaw) {
   for (const chunk of chunkWallets(ids)) {
     const preview = await postRebind(ctx, deviceToken, { dryRun: true, toKeyPrefix: target.keyPrefix, wallets: chunk });
     if (!preview.ok) {
-      const failure2 = rebindFailureDetails(preview, {});
-      writeScreenLocalFailure(deps, failure2, json);
+      const failure3 = rebindFailureDetails(preview, {});
+      writeScreenLocalFailure(deps, failure3, json);
       return 1;
     }
     const shown = preview.body;
@@ -90489,7 +91067,7 @@ init_secret_store();
 init_key_output();
 init_keys();
 init_tee_rebind();
-import { randomUUID as randomUUID7 } from "node:crypto";
+import { randomUUID as randomUUID8 } from "node:crypto";
 
 // src/commands/token-pages.ts
 init_esm();
@@ -90499,7 +91077,7 @@ init_deps();
 init_human_output();
 init_presentation();
 init_render();
-import { createHash as createHash5, randomUUID as randomUUID6 } from "node:crypto";
+import { createHash as createHash5, randomUUID as randomUUID7 } from "node:crypto";
 var EXIT_OUTCOME_UNKNOWN = 3;
 var EXIT_REVISION_CONFLICT = 4;
 var TOKEN_PAGE_LIMITS = { thesis: 280, tokenomics: 5000, lore: 5000, update: 1000, comment: 500 };
@@ -90582,8 +91160,8 @@ function writeApiFailure(ctx, result, authType) {
     writeRefusal(ctx, refusal3);
     return 1;
   }
-  const failure2 = result;
-  writeFailure(ctx.deps, failure2.status === 404 ? { ...failure2, message: REFUSALS.not_found } : failure2, { apiUrl: ctx.apiUrl, authType }, ctx.json);
+  const failure3 = result;
+  writeFailure(ctx.deps, failure3.status === 404 ? { ...failure3, message: REFUSALS.not_found } : failure3, { apiUrl: ctx.apiUrl, authType }, ctx.json);
   return 1;
 }
 function dataOf(result) {
@@ -90646,7 +91224,7 @@ function writeUnknown(ctx, idempotencyKey) {
 function idempotencyKeyOf(values, usage4) {
   const given2 = values["--idempotency-key"];
   if (given2 === undefined)
-    return randomUUID6();
+    return randomUUID7();
   if (given2.length < 1 || given2.length > 128)
     return usage4("--idempotency-key must be 1 to 128 characters.");
   return given2;
@@ -91362,7 +91940,7 @@ async function keysRotate(args, ctx) {
     writeScreenUsageFailure(deps, "--idempotency-key must be 1 to 128 characters.", json);
     return 2;
   }
-  const idempotencyKey = keyFlag ?? randomUUID7();
+  const idempotencyKey = keyFlag ?? randomUUID8();
   let graceSeconds = now ? 0 : DEFAULT_GRACE_SECONDS;
   if (graceFlag !== undefined) {
     const grace = parseGrace(graceFlag);
@@ -91920,7 +92498,7 @@ async function client(ctx) {
     }, ctx.json);
   }
 }
-function failure2(answer2, ctx, statusRoute = false) {
+function failure3(answer2, ctx, statusRoute = false) {
   const { refusal: refusal3 } = answer2;
   if (ctx.json && refusal3.body !== undefined)
     ctx.deps.stdout.write(`${JSON.stringify(refusal3.body)}
@@ -91988,7 +92566,7 @@ async function labStatus(args, ctx) {
     return 1;
   const answer2 = await connected.lab.status();
   if (!answer2.ok)
-    return failure2(answer2, ctx, true);
+    return failure3(answer2, ctx, true);
   if (ctx.json)
     ctx.deps.stdout.write(`${JSON.stringify(answer2.body)}
 `);
@@ -92033,7 +92611,7 @@ async function labReplay(args, ctx) {
     const id = parsed2.positionals[0];
     const answer2 = action === "get" ? await connected2.lab.replayGet(id) : await connected2.lab.replayCancel(id);
     if (!answer2.ok)
-      return failure2(answer2, ctx);
+      return failure3(answer2, ctx);
     if (action === "get")
       return replayOutput(answer2.body, ctx);
     if (ctx.json)
@@ -92099,7 +92677,7 @@ ${REPLAY_USAGE}`);
   };
   const started = await connected.lab.replay(body);
   if (!started.ok)
-    return failure2(started, ctx);
+    return failure3(started, ctx);
   if (parsed.booleans.has("--no-wait")) {
     if (ctx.json)
       ctx.deps.stdout.write(`${JSON.stringify(started.body)}
@@ -92109,7 +92687,7 @@ ${REPLAY_USAGE}`);
     return 0;
   }
   const result = await connected.lab.waitForReplay(started.body.job_id);
-  return result.ok ? replayOutput(result.body, ctx) : failure2(result, ctx);
+  return result.ok ? replayOutput(result.body, ctx) : failure3(result, ctx);
 }
 async function report(args, ctx, kind) {
   const flags = kind === "runners" ? ["--hours", "--min-wallets"] : ["--days", "--min-n"];
@@ -92134,7 +92712,7 @@ async function report(args, ctx, kind) {
     return 1;
   const answer2 = kind === "runners" ? await connected.lab.runners(q) : await connected.lab.edges(q);
   if (!answer2.ok)
-    return failure2(answer2, ctx);
+    return failure3(answer2, ctx);
   if (ctx.json)
     ctx.deps.stdout.write(`${JSON.stringify(answer2.body)}
 `);
@@ -92172,7 +92750,7 @@ init_zod();
 init_args();
 init_client();
 init_evm_lite();
-import { randomUUID as randomUUID8 } from "node:crypto";
+import { randomUUID as randomUUID9 } from "node:crypto";
 
 // src/fee-wallet.ts
 init_solana_lite();
@@ -92727,7 +93305,7 @@ async function launch(args, ctx) {
   const flags = parsed.values;
   if (flags["--quote-asset"])
     flags["--quote-asset"] = flags["--quote-asset"].toLowerCase();
-  const id = flags["--client-trade-id"] ?? `launch-${randomUUID8()}`;
+  const id = flags["--client-trade-id"] ?? `launch-${randomUUID9()}`;
   const embedded = EMBEDDED_WALLET_NAMES.has(flags["--wallet"] ?? "");
   const dryRun = parsed.booleans.has("--dry-run");
   const check = parsed.booleans.has("--check");
@@ -93716,7 +94294,7 @@ init_render();
 init_solana_endpoint();
 init_solana_lite();
 init_trading();
-import { randomUUID as randomUUID9 } from "node:crypto";
+import { randomUUID as randomUUID10 } from "node:crypto";
 init_swap();
 var LP_SCOPE = "lp:write";
 var CONFIRM_POLL_MS3 = 2000;
@@ -94019,7 +94597,7 @@ async function lpAdd(args, ctx) {
   if ("error" in parsed)
     return usage5(ctx, parsed.error);
   const flags = parsed.values;
-  const id = flags["--client-trade-id"] ?? `lp-${randomUUID9()}`;
+  const id = flags["--client-trade-id"] ?? `lp-${randomUUID10()}`;
   if (parsed.positionals.length !== 2 || !flags["--amount"] || !flags["--wallet"] || !validClientId(id))
     return usage5(ctx, "Usage: candle lp add <pool> --amount <decimal> <token> --wallet <tee> [--position <nft-mint>] [--slippage-bps 100] [--client-trade-id <id>] [--rpc-url <url>] [--yes]");
   try {
@@ -94055,7 +94633,7 @@ async function lpRemove(args, ctx) {
   if ("error" in parsed)
     return usage5(ctx, parsed.error);
   const flags = parsed.values;
-  const id = flags["--client-trade-id"] ?? `lp-${randomUUID9()}`;
+  const id = flags["--client-trade-id"] ?? `lp-${randomUUID10()}`;
   const percent2 = Number(flags["--percent"]);
   if (parsed.positionals.length !== 1 || !flags["--percent"] || !/^\d+(\.\d{1,2})?$/.test(flags["--percent"]) || !(percent2 > 0 && percent2 <= 100) || !validClientId(id))
     return usage5(ctx, "Usage: candle lp remove <position> --percent <0.01-100> [--wallet <tee>] [--slippage-bps 100] [--client-trade-id <id>] [--rpc-url <url>] [--yes]");
@@ -94087,7 +94665,7 @@ async function lpClaim(args, ctx) {
   if ("error" in parsed)
     return usage5(ctx, parsed.error);
   const flags = parsed.values;
-  const id = flags["--client-trade-id"] ?? `lp-${randomUUID9()}`;
+  const id = flags["--client-trade-id"] ?? `lp-${randomUUID10()}`;
   if (parsed.positionals.length !== 1 || !validClientId(id))
     return usage5(ctx, "Usage: candle lp claim <position> [--wallet <tee>] [--client-trade-id <id>] [--rpc-url <url>] [--yes]");
   try {
@@ -94121,6 +94699,7 @@ var MCP_TOOL_NAMES = [
   "candle_launch_token",
   "candle_launch_and_seed",
   "candle_get_market",
+  "candle_quote",
   "candle_get_feed",
   "candle_vamp_candidates",
   "candle_token_events",
@@ -94162,6 +94741,8 @@ var MCP_TOOL_NAMES = [
   "candle_transfer",
   "candle_sweep",
   "candle_get_wallets",
+  "candle_get_trading_wallets",
+  "candle_get_spendable_balances",
   "candle_get_profile_wallets",
   "candle_set_profile_wallets",
   "candle_get_profile_pnl",
@@ -94338,7 +94919,7 @@ init_bridge();
 init_client();
 init_evm_lite();
 init_human_output();
-import { randomUUID as randomUUID10, sign as sign4 } from "node:crypto";
+import { randomUUID as randomUUID11, sign as sign4 } from "node:crypto";
 
 // src/hyperliquid.ts
 init_sha3();
@@ -98251,7 +98832,7 @@ async function perpsDeposit(args, ctx) {
   if (parsed.positionals.length !== 2 || !amount || !DEC_RE3.test(amount) || !isDepositAsset(asset))
     return usage8(ctx, DEPOSIT_USAGE);
   const { values } = parsed;
-  const id = values["--id"] ?? `deposit-${randomUUID10()}`;
+  const id = values["--id"] ?? `deposit-${randomUUID11()}`;
   if (!DEPOSIT_ID_RE.test(id))
     return usage8(ctx, "--id must be 1 to 128 letters, digits, '.', '_', ':' or '-'.");
   const slippageBps = Number(values["--slippage-bps"] ?? "100");
@@ -99390,8 +99971,8 @@ async function read2(ctx, argv, command) {
         writeUsageFailure(ctx.deps, error.message, ctx.json);
         return 2;
       }
-      const failure3 = { code: error.code, message: error.message, retryable: error.retryable };
-      writeLocalFailure(ctx.deps, failure3, ctx.json);
+      const failure4 = { code: error.code, message: error.message, retryable: error.retryable };
+      writeLocalFailure(ctx.deps, failure4, ctx.json);
       return 1;
     }
     return tradingFailure(ctx, error);
@@ -99405,7 +99986,7 @@ var perpsCandles = (argv, ctx) => read2(ctx, argv, "candles");
 // src/commands/perps-withdraw.ts
 init_args();
 init_human_output();
-import { randomUUID as randomUUID11 } from "node:crypto";
+import { randomUUID as randomUUID12 } from "node:crypto";
 
 // src/hyperliquid-withdraw.ts
 var CANDLE_PERPS_WITHDRAW_PINS = {
@@ -99649,7 +100230,7 @@ async function perpsWithdraw(args, ctx) {
   const amountMicros = parseWithdrawAmount(amount);
   if (amountMicros === null)
     return usage10(ctx, "The amount must be a positive USDC decimal with at most 6 decimals.");
-  const id = parsed.values["--id"] ?? `withdraw-${randomUUID11()}`;
+  const id = parsed.values["--id"] ?? `withdraw-${randomUUID12()}`;
   if (!ID_RE.test(id))
     return usage10(ctx, "--id must be 1 to 128 letters, digits, '.', '_', ':' or '-'.");
   if (!refuseEnvPassphrase(ctx))
@@ -99788,7 +100369,7 @@ init_render();
 init_secret_store();
 init_solana_lite();
 init_errors2();
-import { generateKeyPairSync as generateKeyPairSync3, randomUUID as randomUUID13 } from "node:crypto";
+import { generateKeyPairSync as generateKeyPairSync3, randomUUID as randomUUID14 } from "node:crypto";
 
 // src/x402/codec.ts
 var PAYMENT_REQUIRED_HEADER = "PAYMENT-REQUIRED";
@@ -100398,7 +100979,7 @@ init_deps();
 init_render();
 init_solana_endpoint();
 init_solana_lite();
-import { randomUUID as randomUUID12 } from "node:crypto";
+import { randomUUID as randomUUID13 } from "node:crypto";
 
 // src/x402/pay.ts
 init_client();
@@ -100746,7 +101327,7 @@ async function runPaidRead(ctx, input) {
       blockhash: blockhashFor(ctx),
       env: ctx.deps.env,
       now: ctx.deps.now,
-      newId: randomUUID12
+      newId: randomUUID13
     });
     const line = paymentLine(paid);
     if (line && !ctx.json)
@@ -101358,7 +101939,7 @@ async function runPlanPayment(ctx, run2) {
     const transaction = serializePartiallySigned(transfer, signer.sign(transfer.message));
     const at3 = new Date(deps.now()).toISOString();
     const pending = {
-      id: randomUUID13(),
+      id: randomUUID14(),
       plan: run2.plan,
       renew,
       path,
@@ -101669,7 +102250,8 @@ var PLAN_CAPABILITY_LABELS2 = {
   createLinkedWallets: "Create linked wallets",
   importLinkedWallets: "Import linked wallets",
   limitOrders: "Limit orders",
-  quant: "Quant deep analyses (Max)"
+  quant: "Quant deep analyses (Max)",
+  strategyLab: "Strategy lab (saved strategies stay Max)"
 };
 var PLAN_LABELS2 = { free: "Free", believer: "Believer", pro: "Pro", max: "Max" };
 function planLabel2(plan2) {
@@ -101698,6 +102280,9 @@ function planTableRows2(table) {
     row2("Uploads per minute", (e) => count2(e.limits.uploadsPerMin)),
     row2("Linked wallets", (e) => count2(e.limits.linkedWallets))
   ];
+  if (plans.some((e) => typeof e.limits.labReplaysPerDay === "number")) {
+    rows.push(row2("Strategy lab replays", (e) => typeof e.limits.labReplaysPerDay === "number" ? `${count2(e.limits.labReplaysPerDay)} a day` : "-"));
+  }
   const known = Object.keys(PLAN_CAPABILITY_LABELS2);
   const served = new Set;
   for (const entry of plans)
@@ -103280,12 +103865,12 @@ async function startEvmRead(addresses, rpcUrl, fetchFn) {
   try {
     chainId = await rpc.chainId();
   } catch (error) {
-    const failure3 = message(error);
+    const failure4 = message(error);
     return {
       balances: async () => ({
         byAddress: new Map(unique.map((address) => [address, { wei: null, usdg: null }])),
         unavailable: unique,
-        failure: failure3
+        failure: failure4
       })
     };
   }
@@ -103297,7 +103882,7 @@ async function startEvmRead(addresses, rpcUrl, fetchFn) {
   return {
     balances: async () => {
       const byAddress = new Map;
-      let failure3;
+      let failure4;
       let next = 0;
       await Promise.all(Array.from({ length: Math.min(EVM_READS_IN_FLIGHT, unique.length) }, async () => {
         while (next < unique.length) {
@@ -103306,7 +103891,7 @@ async function startEvmRead(addresses, rpcUrl, fetchFn) {
             try {
               return await call2();
             } catch (error) {
-              failure3 ??= message(error);
+              failure4 ??= message(error);
               return null;
             }
           };
@@ -103319,7 +103904,7 @@ async function startEvmRead(addresses, rpcUrl, fetchFn) {
         const read3 = byAddress.get(address);
         return read3 === undefined || read3.wei === null || read3.usdg === null;
       });
-      return { byAddress, unavailable: unavailable6, ...failure3 === undefined ? {} : { failure: failure3 } };
+      return { byAddress, unavailable: unavailable6, ...failure4 === undefined ? {} : { failure: failure4 } };
     }
   };
 }
@@ -103328,13 +103913,13 @@ async function readOwnRpc(addresses, solana, ctx) {
   const unique = [...new Set(addresses)];
   const lamports = new Map;
   let rateLimited = false;
-  let failure3;
+  let failure4;
   const noteFailure = (error) => {
     if (isRateLimited(error)) {
       rateLimited = true;
-      failure3 ??= rateLimitedReadFailure(ctx, error);
+      failure4 ??= rateLimitedReadFailure(ctx, error);
     } else
-      failure3 ??= describeRpcFailure(error);
+      failure4 ??= describeRpcFailure(error);
   };
   for (let at3 = 0;at3 < unique.length; at3 += CHUNK) {
     const chunk = unique.slice(at3, at3 + CHUNK);
@@ -103396,7 +103981,7 @@ async function readOwnRpc(addresses, solana, ctx) {
     if (sol === null || held === null)
       unavailable6.push(address);
   }
-  return { byAddress, unavailable: unavailable6, ...failure3 === undefined ? {} : { failure: failure3 } };
+  return { byAddress, unavailable: unavailable6, ...failure4 === undefined ? {} : { failure: failure4 } };
 }
 function solanaHoldings(read3, prices) {
   if (read3 === undefined || read3.lamports === null && read3.tokens === null)
@@ -103826,17 +104411,17 @@ async function profileUse(args, ctx) {
   let account = profile.account;
   let username = profile.username;
   if (apiKey) {
-    const { account: live, username: liveUsername, failure: failure3 } = await fetchAccount(deps, apiUrl, apiKey);
+    const { account: live, username: liveUsername, failure: failure4 } = await fetchAccount(deps, apiUrl, apiKey);
     if (live) {
       account = live;
       username = liveUsername;
       await deps.updateProfile(name2, { account: live, username: liveUsername, accountCachedAt: deps.now() });
     } else {
       if (json)
-        notice(deps, "stderr", "warning", `Could not refresh the account for ${name2} (${failure3}); keeping the cached value.
+        notice(deps, "stderr", "warning", `Could not refresh the account for ${name2} (${failure4}); keeping the cached value.
 `.trim());
       else
-        notice(deps, "stderr", "warning", `Could not refresh the account for ${name2} (${failure3}); keeping the cached value.`);
+        notice(deps, "stderr", "warning", `Could not refresh the account for ${name2} (${failure4}); keeping the cached value.`);
     }
   } else {
     if (json)
@@ -104170,8 +104755,8 @@ async function quantAsk(args, ctx) {
     if (turnId === undefined) {
       if (reason === "interrupted")
         return await stopped(ctx, client2, undefined, reason, timeoutS);
-      const failure3 = refusal3?.status === 402 && offer ? offerFailure(offer.status, offer.headers, offer.body) : turnRefusal(refusal3 ?? { code: "BAD_RESPONSE", status: 0, shape: "transport" });
-      writeScreenLocalFailure(ctx.deps, failure3, ctx.json);
+      const failure4 = refusal3?.status === 402 && offer ? offerFailure(offer.status, offer.headers, offer.body) : turnRefusal(refusal3 ?? { code: "BAD_RESPONSE", status: 0, shape: "transport" });
+      writeScreenLocalFailure(ctx.deps, failure4, ctx.json);
       return 1;
     }
     if (stop.signal.aborted) {
@@ -105303,7 +105888,7 @@ init_presentation();
 init_render();
 init_trading();
 init_swap();
-import { randomUUID as randomUUID14 } from "node:crypto";
+import { randomUUID as randomUUID15 } from "node:crypto";
 var withdrawal = exports_external.object({ withdrawal: exports_external.string(), amountRaw: exports_external.string(), endTime: exports_external.string(), claimable: exports_external.boolean() }).passthrough();
 var positionsSchema = exports_external.object({
   success: exports_external.literal(true),
@@ -105358,7 +105943,7 @@ async function runStake(action, args, ctx) {
     return 2;
   }
   const { values, positionals, booleans } = parsed;
-  const id = values["--client-stake-id"] ?? `stake-${randomUUID14()}`;
+  const id = values["--client-stake-id"] ?? `stake-${randomUUID15()}`;
   const all = booleans.has("--all");
   if (!validClientId(id) || id.length > 128 || (action === "positions" ? positionals.length !== 0 : action === "finish" ? positionals.length > 1 : action === "claim" ? all ? positionals.length !== 0 : positionals.length !== 1 : positionals.length !== 1)) {
     writeUsageFailure(ctx.deps, usage12, ctx.json);
@@ -106448,7 +107033,7 @@ init_args();
 init_client();
 init_deps();
 init_human_output();
-import { randomUUID as randomUUID15 } from "node:crypto";
+import { randomUUID as randomUUID16 } from "node:crypto";
 init_render();
 var EXIT_OUTCOME_UNKNOWN2 = 3;
 var EDIT_FIELDS = launchFlagFields.filter((field) => field.key === "description" || field.key.startsWith("socials."));
@@ -106574,7 +107159,7 @@ async function tokenEdit(args, ctx) {
   if (given2 !== undefined && (given2.length < 1 || given2.length > 128)) {
     return usage12("--idempotency-key must be 1 to 128 characters.");
   }
-  const idempotencyKey = given2 ?? randomUUID15();
+  const idempotencyKey = given2 ?? randomUUID16();
   const apiKey = await resolveApiKey(ctx.deps, ctx.profile);
   if (!apiKey) {
     writeLocalFailure(ctx.deps, {
@@ -106599,17 +107184,17 @@ async function tokenEdit(args, ctx) {
     return EXIT_OUTCOME_UNKNOWN2;
   }
   if (!result.ok) {
-    const failure3 = { apiUrl: ctx.apiUrl, authType: "key" };
+    const failure4 = { apiUrl: ctx.apiUrl, authType: "key" };
     if (!unsettledCommit && !mayHaveCommitted(result)) {
-      writeFailure(ctx.deps, result, failure3, ctx.json);
+      writeFailure(ctx.deps, result, failure4, ctx.json);
       return 1;
     }
     const retry = `Rerun the same command with --idempotency-key ${idempotencyKey}: Candle returns the first result instead of editing twice.`;
     if (ctx.json) {
-      ctx.deps.stdout.write(`${JSON.stringify({ ...errorEnvelope(result, failure3), idempotencyKey, details: { idempotencyKey }, retryCommand: retry })}
+      ctx.deps.stdout.write(`${JSON.stringify({ ...errorEnvelope(result, failure4), idempotencyKey, details: { idempotencyKey }, retryCommand: retry })}
 `);
     } else {
-      writeFailure(ctx.deps, result, failure3, false);
+      writeFailure(ctx.deps, result, failure4, false);
       ctx.deps.stderr.write(`Idempotency key: ${idempotencyKey}
 ${retry}
 `);
@@ -106709,7 +107294,9 @@ init_render();
 init_solana_verify();
 init_trading();
 init_swap();
-var USAGE18 = "Usage: candle transfer --to <address|wallet name|allowlist label|vault> --asset <SOL|USDC|CNDL|ETH|USDG>|--mint <mint>|--token <0x...> --amount <decimal|max> [--wallet <name>] [--rpc-url <url>] [--yes] [--json]";
+var USAGE18 = `Usage: candle transfer --to <address|wallet name|allowlist label|vault> --asset <SOL|USDC|CNDL|ETH|USDG>|--mint <mint>|--token <0x...> --amount <decimal|max> [--wallet <name>] [--client-id <id>] [--rpc-url <url>] [--yes] [--json]
+       candle transfer status <transfer id|client id> [--json]`;
+var CLIENT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 var TRANSFER_ASSETS = [...Object.keys(BASES), ...Object.keys(HOOD_BASES)];
 var BASE58_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 async function readLinkedWallets(ctx, key) {
@@ -106842,9 +107429,26 @@ async function confirmTransfer(ctx, lines, yes) {
     throw new TradingError("CONFIRMATION_REQUIRED", "Run interactively to confirm, or use --yes for an ordinary transfer prompt.");
   return (await ctx.deps.promptLine("Proceed? [y/N] ")).trim().toLowerCase() === "y";
 }
+async function transferStatus(args, ctx) {
+  const parsed = parseArgs(args, { valueFlags: [], booleanFlags: [] });
+  if ("error" in parsed || parsed.positionals.length !== 1 || !CLIENT_ID.test(parsed.positionals[0] ?? "")) {
+    writeUsageFailure(ctx.deps, "Usage: candle transfer status <transfer id|client id> [--json]", ctx.json);
+    return 2;
+  }
+  try {
+    const key = await tradingKey(ctx);
+    const id = parsed.positionals[0];
+    const found = await request(ctx, key, `/api/v1/agent/transfer/${encodeURIComponent(id)}`);
+    return printTradingResult(ctx, found);
+  } catch (error) {
+    return tradingFailure(ctx, error);
+  }
+}
 async function transfer(args, ctx) {
+  if (args[0] === "status")
+    return await transferStatus(args.slice(1), ctx);
   const parsed = parseArgs(args, {
-    valueFlags: ["--wallet", "--to", "--asset", "--mint", "--token", "--amount", "--rpc-url"],
+    valueFlags: ["--wallet", "--to", "--asset", "--mint", "--token", "--amount", "--rpc-url", "--client-id"],
     booleanFlags: ["--yes"]
   });
   if ("error" in parsed) {
@@ -106853,7 +107457,7 @@ async function transfer(args, ctx) {
   }
   const flags2 = parsed.values;
   const asset = flags2["--asset"]?.toUpperCase();
-  if (parsed.positionals.length !== 0 || !flags2["--to"] || !flags2["--amount"] || [flags2["--asset"], flags2["--mint"], flags2["--token"]].filter(Boolean).length !== 1 || asset !== undefined && !TRANSFER_ASSETS.includes(asset) || flags2["--mint"] !== undefined && !BASE58_ADDRESS.test(flags2["--mint"]) || flags2["--token"] !== undefined && !checkEvmAddress(flags2["--token"]).ok) {
+  if (parsed.positionals.length !== 0 || !flags2["--to"] || !flags2["--amount"] || [flags2["--asset"], flags2["--mint"], flags2["--token"]].filter(Boolean).length !== 1 || asset !== undefined && !TRANSFER_ASSETS.includes(asset) || flags2["--mint"] !== undefined && !BASE58_ADDRESS.test(flags2["--mint"]) || flags2["--token"] !== undefined && !checkEvmAddress(flags2["--token"]).ok || flags2["--client-id"] !== undefined && !CLIENT_ID.test(flags2["--client-id"])) {
     writeUsageFailure(ctx.deps, USAGE18, ctx.json);
     return 2;
   }
@@ -106900,7 +107504,8 @@ async function transfer(args, ctx) {
       chain: "solana",
       ...asset ? { asset } : { mint: flags2["--mint"] },
       amountRaw,
-      to: destination.address
+      to: destination.address,
+      ...flags2["--client-id"] !== undefined ? { clientTransferId: flags2["--client-id"] } : {}
     });
     const transferId = built.transferId;
     const unsigned = built.unsignedTransactionsBase64;
@@ -106936,6 +107541,7 @@ async function transfer(args, ctx) {
     const receipt = {
       ...result,
       transferId,
+      ...flags2["--client-id"] !== undefined ? { clientTransferId: flags2["--client-id"] } : {},
       walletId: wallet3.id,
       wallet: safeText(wallet3.address),
       destination,
@@ -106992,7 +107598,8 @@ async function hoodTransfer(ctx, args) {
     chain: "hood",
     ...asset ? { asset } : { mint: tokenAddress },
     amountRaw: requested,
-    to: destination.address
+    to: destination.address,
+    ...flags2["--client-id"] !== undefined ? { clientTransferId: flags2["--client-id"] } : {}
   });
   const parsed = sequencedSchema.safeParse(built);
   if (!parsed.success)
@@ -107029,6 +107636,7 @@ async function hoodTransfer(ctx, args) {
   const receipt = {
     ...run2.final,
     transferId,
+    ...flags2["--client-id"] !== undefined ? { clientTransferId: flags2["--client-id"] } : {},
     chain: "hood",
     walletId: wallet3.id,
     wallet: safeText(wallet3.address),
@@ -107701,10 +108309,10 @@ candle update`);
       } catch (error) {
         steps.fail("installing");
         await discard(deps, helper.tmpPath);
-        const failure3 = notWritable(dir, error);
+        const failure4 = notWritable(dir, error);
         writeScreenLocalFailure(deps, {
-          ...failure3,
-          message: `${failure3.message} candle ${target.version} was installed to ${realExec}, but its security key helper could not be renamed to ${helper.target}.`
+          ...failure4,
+          message: `${failure4.message} candle ${target.version} was installed to ${realExec}, but its security key helper could not be renamed to ${helper.target}.`
         }, json);
         return 1;
       }
@@ -108635,8 +109243,8 @@ async function vaultDemoteBatch(args, ctx) {
         row2.label,
         row2.destination ?? `none (${row2.destinationNote})`
       ]), []);
-      for (const skipped of outcomes) {
-        ctx.deps[display].write(`Not demoted: ${skipped.address}: ${skipped.reason}
+      for (const skipped2 of outcomes) {
+        ctx.deps[display].write(`Not demoted: ${skipped2.address}: ${skipped2.reason}
 `);
       }
       if (!yes) {
@@ -108744,12 +109352,12 @@ async function demoteOne(ctx, session, row2, values, booleans) {
       }
     }
     outcome.results = results;
-    const failure3 = [...results].reverse().find((doc) => typeof doc === "object" && doc !== null && doc.ok === false);
-    if (failure3 !== undefined && exitCode !== 0) {
-      if (typeof failure3.code === "string")
-        outcome.code = failure3.code;
-      if (typeof failure3.message === "string")
-        outcome.reason = failure3.message;
+    const failure4 = [...results].reverse().find((doc) => typeof doc === "object" && doc !== null && doc.ok === false);
+    if (failure4 !== undefined && exitCode !== 0) {
+      if (typeof failure4.code === "string")
+        outcome.code = failure4.code;
+      if (typeof failure4.message === "string")
+        outcome.reason = failure4.message;
     }
   }
   if (thrown !== undefined)
@@ -110407,6 +111015,7 @@ init_solana_endpoint();
 init_errors2();
 init_evm_tee();
 init_evm_transfer();
+init_format();
 
 // src/vault/funding-receipts.ts
 init_errors2();
@@ -110591,6 +111200,8 @@ async function vaultFund(args, ctx) {
     if (parsed.values["--from"] !== undefined) {
       return usage(ctx, "--from applies to an external wallet only; a TEE wallet is funded from its pinned vault key.");
     }
+    if (isRetiredTee(teeEntry))
+      return refuseRetiredFund(ctx, teeAddress);
     const reconciled = await reconcileFundingReceipts(vault, [teeAddress, ...teeEntry.tee?.vaultDestination ? [teeEntry.tee.vaultDestination] : []], solana.rpc, ctx);
     if (reconciled !== null)
       return reconciled;
@@ -110712,6 +111323,8 @@ async function vaultFundEvm(ctx, parsed, teeAddress) {
       }, ctx.json);
       return 1;
     }
+    if (isRetiredTee(teeEntry))
+      return refuseRetiredFund(ctx, teeEntry.address);
     if (teeEntry.tee?.remoteAuthority !== "verified-active" || teeEntry.tee.stopRequestedAt !== undefined) {
       writeLocalFailure(ctx.deps, {
         code: "TEE_WALLET_NOT_VERIFIED",
@@ -110745,6 +111358,14 @@ async function vaultFundEvm(ctx, parsed, teeAddress) {
       writeJson: (value) => writeJson(ctx.deps, { ...value, tee: teeEntry.address })
     }, client2.rpc);
   });
+}
+function refuseRetiredFund(ctx, address) {
+  writeLocalFailure(ctx.deps, {
+    code: "TEE_WALLET_STOPPED",
+    message: `${address} is a retired TEE wallet; a retired address is never refunded.`,
+    suggestion: "Nothing was signed. Create a new wallet to fund: candle tee new"
+  }, ctx.json);
+  return 1;
 }
 
 // src/commands/vault-import-legacy.ts
@@ -110957,14 +111578,14 @@ async function vaultImportLegacy(args, ctx) {
     const digest = sourceDigest(vault.file.vaultId, new TextEncoder().encode(legacyRaw));
     const already = new Set(vault.index.entries.map((entry) => entry.address));
     const toMigrate = legacyEntries.filter((entry) => !already.has(entry.address));
-    const skipped = legacyEntries.length - toMigrate.length;
+    const skipped2 = legacyEntries.length - toMigrate.length;
     if (toMigrate.length === 0) {
       await recordMigrationSidecar(vaultPath, vault, fromPath, digest, deps.now());
       return reportDone(ctx, {
         path: fromPath,
         vaultPath,
         migrated: 0,
-        skipped,
+        skipped: skipped2,
         addresses: [],
         digest,
         idempotent: true
@@ -111004,7 +111625,7 @@ async function vaultImportLegacy(args, ctx) {
       path: fromPath,
       vaultPath,
       migrated: newEntries.length,
-      skipped,
+      skipped: skipped2,
       addresses: newEntries.map((entry) => ({
         address: entry.address,
         lifecycle: entry.tee?.lifecycle ?? "local-candidate",
@@ -111136,7 +111757,7 @@ async function readLamports(addresses, solana, ctx) {
   const { rpc } = solana;
   const lamports = new Map;
   const unavailable6 = [];
-  let failure3;
+  let failure4;
   let rateLimited = false;
   for (let at3 = 0;at3 < addresses.length; at3 += CHUNK2) {
     const chunk = addresses.slice(at3, at3 + CHUNK2);
@@ -111152,12 +111773,12 @@ async function readLamports(addresses, solana, ctx) {
       unavailable6.push(...chunk);
       if (isRateLimited(error)) {
         rateLimited = true;
-        failure3 ??= rateLimitedReadFailure(ctx, error);
+        failure4 ??= rateLimitedReadFailure(ctx, error);
       } else
-        failure3 ??= describeRpcFailure(error);
+        failure4 ??= describeRpcFailure(error);
     }
   }
-  return { lamports, unavailable: unavailable6, ...failure3 === undefined ? {} : { failure: failure3 } };
+  return { lamports, unavailable: unavailable6, ...failure4 === undefined ? {} : { failure: failure4 } };
 }
 async function readEvmBalances(addresses, rpcUrl, fetchFn) {
   const rpc = createEvmRpc(rpcUrl, fetchFn);
@@ -111256,17 +111877,17 @@ async function vaultList(args, ctx) {
     }
     let lamports = new Map;
     let unavailable6 = [];
-    let failure3;
+    let failure4;
     if (balances && solana.length > 0 && solanaClient !== undefined) {
       const outcome = await readLamports(solana.map((entry) => entry.address), solanaClient, ctx);
       lamports = outcome.lamports;
       unavailable6 = outcome.unavailable;
-      failure3 = outcome.failure;
+      failure4 = outcome.failure;
     }
     const solanaComplete = unavailable6.length === 0;
     const totalLamports = [...lamports.values()].reduce((sum, value) => sum + value, 0n);
     if (!solanaComplete) {
-      notice(deps, "stderr", "warning", `${unavailable6.length} ${unavailable6.length === 1 ? "address" : "addresses"} could not be read: ${failure3 ?? "the RPC did not answer"}. Narrow with a filter, or use your own endpoint with --rpc-url.
+      notice(deps, "stderr", "warning", `${unavailable6.length} ${unavailable6.length === 1 ? "address" : "addresses"} could not be read: ${failure4 ?? "the RPC did not answer"}. Narrow with a filter, or use your own endpoint with --rpc-url.
 `.trim());
     }
     const evm = balances ? matched.filter((entry) => entry.chain === "evm") : [];
@@ -111498,8 +112119,8 @@ function unreadableRoomLine(reason) {
 `;
 }
 var RESTORED_SENTENCE = "The vault entry is back as it was: nothing left this machine.";
-function restoresPreImportEntry(failure3) {
-  return failure3.stage === "init" && failure3.status !== undefined && failure3.status !== 0;
+function restoresPreImportEntry(failure4) {
+  return failure4.stage === "init" && failure4.status !== undefined && failure4.status !== 0;
 }
 function restoreRefusedFailure(init, error) {
   if (error instanceof VaultError && error.code === "VAULT_CHANGED") {
@@ -111777,7 +112398,7 @@ async function promoteEvmInPlace(input, subjectLabel, sweepTo) {
   });
   const code = imported.exit;
   if (imported.failure !== undefined) {
-    let failure3 = {
+    let failure4 = {
       code: imported.failure.code,
       message: imported.failure.message,
       ...imported.failure.suggestion !== undefined ? { suggestion: imported.failure.suggestion } : {}
@@ -111785,12 +112406,12 @@ async function promoteEvmInPlace(input, subjectLabel, sweepTo) {
     if (restoresPreImportEntry(imported.failure)) {
       try {
         vault = hold(await commitVault(vault, { index: preImportIndex }, ctx.deps));
-        failure3 = { ...failure3, message: `${failure3.message} ${RESTORED_SENTENCE}` };
+        failure4 = { ...failure4, message: `${failure4.message} ${RESTORED_SENTENCE}` };
       } catch (error) {
-        failure3 = restoreRefusedFailure(failure3, error);
+        failure4 = restoreRefusedFailure(failure4, error);
       }
     }
-    writeLocalFailure(ctx.deps, failure3, ctx.json);
+    writeLocalFailure(ctx.deps, failure4, ctx.json);
     return code;
   }
   let rebound;
@@ -112236,7 +112857,7 @@ async function promoteInPlace(ctx, parsed, subjectLabel, toKey) {
     });
     const code = imported.exit;
     if (imported.failure !== undefined) {
-      let failure3 = {
+      let failure4 = {
         code: imported.failure.code,
         message: imported.failure.message,
         ...imported.failure.suggestion !== undefined ? { suggestion: imported.failure.suggestion } : {}
@@ -112244,12 +112865,12 @@ async function promoteInPlace(ctx, parsed, subjectLabel, toKey) {
       if (restoresPreImportEntry(imported.failure)) {
         try {
           vault = hold(await commitVault(vault, { index: preImportIndex }, ctx.deps));
-          failure3 = { ...failure3, message: `${failure3.message} ${RESTORED_SENTENCE}` };
+          failure4 = { ...failure4, message: `${failure4.message} ${RESTORED_SENTENCE}` };
         } catch (error) {
-          failure3 = restoreRefusedFailure(failure3, error);
+          failure4 = restoreRefusedFailure(failure4, error);
         }
       }
-      writeLocalFailure(ctx.deps, failure3, ctx.json);
+      writeLocalFailure(ctx.deps, failure4, ctx.json);
       return code;
     }
     let rebound;
@@ -112291,10 +112912,10 @@ async function promoteInPlace(ctx, parsed, subjectLabel, toKey) {
 async function resumePromote(ctx, vault, entry, reopen, path, hold, confirmations) {
   const announceGrant = confirmations.announceGrant ?? true;
   const report2 = confirmations.report ?? "write";
-  const fail4 = (failure3, exit) => {
+  const fail4 = (failure4, exit) => {
     if (report2 === "write")
-      writeLocalFailure(ctx.deps, failure3, ctx.json);
-    return { exit, ...report2 === "return" ? { failure: failure3 } : {} };
+      writeLocalFailure(ctx.deps, failure4, ctx.json);
+    return { exit, ...report2 === "return" ? { failure: failure4 } : {} };
   };
   const apiKey = await resolveApiKey(ctx.deps, ctx.profile);
   if (!apiKey) {
@@ -112440,10 +113061,10 @@ async function runTeeImport(ctx, opts) {
   const closeReopened = opts.closeReopened ?? true;
   const apiKey = await resolveApiKey(ctx.deps, ctx.profile);
   if (!apiKey) {
-    const failure3 = { code: "NO_API_KEY", message: "No API key available.", suggestion: "Run: candle keys create" };
+    const failure4 = { code: "NO_API_KEY", message: "No API key available.", suggestion: "Run: candle keys create" };
     if (report2 === "write")
-      writeLocalFailure(ctx.deps, failure3, ctx.json);
-    return { exit: 1, ...report2 === "return" ? { failure: failure3 } : {} };
+      writeLocalFailure(ctx.deps, failure4, ctx.json);
+    return { exit: 1, ...report2 === "return" ? { failure: failure4 } : {} };
   }
   opts.onImport?.();
   const flow = await runImportFlow({
@@ -112459,28 +113080,28 @@ async function runTeeImport(ctx, opts) {
     ...opts.keySigner !== undefined ? { keySigner: opts.keySigner } : {}
   });
   if (!flow.ok) {
-    const failure3 = flow.failure;
-    if (failure3.kind === "api") {
+    const failure4 = flow.failure;
+    if (failure4.kind === "api") {
       const render2 = { apiUrl: ctx.apiUrl, authType: "key" };
       if (report2 === "write") {
-        writeFailure(ctx.deps, failure3.response, render2, ctx.json);
+        writeFailure(ctx.deps, failure4.response, render2, ctx.json);
         return { exit: 1 };
       }
-      const suggestion = suggestionFor(failure3.response, render2);
+      const suggestion = suggestionFor(failure4.response, render2);
       return {
         exit: 1,
         failure: {
-          code: errorEnvelope(failure3.response, render2).code,
-          message: renderError(failure3.response, render2),
+          code: errorEnvelope(failure4.response, render2).code,
+          message: renderError(failure4.response, render2),
           ...suggestion ? { suggestion } : {},
-          stage: failure3.stage,
-          status: failure3.response.status
+          stage: failure4.stage,
+          status: failure4.response.status
         }
       };
     }
     const local = {
-      code: failure3.kind === "signer-store" ? "SIGNER_STORE_FAILED" : "SIGNER_COMMIT_FAILED",
-      message: `${opts.address}: ${failure3.error instanceof Error ? failure3.error.message : String(failure3.error)}`,
+      code: failure4.kind === "signer-store" ? "SIGNER_STORE_FAILED" : "SIGNER_COMMIT_FAILED",
+      message: `${opts.address}: ${failure4.error instanceof Error ? failure4.error.message : String(failure4.error)}`,
       suggestion: "The vault entry is import-pending. Fix the error and re-run promote to resume."
     };
     if (report2 === "write")
@@ -112744,15 +113365,15 @@ async function preflightBatch(index, rows, opts) {
   const failures = [];
   const pinnedBy = new Map;
   const promotedBy = new Map;
-  const refuse3 = (row2, failure3) => {
+  const refuse3 = (row2, failure4) => {
     failures.push({
       line: row2.line,
       label: row2.label,
       destination: row2.destination,
-      code: failure3.code,
-      message: failure3.message,
-      ...failure3.suggestion !== undefined ? { suggestion: failure3.suggestion } : {},
-      ...failure3.why !== undefined ? { why: failure3.why } : {}
+      code: failure4.code,
+      message: failure4.message,
+      ...failure4.suggestion !== undefined ? { suggestion: failure4.suggestion } : {},
+      ...failure4.why !== undefined ? { why: failure4.why } : {}
     });
   };
   const refuseWith = (row2, error, why) => {
@@ -113195,8 +113816,8 @@ ${table}
         rateLimited: 0,
         elapsedMs: 0
       };
-      const skipped = planned.map((item) => skippedResult(item));
-      const rebindable = rebindPhase === undefined ? undefined : splitRebindable(skipped);
+      const skipped2 = planned.map((item) => skippedResult(item));
+      const rebindable = rebindPhase === undefined ? undefined : splitRebindable(skipped2);
       if (rebindPhase === undefined || rebindable === undefined || rebindable.wallets.length === 0) {
         deps.stderr.write(`
 ${table}
@@ -113206,7 +113827,7 @@ ${table}
         return finish(ctx, {
           file: pairsFile,
           rows: rows.length,
-          keys: skipped,
+          keys: skipped2,
           destinations: destinations2,
           exit: 0,
           controlledBy,
@@ -113227,11 +113848,11 @@ ${renderControlledBy(controlledBy, n)}
       if (typed.trim().toLowerCase() !== CONFIRM_WORD) {
         throw new VaultError("PROMOTE_NOT_ACKNOWLEDGED", `The acknowledgement is the word ${CONFIRM_WORD}; nothing was moved, and nothing was written.`, { suggestion: `Run the command again and type ${CONFIRM_WORD} at the prompt.` });
       }
-      const rebound2 = await runRebindPhase(ctx, rebindPhase, skipped);
+      const rebound2 = await runRebindPhase(ctx, rebindPhase, skipped2);
       return finish(ctx, {
         file: pairsFile,
         rows: rows.length,
-        keys: skipped,
+        keys: skipped2,
         destinations: destinations2,
         exit: 0,
         controlledBy,
@@ -113304,24 +113925,24 @@ ${renderControlledBy(controlledBy, acting.length)}
             keySigner: keySignerImport(rebindPhase?.toKey)
           });
           if (imported.failure !== undefined || imported.submitted === undefined) {
-            let failure3 = imported.failure ?? {
+            let failure4 = imported.failure ?? {
               code: "VAULT_WRITE_FAILED",
               message: "The import did not complete."
             };
-            if (restoresPreImportEntry(failure3)) {
+            if (restoresPreImportEntry(failure4)) {
               try {
                 current = hold(await commitVault(current, { index: preImportIndex }, deps));
-                failure3 = { ...failure3, message: `${failure3.message} ${RESTORED_SENTENCE}` };
+                failure4 = { ...failure4, message: `${failure4.message} ${RESTORED_SENTENCE}` };
               } catch (error) {
-                failure3 = restoreRefusedFailure(failure3, error);
+                failure4 = restoreRefusedFailure(failure4, error);
               }
             }
             stopped2 = {
               line: row3.line,
               exit: imported.exit,
-              code: failure3.code,
-              message: failure3.message,
-              ...failure3.suggestion !== undefined ? { suggestion: failure3.suggestion } : {}
+              code: failure4.code,
+              message: failure4.message,
+              ...failure4.suggestion !== undefined ? { suggestion: failure4.suggestion } : {}
             };
             break;
           }
@@ -113490,7 +114111,7 @@ async function verifySubjectSecret(vault, subject) {
 }
 async function reconcileForPreflight(ctx, row2, subject, resolved) {
   const { onDisk } = resolved;
-  const refuse3 = (failure3) => ({ ok: false, failure: failure3 });
+  const refuse3 = (failure4) => ({ ok: false, failure: failure4 });
   const apiKey = await resolveApiKey(ctx.deps, ctx.profile);
   if (!apiKey) {
     return refuse3({
@@ -113616,11 +114237,11 @@ function renderBatchTable(planned, opts) {
   return renderHumanTable(headers2, rows, opts.style ?? terminalStyle({ env: {}, isTTY: { stdin: false, stdout: false, stderr: false } }, "stderr"), headers2.map((_, i) => i === 0 || i === 1 || i === 3 || i === 4 || i === 5 ? { id: true } : i === 2 ? { priority: 2 } : { align: "right", priority: 1 }));
 }
 function renderFooter(opts) {
-  const skipped = opts.planned.filter((item) => item.kind === "skip").length;
+  const skipped2 = opts.planned.filter((item) => item.kind === "skip").length;
   const resumes = opts.planned.filter((item) => item.kind === "resume").length;
   const promotes = opts.planned.filter((item) => item.kind === "promote").length;
   const lines = [
-    `${opts.planned.length} rows from ${opts.file}: ${skipped} already promoted (skipped), ${resumes} to resume, ${promotes} to promote.`
+    `${opts.planned.length} rows from ${opts.file}: ${skipped2} already promoted (skipped), ${resumes} to resume, ${promotes} to promote.`
   ];
   if (opts.destinations.length > 0) {
     lines.push(`${opts.destinations.length} destination${opts.destinations.length === 1 ? "" : "s"}, in this order: ${opts.destinations.map((d) => `${destinationCell(d.label, d.address)} ${d.keys} key${d.keys === 1 ? "" : "s"}`).join(" · ")}`);
@@ -113670,7 +114291,7 @@ ${opts.landed} of ${opts.acting} rows landed and ARE in the vault; the vault is 
 function finish(ctx, opts) {
   const promoted = opts.keys.filter((r) => r.state === "promoted").length;
   const resumed = opts.keys.filter((r) => r.state === "resumed").length;
-  const skipped = opts.keys.filter((r) => r.state === "skipped").length;
+  const skipped2 = opts.keys.filter((r) => r.state === "skipped").length;
   const unverified = opts.keys.filter((r) => r.state !== "skipped" && r.remoteAuthority !== "verified-active");
   const rebindFailed = opts.rebound?.run !== undefined && !opts.rebound.run.ok;
   const exit = rebindFailed ? Math.max(opts.exit, 1) : opts.exit;
@@ -113683,7 +114304,7 @@ function finish(ctx, opts) {
       rows: opts.rows,
       promoted,
       resumed,
-      skipped,
+      skipped: skipped2,
       destinations: opts.destinations.map(({ label, address, keys }) => ({ label, address, keys })),
       keys: opts.rebound === undefined ? opts.keys : keysWithRebind(opts.keys, opts.rebound.phase, opts.rebound.run),
       controlledBy: controlledByJson(opts.controlledBy),
@@ -113695,7 +114316,7 @@ function finish(ctx, opts) {
   writeFields(ctx.deps, "stdout", [
     ["Promoted", promoted],
     ["Resumed", resumed],
-    ["Already promoted (skipped)", skipped],
+    ["Already promoted (skipped)", skipped2],
     ["Commit", "one unlock, each committed on its own"]
   ]);
   if (unverified.length > 0) {
@@ -114775,10 +115396,12 @@ function describeEnvelope(envelope, facts) {
 init_args();
 init_deps();
 init_evm_lite();
+init_render();
 init_solana_endpoint();
 init_errors2();
 init_evm_tee();
 init_evm_transfer();
+init_format();
 init_promote_support();
 init_store();
 init_vault_support();
@@ -114834,6 +115457,15 @@ async function vaultTransfer(args, ctx) {
       return usage(ctx, `No vault key or promoted wallet matches --from ${fromLabel}.`);
     }
     assertTransferSigner(fromEntry);
+    const retiredDestination = vault.index.entries.find((entry) => isRetiredTee(entry) && entry.address.toLowerCase() === to.toLowerCase());
+    if (retiredDestination !== undefined) {
+      writeLocalFailure(ctx.deps, {
+        code: "TEE_WALLET_STOPPED",
+        message: `${to} is a retired TEE wallet (${retiredDestination.label}); a retired address is never refunded.`,
+        suggestion: "Nothing was signed. Send to a live wallet, or create one: candle tee new"
+      }, ctx.json);
+      return 1;
+    }
     if (fromEntry.chain === "evm") {
       const evmRpc = resolveEvmRpcUrl(rpcUrlFlag, ctx.deps.env[EVM_RPC_URL_ENV], "--rpc-url");
       if ("error" in evmRpc)
@@ -115266,8 +115898,8 @@ async function setAllowLaunch(args, ctx, enabled) {
   for (const message of new Set(notEnforced.map((item) => item.message))) {
     notice(deps, "stderr", "danger", `${message} (ALLOW_LAUNCH_NOT_ENFORCED)`);
   }
-  for (const failure3 of failed) {
-    notice(deps, "stderr", "danger", `Not changed: ${failure3.id}: ${failure3.message}${failure3.code ? ` (${failure3.code})` : ""}.`);
+  for (const failure4 of failed) {
+    notice(deps, "stderr", "danger", `Not changed: ${failure4.id}: ${failure4.message}${failure4.code ? ` (${failure4.code})` : ""}.`);
   }
   return failed.length > 0 || notEnforced.length > 0 ? 1 : 0;
 }
@@ -115525,7 +116157,7 @@ init_solana_alt();
 init_solana_lite();
 init_trading();
 init_swap();
-import { randomUUID as randomUUID16 } from "node:crypto";
+import { randomUUID as randomUUID17 } from "node:crypto";
 var USAGE21 = "Usage: candle wallet close-empty [--wallet embedded|<tee address|label>] [--keep <mint>]... [--client-trade-id <id>] [--preview] [--yes] [--json]";
 var BASE58_ADDRESS2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 var LISTED_ROWS = 50;
@@ -115813,7 +116445,7 @@ async function walletsCloseEmpty(args, ctx) {
     return 2;
   }
   const named = parsed.values["--client-trade-id"];
-  const id = named ?? `close-${randomUUID16()}`;
+  const id = named ?? `close-${randomUUID17()}`;
   if (parsed.positionals.length !== 0 || !validClientId(id) || !lifted.keep.every((m) => BASE58_ADDRESS2.test(m))) {
     writeUsageFailure(ctx.deps, USAGE21, ctx.json);
     return 2;
@@ -116091,11 +116723,11 @@ async function verifyProfileAccount(ctx, config) {
   const apiKey = await deps.store.get(profileSecretRef(profile, "apiKey"));
   if (!apiKey)
     return { ok: true, skipped: "no stored key" };
-  const { account: live, failure: failure3 } = await fetchAccount(deps, ctx.apiUrl, apiKey);
+  const { account: live, failure: failure4 } = await fetchAccount(deps, ctx.apiUrl, apiKey);
   if (!live) {
     return {
       ok: true,
-      warning: `Could not verify the account for ${profile} (${failure3}); proceeding on the cached value ${cached}.`
+      warning: `Could not verify the account for ${profile} (${failure4}); proceeding on the cached value ${cached}.`
     };
   }
   if (live !== cached) {
@@ -116128,6 +116760,7 @@ init_profiles();
 init_release();
 init_render();
 init_secret_store();
+init_trading_checks();
 
 // src/update-notice.ts
 init_client();
@@ -116375,6 +117008,7 @@ var COMMANDS = {
   tee: {
     subcommands: {
       new: teeNew,
+      check: teeCheck,
       enable: teeEnable,
       fund: teeFund,
       status: teeStatus,

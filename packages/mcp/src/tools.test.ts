@@ -38,7 +38,9 @@ test("all registered tools are listed", () => {
     "candle_get_profile_pnl",
     "candle_get_profile_trades",
     "candle_get_profile_wallets",
+    "candle_get_spendable_balances",
     "candle_get_staking",
+    "candle_get_trading_wallets",
     "candle_get_wallets",
     "candle_lab_edges",
     "candle_lab_replay",
@@ -73,6 +75,7 @@ test("all registered tools are listed", () => {
     "candle_perps_setup",
     "candle_perps_thresholds",
     "candle_perps_tpsl",
+    "candle_quote",
     "candle_report_activity",
     "candle_resolve_token",
     "candle_set_profile_wallets",
@@ -208,6 +211,43 @@ describe("buildRequest: creator fees (FE-438)", () => {
   })
 })
 
+describe("buildRequest: the wallets a key may pay from (BE-2650, R25)", () => {
+  const cfg = { apiUrl: "https://api.test", apiKey: "k" }
+
+  test("candle_get_trading_wallets reads the key's TEE wallets, with its cursor", () => {
+    const first = buildRequest("candle_get_trading_wallets", {}, cfg)
+    expect(first.url).toBe("https://api.test/api/v1/agent/wallets/trading")
+    expect(first.init.method).toBe("GET")
+    expect(new Headers(first.init.headers).get("x-api-key")).toBe("k")
+    expect(buildRequest("candle_get_trading_wallets", { cursor: "tk1:a/b" }, cfg).url).toBe(
+      "https://api.test/api/v1/agent/wallets/trading?cursor=tk1%3Aa%2Fb",
+    )
+  })
+
+  test("candle_get_spendable_balances reads self balances, mints as one comma list", () => {
+    const first = buildRequest("candle_get_spendable_balances", {}, cfg)
+    expect(first.url).toBe("https://api.test/api/v1/agent/wallets/self/balances")
+    expect(first.init.method).toBe("GET")
+    const r = buildRequest(
+      "candle_get_spendable_balances",
+      { cursor: "50", mints: ["M1nt", "0xAbC0000000000000000000000000000000000001"] },
+      cfg,
+    )
+    expect(r.url).toBe(
+      "https://api.test/api/v1/agent/wallets/self/balances?cursor=50&mints=M1nt%2C0xAbC0000000000000000000000000000000000001",
+    )
+    expect(new URL(r.url).searchParams.get("mints")).toBe("M1nt,0xAbC0000000000000000000000000000000000001")
+    expect(buildRequest("candle_get_spendable_balances", { mints: [] }, cfg).url).toBe(
+      "https://api.test/api/v1/agent/wallets/self/balances",
+    )
+  })
+
+  test("both need a key", () => {
+    expect(() => buildRequest("candle_get_trading_wallets", {}, { apiUrl: "https://api.test" })).toThrow()
+    expect(() => buildRequest("candle_get_spendable_balances", {}, { apiUrl: "https://api.test" })).toThrow()
+  })
+})
+
 describe("buildRequest: vamp candidates (BE-1504)", () => {
   const cfg = { apiUrl: "https://api.test/", apiKey: "k" }
 
@@ -327,6 +367,32 @@ describe("buildRequest", () => {
   test("swap without a key throws before any request is built", () => {
     expect(() =>
       buildRequest("candle_swap", { from: "SOL", to: "USDC", amountRaw: "1" }, { apiUrl: "https://api.test" }),
+    ).toThrow(/CANDLE_AGENT_API_KEY/)
+  })
+  test("candle_quote is a keyed POST to the trade quote route and forwards only what was set", () => {
+    const r = buildRequest(
+      "candle_quote",
+      { chain: "solana", mint: "M1", side: "buy", amountRaw: "1000" },
+      { apiUrl: "https://api.test", apiKey: "cndl_live_k" },
+    )
+    expect(r.url).toBe("https://api.test/api/v1/trade/agent/quote")
+    expect(r.init.method).toBe("POST")
+    expect((r.init.headers as Record<string, string>)["x-api-key"]).toBe("cndl_live_k")
+    expect(JSON.parse(r.init.body as string)).toEqual({ chain: "solana", mint: "M1", side: "buy", amountRaw: "1000" })
+    const hood = buildRequest(
+      "candle_quote",
+      { chain: "hood", mint: "0xA", side: "sell", amountRaw: "5", quoteAsset: "usdg", includeRoundTrip: true },
+      { apiUrl: "https://api.test", apiKey: "cndl_live_k" },
+    )
+    expect(JSON.parse(hood.init.body as string)).toMatchObject({ quoteAsset: "usdg", includeRoundTrip: true })
+  })
+  test("candle_quote needs a key", () => {
+    expect(() =>
+      buildRequest(
+        "candle_quote",
+        { chain: "solana", mint: "M1", side: "buy", amountRaw: "1" },
+        { apiUrl: "https://api.test" },
+      ),
     ).toThrow(/CANDLE_AGENT_API_KEY/)
   })
   test("get_market is an unauthenticated GET", () => {
@@ -620,6 +686,13 @@ describe("tool descriptions carry the rules an agent needs at call time", () => 
     expect(d).not.toMatch(/risk|original|fake|hacc|pump\.fun|helius|alchemy/i)
   })
 
+  test("candle_quote says it needs swap:write and that a read-only key cannot quote", () => {
+    const d = describeOf("candle_quote")
+    expect(d).toContain("swap:write")
+    expect(d).toContain("read-only key")
+    expect(d).toContain("route is present only on some answers")
+  })
+
   test("get_market explains routing, provenance and the general quote endpoint", () => {
     const d = describeOf("candle_get_market")
     expect(d).toContain("error.discovery")
@@ -741,7 +814,7 @@ describe("tool descriptions carry the rules an agent needs at call time", () => 
 })
 
 /** Registers the named tools on a recorder and returns their handlers and schemas, wired to `doFetch`. */
-function toolsWith(names: readonly ToolName[], doFetch: FetchLike) {
+function toolsWith(names: readonly ToolName[], doFetch: FetchLike, extra: { embeddedExecutionStatus?: boolean } = {}) {
   type Result = { content: { type: string; text: string }[]; isError?: boolean }
   const tools = new Map<
     string,
@@ -763,6 +836,7 @@ function toolsWith(names: readonly ToolName[], doFetch: FetchLike) {
     tools: names,
     getConfig: () => ({ apiUrl: "https://api.test", apiKey: "cndl_live_k" }),
     fetch: doFetch,
+    ...extra,
   })
   const call = async (name: ToolName, args: Record<string, unknown>) => {
     const tool = tools.get(name)
@@ -774,6 +848,54 @@ function toolsWith(names: readonly ToolName[], doFetch: FetchLike) {
 }
 
 const answer = (status: number, text: string) => ({ ok: status < 400, status, text: async () => text })
+
+// BE-2650: the TEE read rides the local server only; the hosted server opts out.
+describe("candle_execution_status: the TEE wallet read", () => {
+  const routes: Record<string, unknown> = {
+    "/api/v1/agent/wallets/embedded": { success: true, wallets: { solana: null, evm: null } },
+    "/api/v1/agent/wallets/trading": { success: true, paused: false, page: [], isDone: true },
+    "/api/v1/agent/tier": { success: true, tier: "max" },
+    "/api/v1/agent/keys/self/limits": { success: true },
+    "/api/v1/agent/keys/self/risk": { success: true, stopped: false },
+  }
+  const fetchFor =
+    (urls: string[]): FetchLike =>
+    async (url) => {
+      urls.push(url)
+      return answer(200, JSON.stringify(routes[new URL(url).pathname]))
+    }
+
+  test("a local registration reads the key's TEE wallets", async () => {
+    const urls: string[] = []
+    const { call } = toolsWith(["candle_execution_status"], fetchFor(urls))
+    const body = JSON.parse((await call("candle_execution_status", {})).text)
+    expect(urls).toContain("https://api.test/api/v1/agent/wallets/trading")
+    expect(body.tee).toEqual([])
+  })
+
+  test("embeddedExecutionStatus (the hosted server) never asks for them", async () => {
+    const urls: string[] = []
+    const { call } = toolsWith(["candle_execution_status"], fetchFor(urls), { embeddedExecutionStatus: true })
+    const body = JSON.parse((await call("candle_execution_status", {})).text)
+    expect(urls).toHaveLength(4)
+    expect(urls.some((url) => url.includes("/wallets/trading"))).toBe(false)
+    expect(body.ready).toBe(true)
+  })
+
+  test("the two new reads relay the API body as it came back, errors included", async () => {
+    const page = { success: true, keyPrefix: "kp", scopes: [], paused: false, page: [], isDone: true }
+    const refused = { success: false, error: { code: "VALIDATION_FAILED", message: "cursor must be ..." } }
+    const { call } = toolsWith(["candle_get_trading_wallets", "candle_get_spendable_balances"], async (url) =>
+      url.includes("/self/balances") ? answer(400, JSON.stringify(refused)) : answer(200, JSON.stringify(page)),
+    )
+    const trading = await call("candle_get_trading_wallets", {})
+    expect(trading.result.isError).toBeUndefined()
+    expect(JSON.parse(trading.text)).toEqual(page)
+    const balances = await call("candle_get_spendable_balances", { cursor: "x" })
+    expect(balances.result.isError).toBe(true)
+    expect(JSON.parse(balances.text)).toEqual(refused)
+  })
+})
 
 // BE-1411 T5 (R3): the result carries the guidance, so a client that never read the description
 // still gets it.
