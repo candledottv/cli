@@ -50,6 +50,7 @@ import { randomUUID } from "node:crypto"
 import type { McpServer, RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js"
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js"
 import { z } from "zod"
+import { chainSchema } from "./chain-registry"
 import { keyedRedirectGuard, type RequestConfig, resolveConfig } from "./client"
 import { CLUSTER_READ_DESCRIPTION, readTokenClusters, tokenClustersShape } from "./cluster-read"
 import { decimalToRaw, QUOTE_DECIMALS } from "./convert"
@@ -985,6 +986,24 @@ async function getOperation(args: Record<string, unknown>, cfg: RequestConfig, d
 }
 
 /**
+ * BE-3072: when the API answers with recovery evidence that says to read status (an uncertain or
+ * unrecorded leg), the result gains a top-level `next` saying so in words, so a client that never
+ * read the description reads the job instead of invoking the tool again. Every other field is
+ * untouched, the evidence stays machine-readable, and the result stays an error.
+ */
+export function recoveryNext(body: Record<string, unknown>, clientId: string, kind: OperationKind): string | null {
+  const error = (typeof body.error === "object" && body.error !== null ? body.error : {}) as Record<string, unknown>
+  const pick = (key: string) => (error[key] !== undefined ? error[key] : body[key])
+  if (pick("safeAction") !== "read_status" && pick("recoveryRequired") !== true) return null
+  const poll = typeof pick("pollAfterMs") === "number" ? ` Wait about ${pick("pollAfterMs")} ms between reads.` : ""
+  return (
+    "A transaction for this operation may have been broadcast and its receipt is not confirmed or not yet " +
+    `recorded. Do not call this tool again and do not use a new id. Read candle_get_operation with clientId ` +
+    `"${clientId}" and kind "${kind}" instead.${poll}`
+  )
+}
+
+/**
  * candle_swap. The swap always has an id: a caller's own is used unchanged, and one is generated
  * when it is absent or empty, before the request is built. Without one a swap that fails in
  * transit can neither be replayed nor read back with candle_get_operation's kind "swap".
@@ -1014,19 +1033,23 @@ async function swap(args: Record<string, unknown>, cfg: RequestConfig, doFetch: 
     const failed = transportError("clientSwapId", clientSwapId, thrown)
     return { content: [{ type: "text" as const, text: failed.text }], isError: true }
   }
+  const answered = body as Record<string, unknown>
+  const next = ok ? null : recoveryNext(answered, clientSwapId, "swap")
   return {
-    content: [{ type: "text" as const, text: JSON.stringify({ clientSwapId, ...(body as Record<string, unknown>) }) }],
+    content: [
+      { type: "text" as const, text: JSON.stringify({ clientSwapId, ...answered, ...(next ? { next } : {}) }) },
+    ],
     ...(ok ? {} : { isError: true }),
   }
 }
 
 const getMarketShape = {
-  chain: z.string().describe('"solana" or "hood"'),
+  chain: chainSchema(),
   mint: z.string().describe("Token mint (solana) or contract address (hood)"),
 }
 
 const quoteShape = {
-  chain: z.enum(["solana", "hood"]),
+  chain: chainSchema(),
   mint: z.string().describe("Token mint (solana) or contract address (hood)"),
   side: z.enum(["buy", "sell"]),
   amountRaw: z.string().describe("Positive integer in base units: the quote asset's for a buy, the token's for a sell"),
@@ -1080,7 +1103,7 @@ const TOKEN_EVENTS_KIND_NOTE =
   "kept back from the request and applied to the returned page by this server, so a filtered page can be shorter than limit while older events of other kinds remain: page with nextCursor as before until it is null"
 
 const tokenCardShape = {
-  chain: z.string().describe('"solana" or "hood"'),
+  chain: chainSchema(),
   mint: z.string().describe("Token mint (solana) or contract address (hood)"),
   tag: z
     .string()
@@ -1091,7 +1114,7 @@ const tokenCardShape = {
 }
 
 const tokenEventsShape = {
-  chain: z.string().describe('"solana" or "hood"'),
+  chain: chainSchema(),
   mint: z.string().describe("Token mint (solana) or contract address (hood)"),
   kind: z.enum(["trade", "signal", "callout"]).optional().describe(`Only this kind; ${TOKEN_EVENTS_KIND_NOTE}`),
   since: z
@@ -1103,7 +1126,7 @@ const tokenEventsShape = {
 }
 
 const tokenForensicsShape = {
-  chain: z.string().describe('"solana" or "hood"'),
+  chain: chainSchema(),
   mint: z.string().describe("Token mint (solana) or contract address (hood)"),
 }
 
@@ -1162,7 +1185,7 @@ const getFeedShape = {
 // The activity report body is a passthrough: the API is the authoritative validator, and its
 // shape already varies by chain (solana signature vs hood signature). See apps/api/src/routes/activity.ts.
 const reportActivityShape = {
-  chain: z.string().describe('"solana" or "hood"'),
+  chain: chainSchema(),
   signature: z.string().describe("Transaction signature/hash to verify and record"),
 }
 
@@ -1197,7 +1220,7 @@ const createPostShape = {
     .describe("1 to 500 characters. Line breaks are kept; any other control character and bidi characters are refused"),
   token: z
     .object({
-      chain: z.enum(["solana", "hood"]),
+      chain: chainSchema(),
       mint: z.string().describe("The token's mint (Solana) or contract address (Hood)"),
     })
     .strict()
@@ -1510,7 +1533,7 @@ const IMAGE_PATH_DISCLOSURE =
   "a wide banner goes in bannerPath, which is not cropped."
 
 const transferShape = {
-  chain: z.enum(["solana", "hood"]).describe("Which chain the transfer executes on"),
+  chain: chainSchema("Which chain the transfer executes on"),
   asset: z
     .enum(["SOL", "USDC", "CNDL", "ETH", "USDG"])
     .optional()
@@ -1535,7 +1558,7 @@ const transferShape = {
 }
 
 const sweepShape = {
-  chain: z.enum(["solana", "hood"]).describe("Which chain to sweep"),
+  chain: chainSchema("Which chain to sweep"),
   to: z.string().describe("Destination address, same rules as candle_transfer's `to`"),
   mints: z
     .array(z.string())
