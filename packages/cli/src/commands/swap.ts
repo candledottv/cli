@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto"
 import { z } from "zod"
+import {
+  readSwapReceipt,
+  SWAP_RECEIPT_MAX_HASH_CHARS,
+  type SwapReceiptResponse,
+  type SwapReceiptTarget,
+} from "../../../mcp/src/swap-receipt"
+import { operationNotFoundNext } from "../../../mcp/src/tools"
 import { parseArgs } from "../args"
 import {
   BRIDGE_ASSETS,
@@ -15,6 +22,7 @@ import {
   relayHoodLegProblem,
   relaySolanaDepositProblem,
 } from "../bridge"
+import { apiRequest } from "../client"
 import type { CommandContext } from "../deps"
 import {
   createEvmRpc,
@@ -252,7 +260,12 @@ export function printTradingResult(ctx: CommandContext, result: Json): number {
   }
   const printed = ctx.json && (result.kind === "swap" || result.kind === "trade") ? swapJsonResult(result) : result
   ctx.deps.stdout.write(ctx.json ? `${JSON.stringify(printed)}\n` : `${JSON.stringify(result, null, 2)}\n`)
-  return 0
+  const job = result.job as Json | undefined
+  const operation = job?.operation as Json | undefined
+  return (operation?.guard as Json | undefined)?.recoveryRequired === true ||
+    (operation?.recovery as Json | undefined)?.recoveryRequired === true
+    ? 3
+    : 0
 }
 
 /**
@@ -348,7 +361,14 @@ export async function lookupOperation(
   return found[0] ? { ...found[0], ...(local?.signature ? { signature: local.signature } : {}) } : null
 }
 export async function swapStatus(args: string[], ctx: CommandContext): Promise<number> {
-  const parsed = parseArgs(args, { valueFlags: ["--kind"], booleanFlags: ["--wait"] })
+  const parsed = parseArgs(args, { valueFlags: ["--kind", "--operation"], booleanFlags: ["--wait"] })
+  if (!("error" in parsed) && parsed.values["--operation"] !== undefined) {
+    if (parsed.positionals.length || parsed.values["--kind"] || parsed.booleans.has("--wait")) {
+      writeUsageFailure(ctx.deps, "Usage: candle swap status --operation <operationId>", ctx.json)
+      return 2
+    }
+    return hoodOperationRead(ctx, parsed.values["--operation"])
+  }
   if (
     "error" in parsed ||
     parsed.positionals.length !== 1 ||
@@ -369,7 +389,7 @@ export async function swapStatus(args: string[], ctx: CommandContext): Promise<n
         "JOB_NOT_FOUND",
         `No operation ${id} is visible to key ${apiKeyPrefix(key) ?? "this key"} on the ${kind ?? "trade, swap, launch"} rail(s). Nothing was resent.`,
         {
-          suggestion: `Trade and launch jobs are readable by any key on this account; swap jobs only by the key that placed them. If another key or profile placed it, run: candle swap status ${id} --profile <that profile>`,
+          suggestion: `${/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(id) ? `If this is an operationId, read: candle swap status --operation ${id}. ` : ""}Trade and launch jobs are readable by any key on this account; swap jobs only by the key that placed them. If another key or profile placed it, run: candle swap status ${id} --profile <that profile>`,
         },
       )
     const result = parsed.booleans.has("--wait")
@@ -379,6 +399,124 @@ export async function swapStatus(args: string[], ctx: CommandContext): Promise<n
   } catch (error) {
     return tradingFailure(ctx, error)
   }
+}
+
+// ── BE-3140 (R97): candle swap receipt ───────────────────────────────────────────────────────
+
+const SWAP_RECEIPT_USAGE = "Usage: candle swap receipt <hash> | candle swap receipt --client-swap-id <id>"
+
+/** What `bridgeStatus` adds to a human `Settlement:` line. */
+const BRIDGE_STATUS_WORDS: Record<string, string> = {
+  refund: "refunded",
+  // Relay's `/intents/status` returns `fallback` for a refund, so it reads as one.
+  fallback: "refunded, Relay fallback",
+  failure: "Relay failure",
+}
+
+/**
+ * `candle swap receipt <hash>` / `--client-swap-id <id>` (BE-3140, spec 4.4): re-reads a one-shot
+ * swap's settlement, one made through MCP or the SDK with this key, remeasured now. The same reads,
+ * order and skip rule as `candle_get_swap_receipt` (packages/mcp/src/swap-receipt.ts), GET only.
+ * The CLI's own swaps run on build/submit and are re-read by `candle swap status` (spec D3).
+ *
+ * Exit 0 when a settlement or a `receipt` answer was read, whatever its state; 1 on an API error,
+ * `RECEIPT_NOT_FOUND` included; 2 on usage. No `--wait`: each call is one measurement.
+ */
+export async function swapReceipt(args: string[], ctx: CommandContext): Promise<number> {
+  const parsed = parseArgs(args, { valueFlags: ["--client-swap-id"] })
+  let target: SwapReceiptTarget | undefined
+  if (!("error" in parsed)) {
+    const id = parsed.values["--client-swap-id"]
+    const [hash, ...extra] = parsed.positionals
+    if (
+      extra.length === 0 &&
+      id === undefined &&
+      hash !== undefined &&
+      hash.length > 0 &&
+      hash.length <= SWAP_RECEIPT_MAX_HASH_CHARS
+    )
+      target = { hash }
+    else if (extra.length === 0 && hash === undefined && id !== undefined && validClientId(id))
+      target = { clientSwapId: id }
+  }
+  if (!target) {
+    writeUsageFailure(ctx.deps, SWAP_RECEIPT_USAGE, ctx.json)
+    return 2
+  }
+  try {
+    const key = await tradingKey(ctx)
+    const get = async (path: string): Promise<SwapReceiptResponse> => {
+      const res = await apiRequest(path, {
+        apiUrl: ctx.apiUrl,
+        credentials: { apiKey: key },
+        auth: "key",
+        method: "GET",
+        fetch: ctx.deps.fetch,
+        env: ctx.deps.env,
+      })
+      if (res.ok) return { ok: true, status: res.status, text: JSON.stringify(res.body) }
+      // The API's own envelope when it sent one; otherwise the client's reading of the failure.
+      const raw = res.raw !== null && typeof res.raw === "object" ? res.raw : undefined
+      const text = JSON.stringify(
+        raw ?? { success: false, error: { code: res.code ?? "REQUEST_FAILED", message: res.message } },
+      )
+      return { ok: false, status: res.status, text }
+    }
+    const answer = await readSwapReceipt(target, get, operationNotFoundNext)
+    const body = answer.body ?? {}
+    if (answer.isError) {
+      const error = (body.error !== null && typeof body.error === "object" ? body.error : {}) as Json
+      const details: Json = {}
+      for (const field of ["clientSwapId", "outcome", "hashes", "receipt"]) {
+        if (body[field] !== undefined) details[field] = body[field]
+      }
+      writeLocalFailure(
+        ctx.deps,
+        {
+          code: typeof error.code === "string" ? error.code : "REQUEST_FAILED",
+          message: typeof error.message === "string" ? error.message : "The receipt read failed.",
+          ...(typeof body.next === "string" ? { suggestion: body.next } : {}),
+          ...(Object.keys(details).length ? { details } : {}),
+        },
+        ctx.json,
+      )
+      return 1
+    }
+    describeReceipt(ctx, body, answer.job)
+    ctx.deps.stdout.write(ctx.json ? `${JSON.stringify(body)}\n` : `${JSON.stringify(body, null, 2)}\n`)
+    return 0
+  } catch (error) {
+    return tradingFailure(ctx, error)
+  }
+}
+
+/** The human line on stderr: what arrived, the state, or the `next` when nothing was measured. */
+function describeReceipt(ctx: CommandContext, body: Json, job: Json | undefined): void {
+  const settlement = body.settlement
+  if (settlement === null || typeof settlement !== "object") {
+    if (typeof body.next === "string") ctx.deps.stderr.write(`${body.next}\n`)
+    return
+  }
+  const { state, settledOutRaw, bridgeStatus } = settlement as Json
+  if (state === "settled" && typeof settledOutRaw === "string" && /^\d+$/.test(settledOutRaw)) {
+    // The hash form's settlement names no out asset, so it never prints a guessed decimal amount.
+    const asset = typeof job?.to === "string" ? job.to : undefined
+    const decimals =
+      typeof job?.outDecimals === "number"
+        ? job.outDecimals
+        : asset
+          ? (BASES[asset]?.decimals ?? HOOD_BASES[asset]?.decimals)
+          : undefined
+    ctx.deps.stderr.write(
+      asset && decimals !== undefined
+        ? `settled ${decimalAmount(settledOutRaw, decimals)} ${asset}\n`
+        : `settled ${settledOutRaw} (raw units)\n`,
+    )
+    return
+  }
+  const words = typeof bridgeStatus === "string" ? BRIDGE_STATUS_WORDS[bridgeStatus] : undefined
+  const shown = state === "settled" ? "settled, amount not measured" : String(state)
+  ctx.deps.stderr.write(`Settlement: ${shown}${words ? ` (${words})` : ""}\n`)
 }
 
 // ── Ember 4c: bridge status and --wait (4c-ED-9, R1) ─────────────────────────────────────────
@@ -1463,4 +1601,49 @@ async function bridgeSwap(
     )
     return printTradingResult(ctx, { ...receipt, waited: { final: false, error: reason } })
   }
+}
+
+/** Explicit operation-id mode never probes a rail client id or reaches a signer. */
+async function hoodOperationRead(
+  ctx: CommandContext,
+  id: string,
+  candidateHash?: string,
+  recover = false,
+): Promise<number> {
+  if (!validClientId(id)) {
+    writeUsageFailure(ctx.deps, "An operationId is required", ctx.json)
+    return 2
+  }
+  try {
+    const key = await tradingKey(ctx)
+    const path = `/api/v1/agent/hood-tee/operations/${encodeURIComponent(id)}${recover ? "/recover" : ""}`
+    const result = await request(ctx, key, path, recover ? (candidateHash ? { candidateHash } : {}) : undefined)
+    const operation = result.operation as Json | undefined
+    const guard = operation?.guard as Json | undefined
+    ctx.deps.stdout.write(`${JSON.stringify(result, null, ctx.json ? undefined : 2)}\n`)
+    if (guard)
+      ctx.deps.stderr.write(
+        `${safeText(guard.reason)}: ${safeText(guard.clearingCondition)} Read: candle swap status --operation ${id}.\n`,
+      )
+    return guard?.recoveryRequired === true || (operation?.recovery as Json | undefined)?.recoveryRequired === true
+      ? 3
+      : 0
+  } catch (error) {
+    if (error instanceof TradingError && ["JOB_NOT_FOUND", "NOT_FOUND", "HTTP_404"].includes(error.code))
+      ctx.deps.stderr.write("Operation lookup unavailable on this server; read the job by its client id.\n")
+    return tradingFailure(ctx, error)
+  }
+}
+export async function swapRecover(args: string[], ctx: CommandContext): Promise<number> {
+  const parsed = parseArgs(args, { valueFlags: ["--operation", "--hash"] })
+  if (
+    "error" in parsed ||
+    parsed.positionals.length ||
+    !parsed.values["--operation"] ||
+    (parsed.values["--hash"] !== undefined && !/^0x[0-9a-fA-F]{64}$/.test(parsed.values["--hash"]))
+  ) {
+    writeUsageFailure(ctx.deps, "Usage: candle swap recover --operation <operationId> [--hash <0x…>]", ctx.json)
+    return 2
+  }
+  return hoodOperationRead(ctx, parsed.values["--operation"], parsed.values["--hash"], true)
 }

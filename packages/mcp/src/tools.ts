@@ -9,7 +9,9 @@
  * verbatim -- this package never reinterprets an error body, it relays exactly what the endpoint
  * sent. Two tools ADD top-level fields to that body and change none of its own: `candle_swap`
  * adds the `clientSwapId` it sent, and `candle_get_operation` adds `outcome` and `next` to a 404
- * `JOB_NOT_FOUND` (see `swap` and `getOperation` below). One tool narrows the body's own list:
+ * `JOB_NOT_FOUND` (see `swap` and `getOperation` below), and `candle_get_swap_receipt` adds `next`
+ * to a hash read's 404 `RECEIPT_NOT_FOUND` and builds its own object for the clientSwapId form
+ * (swap-receipt.ts). One tool narrows the body's own list:
  * `candle_token_events`, called with `kind`, filters the relayed `events` to that kind and adds
  * `filteredByKind`, because the route has no kind parameter (see `tokenEventsRelay` below). That
  * body is NOT one uniform shape
@@ -88,6 +90,13 @@ import {
 } from "./perps-markets"
 import { perpsRiskShapes, withPortfolioSection } from "./perps-risk"
 import { PLAN_CAPABILITY_NOTE, type PlanTable, planPromotionLine, planTableMarkdown } from "./plans"
+import {
+  readSwapReceipt,
+  SWAP_RECEIPT_MAX_HASH_CHARS,
+  swapReceiptFirstPath,
+  swapReceiptTarget,
+  swapReceiptTransportError,
+} from "./swap-receipt"
 import {
   TOKEN_EDIT_DESCRIPTION,
   TOKEN_HISTORY_DESCRIPTION,
@@ -211,6 +220,9 @@ export const TOOL_NAMES = [
   "candle_resolve_token",
   "candle_execution_status",
   "candle_get_operation",
+  // BE-3140 (R97): a one-shot candle_swap's settlement, remeasured now, by hash or clientSwapId.
+  "candle_get_swap_receipt",
+  "candle_recover_operation",
   // FE-438: the creator fees this account's launched tokens can pay, and the claim.
   "candle_get_fees",
   "candle_claim_fees",
@@ -533,9 +545,12 @@ export function buildRequest(name: RestToolName, args: Record<string, unknown>, 
 
     case "candle_token_forensics": {
       const { chain, mint } = args as { chain: string; mint: string }
+      // R96: a configured key is sent on Hood only, where it pays for hacc's EVM contract-safety
+      // read on that key's own research plan. Solana stays keyless, byte for byte.
       return {
         url: `${base}/api/v1/markets/${encodeURIComponent(chain)}/${encodeURIComponent(mint)}/forensics`,
-        init: { method: "GET", headers: jsonHeaders() },
+        // chain-lint-allowed: the key rides Hood forensics only; Solana stays keyless (R96 spec 9.4)
+        init: { method: "GET", headers: jsonHeaders(chain === "hood" ? cfg.apiKey : undefined) },
       }
     }
 
@@ -697,8 +712,31 @@ export function buildRequest(name: RestToolName, args: Record<string, unknown>, 
       }
     }
 
+    case "candle_recover_operation": {
+      const apiKey = requireApiKey(cfg)
+      const { operationId, candidateHash } = args as { operationId: string; candidateHash?: string }
+      if (!operationId) throw new Error("operationId is required")
+      return {
+        url: `${base}/api/v1/agent/hood-tee/operations/${encodeURIComponent(operationId)}/recover`,
+        init: {
+          method: "POST",
+          headers: jsonHeaders(apiKey),
+          body: JSON.stringify(candidateHash ? { candidateHash } : {}),
+        },
+      }
+    }
     case "candle_get_operation": {
       const apiKey = requireApiKey(cfg)
+      if (args.operationId !== undefined) {
+        if (args.clientId !== undefined || args.kind !== undefined || typeof args.operationId !== "string")
+          throw new Error("operationId is exclusive with clientId/kind")
+        return {
+          url: `${base}/api/v1/agent/hood-tee/operations/${encodeURIComponent(args.operationId)}`,
+          init: { method: "GET", headers: jsonHeaders(apiKey) },
+        }
+      }
+      if (typeof args.clientId !== "string" || !["trade", "swap", "launch"].includes(String(args.kind)))
+        throw new Error("Supply clientId and kind, or operationId")
       // Three rails, three ledgers, one tool. The path is chosen by `kind` rather than sniffed
       // from the id: clientTradeId, clientSwapId and clientLaunchId are all caller-chosen strings,
       // so there is nothing in an id to dispatch on, and guessing wrong returns a 404 for the
@@ -713,6 +751,14 @@ export function buildRequest(name: RestToolName, args: Record<string, unknown>, 
             ? `/api/v1/agent/swap/by-client-id/${id}`
             : `/api/v1/trade/agent/jobs/${id}`
       return { url: `${base}${path}`, init: { method: "GET", headers: jsonHeaders(apiKey) } }
+    }
+    case "candle_get_swap_receipt": {
+      // The first read only: the clientSwapId form's second read is `getSwapReceipt`'s (BE-3140).
+      const target = swapReceiptTarget(args)
+      return {
+        url: `${base}${swapReceiptFirstPath(target)}`,
+        init: { method: "GET", headers: jsonHeaders(requireApiKey(cfg)) },
+      }
     }
 
     case "candle_trade_execute": {
@@ -973,7 +1019,13 @@ async function getOperation(args: Record<string, unknown>, cfg: RequestConfig, d
       // Not the API's envelope: relayed as it is, below.
     }
     const code = (body as { error?: { code?: unknown } } | null)?.error?.code
-    if (code === "JOB_NOT_FOUND") {
+    if (code === "JOB_NOT_FOUND" && args.operationId !== undefined) {
+      text = JSON.stringify({
+        ...(body as Record<string, unknown>),
+        outcome: "unknown",
+        next: "Operation lookup unavailable on this server; read the job by its client id. Do not repeat the trade.",
+      })
+    } else if (code === "JOB_NOT_FOUND") {
       const { clientId, kind } = args as { clientId: string; kind?: OperationKind }
       const next = operationNotFoundNext(clientId, kind === "launch" || kind === "swap" ? kind : "trade")
       text = JSON.stringify({ ...(body as Record<string, unknown>), outcome: "unknown", next })
@@ -984,6 +1036,46 @@ async function getOperation(args: Record<string, unknown>, cfg: RequestConfig, d
     ...(res.ok ? {} : { isError: true }),
   }
 }
+
+/**
+ * candle_get_swap_receipt (BE-3140, R97): a one-shot swap's settlement, remeasured now. The hash
+ * form relays the receipt route's answer, adding `next` to a 404 `RECEIPT_NOT_FOUND`; the
+ * clientSwapId form reads the row and then, for a `confirmed` row only, the receipt of
+ * `hashes[0]` (swap-receipt.ts). GET only, to those two routes. A bad input throws before any
+ * fetch; a fetch that throws is `MCP_TRANSPORT` worded for a read.
+ */
+async function getSwapReceipt(args: Record<string, unknown>, cfg: RequestConfig, doFetch: FetchLike) {
+  // Validates the input and the key before anything is fetched.
+  buildRequest("candle_get_swap_receipt", args, cfg)
+  const target = swapReceiptTarget(args)
+  const base = cfg.apiUrl.replace(/\/$/, "")
+  const headers = jsonHeaders(requireApiKey(cfg))
+  const get = async (path: string) => {
+    const res = await doFetch(`${base}${path}`, { method: "GET", headers })
+    noteVersionHeaders(res)
+    return { ok: res.ok, status: res.status, text: await res.text() }
+  }
+  try {
+    const answer = await readSwapReceipt(target, get, operationNotFoundNext)
+    return { content: [{ type: "text" as const, text: answer.text }], ...(answer.isError ? { isError: true } : {}) }
+  } catch (thrown) {
+    return { content: [{ type: "text" as const, text: swapReceiptTransportError(target, thrown) }], isError: true }
+  }
+}
+
+/** The stdio description; the hosted connector words it for a connection (apps/api/src/mcp/hosted.ts). */
+export const SWAP_RECEIPT_DESCRIPTION =
+  "Read how a one-shot candle_swap settled, remeasured from chain and Relay now. Moves nothing and never " +
+  "resends the swap. Pass exactly one of hash (any hash from that swap's hashes) or clientSwapId. Answers " +
+  "settlement.state: settled with settledOutRaw (what arrived), pending (not filled yet), failed (bridgeStatus " +
+  "says refund, fallback or failure when Relay reported it), or uncertain (reconcile from chain). Only the key " +
+  "that made the swap can read its receipt. Each call reads chain and Relay for up to 8 seconds: poll no faster " +
+  "than every 15 seconds. A swap from candle_trade or a build/submit swap is read with candle_get_operation instead."
+
+/** G3: the sentence both servers' candle_swap descriptions end with. */
+export const SWAP_SETTLEMENT_REREAD =
+  "When settlement.state is pending or uncertain, read it again with candle_get_swap_receipt (clientSwapId, or " +
+  "any hash from hashes); do not resend the swap to learn it."
 
 /**
  * BE-3072: when the API answers with recovery evidence that says to read status (an uncertain or
@@ -1244,12 +1336,27 @@ const getAgentPositionsShape = {
 }
 
 const getOperationShape = {
+  operationId: z
+    .string()
+    .optional()
+    .describe(
+      "Explicit Hood TEE operation id, exclusive with clientId and kind; reads recovery and guard even for a terminal job",
+    ),
   clientId: z
     .string()
-    .describe("The clientTradeId, clientSwapId or clientLaunchId the write used, or that the tool echoed back to you"),
-  kind: z
-    .enum(["trade", "swap", "launch"])
-    .describe("Which rail the id belongs to. Required: ids are caller-chosen strings with no shape to dispatch on"),
+    .optional()
+    .describe("The clientTradeId, clientSwapId or clientLaunchId the write used; requires kind"),
+  kind: z.enum(["trade", "swap", "launch"]).optional().describe("Required with clientId; omit with operationId"),
+}
+
+const getSwapReceiptShape = {
+  hash: z
+    .string()
+    .min(1)
+    .max(SWAP_RECEIPT_MAX_HASH_CHARS)
+    .optional()
+    .describe("Any hash from the swap's `hashes`. Exclusive with clientSwapId"),
+  clientSwapId: z.string().optional().describe("The clientSwapId candle_swap returned. Exclusive with hash"),
 }
 
 const vampCandidatesShape = {
@@ -1929,7 +2036,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     {
       title: "Token forensics",
       description:
-        "Gate a buy before making it: who launched it (resolved on-chain; pump.fun's shared updateAuthority is never the developer; when no developer is on chain, deployer.attribution names the launchpad or issuer instead, e.g. launched via stonk.fun or issued by xStocks), their went-to-zero rate and last coins, who bought in the deploy window (the creator's own wallets are marked disclosed; strangers in the same slot are the bundle signal), same-funder insider share, same-funder deployer cluster, and safety.summary with six sourced flags (mintAuthority, freezeAuthority, tokenExtensions, lpLock, sellability, liquidityDrain). Refuse an unprompted buy when flagged; incomplete or unknown is not clearance. deployer.priorLaunches is counted (pump.fun curves for a curve creator; record.count says the source); deployer.launcher is the wallet that sent the launch, often a launch tool's signer, never the developer; launch.deployerLaunches is that wallet's inclusive informational count, never a warning. Every measurement carries a coverage note -- 'unavailable' is not 'clean'. No key needed.\n\nMARKET_NOT_FOUND means Candle has no market for that token and this could not run. That is also not 'clean': report that you could not check it, rather than reporting the token as safe. That refusal now carries error.coverage -- covered:false, a reason ('external_launchpad' when the token launched somewhere else, 'unknown_mint' when nobody has indexed it), the launchpad when known, and every check that consequently did not run. Read it instead of guessing. Most of the feed, and any Solana mint Jupiter's index knows, now answers with a partial report instead. On Hood, a token Candle did not launch names its launch account (deployer.method cvc_launch_account) for pons.family and pools.trade launches, with no record of earlier coins; other Hood launchpads return no developer.",
+        "Gate a buy before making it: who launched it (resolved on-chain; pump.fun's shared updateAuthority is never the developer; when no developer is on chain, deployer.attribution names the launchpad or issuer instead, e.g. launched via stonk.fun or issued by xStocks), their went-to-zero rate and last coins, who bought in the deploy window (the creator's own wallets are marked disclosed; strangers in the same slot are the bundle signal), same-funder insider share, same-funder deployer cluster, and safety.summary over sourced flags (mintAuthority, freezeAuthority, tokenExtensions, lpLock, sellability, liquidityDrain; on Hood also buyability, taxes, ownerControl, contractRisk, creatorHistory). Refuse an unprompted buy when flagged; incomplete or unknown is not clearance. On Hood, safety.evm carries hacc's 21 EVM contract-security fields as reported (null means not known), their provenance and observedAt, and a reason when no read ran (no_key, hacc_forbidden, stale, ...); a stale reading is never clear. deployer.priorLaunches is counted (pump.fun curves for a curve creator; record.count says the source); deployer.launcher is the wallet that sent the launch, often a launch tool's signer, never the developer; launch.deployerLaunches is that wallet's inclusive informational count, never a warning. Every measurement carries a coverage note -- 'unavailable' is not 'clean'. No key needed; with a key, Hood contract safety reads hacc on that key's research plan (hacc admits and charges it; researchCredits shows the cost). The key is sent on Hood only.\n\nMARKET_NOT_FOUND means Candle has no market for that token and this could not run. That is also not 'clean': report that you could not check it, rather than reporting the token as safe. That refusal now carries error.coverage -- covered:false, a reason ('external_launchpad' when the token launched somewhere else, 'unknown_mint' when nobody has indexed it), the launchpad when known, and every check that consequently did not run. Read it instead of guessing. Most of the feed, and any Solana mint Jupiter's index knows, now answers with a partial report instead. On Hood, a token Candle did not launch names its launch account (deployer.method cvc_launch_account) for pons.family and pools.trade launches, with no record of earlier coins; other Hood launchpads return no developer.",
       inputSchema: tokenForensicsShape,
     },
     async (args) => callAndRelay("candle_token_forensics", args, getConfig(), doFetch),
@@ -2238,7 +2345,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     {
       title: "What happened to a write",
       description:
-        "Look up a trade, swap or launch by the id its write used, and find out whether it landed. " +
+        "Look up a trade, swap or launch by clientId and kind, or supply only operationId for a Hood TEE guard. While guard.recoveryRequired is true, read status and follow clearingCondition; never repeat the trade. " +
         "Reads only; moves nothing.\n\n" +
         "Call this after a timeout, after a restart, or any time you hold an id and do not know " +
         "the outcome. Do NOT re-send the write to find out.\n\n" +
@@ -2258,6 +2365,29 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
       inputSchema: getOperationShape,
     },
     async (args) => getOperation(args, getConfig(), doFetch),
+  )
+
+  register(
+    "candle_get_swap_receipt",
+    {
+      title: "How a one-shot swap settled",
+      description: SWAP_RECEIPT_DESCRIPTION,
+      inputSchema: getSwapReceiptShape,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (args) => getSwapReceipt(args, getConfig(), doFetch),
+  )
+
+  register(
+    "candle_recover_operation",
+    {
+      title: "Recover a Hood TEE leg by proof",
+      description:
+        "Read-only chain recovery: verifies a legacy leg's exact historical stamp and receipt. Never signs, sends or collects fees. An optional candidateHash is an untrusted locator. A hold remains until clearingCondition is met; read candle_get_operation with operationId, never repeat the trade.",
+      inputSchema: { operationId: z.string(), candidateHash: z.string().optional() },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async (args) => callAndRelay("candle_recover_operation", args, getConfig(), doFetch),
   )
 
   register(
@@ -2677,7 +2807,8 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
         "on a live venue.\n\n" +
         "This tool spends the embedded wallets. A TEE wallet also bridges, from SOL or USDC to ETH " +
         "or USDG or back, but only into the same key's TEE wallet on the other chain, with no Candle " +
-        "fee: that runs through `candle swap` with the wallet's bound key, not this tool.",
+        "fee: that runs through `candle swap` with the wallet's bound key, not this tool.\n\n" +
+        SWAP_SETTLEMENT_REREAD,
       inputSchema: swapShape,
     },
     async (args) => swap(args, getConfig(), doFetch),

@@ -101,6 +101,7 @@ import {
 export async function vaultPromote(args: string[], ctx: CommandContext): Promise<number> {
   const parsed = parseArgs(args, {
     valueFlags: ["--from", "--in-place", "--sweep-to", "--label", "--rpc-url", "--keystore", "--to-key"],
+    keyPrefixValueFlags: ["--to-key"],
     booleanFlags: ["--accept-unknown-exposure", "--accept-older-copy"],
     pathFlags: ["--keystore"],
   })
@@ -487,7 +488,7 @@ export async function reopenFromDisk(
       suggestion:
         "The vault was there when this run started. Check nothing moved or removed it, then: candle vault status",
     })
-  return reopen(path, raw)
+  return reopen(path, raw, "re-opening the vault to verify its current contents")
 }
 
 async function promoteInPlace(
@@ -1032,7 +1033,7 @@ export async function runTeeImport(
      * `opened.reopen`, the factor path; the batch passes a held-key re-open that shares its DEK
      * (BE-285, D9), which is why `closeReopened` exists.
      */
-    reopenForWrite: (path: string, raw: string) => Promise<UnlockedVault>
+    reopenForWrite: OpenedVault["reopen"]
     /**
      * Whether the `finally` below closes what `reopenForWrite` returned. Default `true`: a vault
      * opened through the factor is this call's to wipe. The batch passes `false`, because its
@@ -1105,7 +1106,11 @@ export async function runTeeImport(
   const account = name !== undefined ? (config.profiles?.[name]?.account ?? "") : ""
   const importedAt = new Date(ctx.deps.now()).toISOString()
   const raw = await requireVaultRaw(ctx, opts.resolvedVault)
-  const vault = await opts.reopenForWrite(opts.resolvedVault.path, raw)
+  const vault = await opts.reopenForWrite(
+    opts.resolvedVault.path,
+    raw,
+    "re-opening the vault to save the import result",
+  )
   let committed: UnlockedVault | undefined
   try {
     committed = await commitVault(

@@ -1,11 +1,11 @@
 # @candledottv/mcp
 
 An MCP (Model Context Protocol) server for the Candle agent rail. The current source exposes Candle's REST API as
-ninety-one tools over stdio, plus four Hyperliquid market reads (ninety-five in all; `candle_quote`, `candle_get_price_history`, `candle_get_trading_wallets` and `candle_get_spendable_balances` are in source only and not in the published 0.10.29), so an MCP-capable agent can launch tokens (optionally seeded with a dev
+ninety-three tools over stdio, plus four Hyperliquid market reads (ninety-seven in all; ninety-five of them ship in the published 0.10.31 — `candle_recover_operation` and `candle_get_swap_receipt` are source only until the next release), so an MCP-capable agent can launch tokens (optionally seeded with a dev
 buy in the same call), trade, convert between base assets (including across chains), read market
 and feed data, read one token's signals and tracked-wallet trades and its card data, report on-chain activity,
 check an agent profile, and backtest a strategy in hacc's strategy lab without hand-rolling HTTP calls. The five
-strategy lab tools, `candle_get_trading_wallets` and `candle_get_spendable_balances` are unreleased source.
+strategy lab tools, `candle_get_trading_wallets` and `candle_get_spendable_balances` are in the published 0.10.31.
 
 Not sure this is the right tool? [How to choose: SDK, MCP or CLI](https://docs.candle.tv/developers/choose-a-surface).
 
@@ -15,7 +15,7 @@ Nineteen tools are read-only and need nothing but `CANDLE_API_URL` (which alread
 production): `candle_get_market`, `candle_get_price_history`, `candle_get_feed`, `candle_token_events`, `candle_token_card`, `candle_token_history`,
 `candle_token_page_about`, `candle_token_page_burns`, `candle_token_page_history`, `candle_token_page_updates`, `candle_token_page_comments`, `candle_token_forensics`, `candle_token_clusters`,
 `candle_get_agent_profile`, `candle_list_agents`, `candle_list_agent_posts`, `candle_get_agent_positions`, `candle_resolve_token` and `candle_get_plans`.
-All of them but `candle_get_price_history` (new in source, not yet published) are in the published 0.10.29; `candle_get_agent_positions` is new since 0.10.27.
+All of them are in the published 0.10.31; `candle_get_agent_positions` is new since 0.10.27 and `candle_get_price_history` is new since 0.10.29.
 With token-page reads enabled on the deployment, those nineteen work immediately without a key.
 Install the released server with no `env` block at all and its ten public reads work immediately:
 
@@ -39,7 +39,7 @@ environment.
 To mint a key for another agent without keeping it as the CLI profile's working key, run `candle keys create --access write --label agent-one --no-store` after device login. The key is printed once; put it in the intended agent's secret store. `--json` reports `stored: false` and exits 0. The profile's existing working key, prefix and scopes stay unchanged, even when it has no working key. Add `--embedded-wallet allow` at a terminal if this key needs the account's embedded wallet. This is a CLI storage option; it adds no MCP tool and does not change tool counts.
 
 `CANDLE_MCP_TOOLS` (optional) is a comma-separated allowlist of tool names; only those register.
-Unset means all ninety-five: the ninety-one tools in the table below plus the four Hyperliquid
+Unset means all ninety-seven: the ninety-three tools in the table below plus the four Hyperliquid
 market reads. An unknown name fails startup with the valid names in the message, rather
 than silently registering the wrong surface. `candle mcp --read-only` / `--tools` set this for
 you.
@@ -135,7 +135,7 @@ tools, getting a key, funding the embedded wallet, and idempotent retries, see
 | `candle_launch_token` | Launch a token on Candle | `POST /api/v1/launch/headless` (or `/dry-run` when `dryRun: true`); with `imagePath`, `POST /api/v1/uploads/agent-image` first | `CANDLE_AGENT_API_KEY` |
 | `candle_get_market` | Get market state | `GET /api/v1/markets/:chain/:mint` | none |
 | `candle_get_price_history` | One Solana token's OHLC bars in USD per token, oldest first (interval 1m-1d, limit 1-500, `to` unix seconds); `source` and `volumeUnit` say whose bars. Hood is refused with its REST route | `GET /api/v1/markets/solana/:mint/candles` | none |
-| `candle_quote` | **Unreleased (source only; not in 0.10.29).** Price a buy or sell before making it; moves nothing. Returns `amountOut` in base units, `venue`, `quoteAsset`, `quoteDecimals`, `quotedAt`; `route` appears only on some answers. `amountRaw` is in base units. Limit 600 a minute per key | `POST /api/v1/trade/agent/quote` | `CANDLE_AGENT_API_KEY` with `swap:write` (a read-only key cannot quote) |
+| `candle_quote` | Price a buy or sell before making it; moves nothing. Returns `amountOut` in base units, `venue`, `quoteAsset`, `quoteDecimals`, `quotedAt`; `route` appears only on some answers. `amountRaw` is in base units. Limit 600 a minute per key | `POST /api/v1/trade/agent/quote` | `CANDLE_AGENT_API_KEY` with `swap:write` (a read-only key cannot quote) |
 | `candle_get_feed` | Get a token feed (`finalstretch`: at most the 200 most complete; `where` on `progress` narrows it) | `GET /api/v1/markets/feed?bucket=...` | none |
 | `candle_token_edit` | As the token's creator, set Candle's copy of its description and links; an unknown `socials` key is refused locally. Needs a `launch:write` key from the launching account; reuse `idempotencyKey` to retry. Off until the deployment switches it on (503 `METADATA_EDIT_DISABLED`) | `PATCH /api/v1/tokens/:chain/:mint/metadata` | `x-api-key` |
 | `candle_token_history` | A token's metadata edits, newest first, with the previous values | `GET /api/v1/tokens/:chain/:mint/metadata/history?limit=...&cursor=...` | none |
@@ -158,7 +158,7 @@ tools, getting a key, funding the embedded wallet, and idempotent retries, see
 | `candle_token_page_seen` | Private own unread position | `GET /api/v1/token-pages/:chain/:address/seen` | Yes (`token-pages:read`) |
 | `candle_token_page_mark_seen` | Mark an actually rendered visible update seen | `POST /api/v1/token-pages/:chain/:address/seen` | Yes (`token-pages:write`) |
 | `candle_vamp_candidates` | Tickers being copied near graduation: Solana tokens near graduation or graduated in the last 6 hours, most-copied in the last 24 hours first, each with a launch draft (name, ticker, image URL) and `draftNotes` for the fields you must supply. Counts exclude the candidate itself. Answers 404 where the deployment has not switched it on | `GET /api/v1/markets/vamp-candidates?limit=...&minCopies24h=...&stage=...` | `CANDLE_AGENT_API_KEY` (`account:read`) |
-| `candle_token_forensics` | Deployer history, deploy-window buyers, sourced token safety flags | `GET /api/v1/markets/:chain/:mint/forensics` | none |
+| `candle_token_forensics` | Deployer history, deploy-window buyers, sourced token safety flags. On Hood a configured key is sent (Hood only) so the report carries hacc's EVM contract safety (`safety.evm`), read and charged on that key's own hacc research plan; past the free rate with x402 per-use on, that key can also draw its account's credit for Candle's per-use price. Solana sends no key | `GET /api/v1/markets/:chain/:mint/forensics` | none (optional on Hood) |
 | `candle_token_clusters` | Optional third-party linked-wallet estimates for a Solana token. Always a result with `isError: false`: `status: "unavailable"` and a `reason` when there is no analysis | `GET /api/v1/tokens/:mint/clusters` | none |
 | `candle_report_activity` | Report on-chain activity | `POST /api/v1/activity/report` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_agent_profile` | Get an agent profile | `GET /api/v1/users/:idOrWallet/agent` | none |
@@ -189,7 +189,9 @@ tools, getting a key, funding the embedded wallet, and idempotent retries, see
 | `candle_get_account_pnl` | P&L for every agent profile on the account in one read (`candle pnl` without `--profile`) | `GET /api/v1/agent/keys/pnl` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_portfolio` | What the account's embedded and TEE wallets hold on Solana and Hood (Hood in `hood`), with prices; unpriced holdings say why, never zero | `GET /api/v1/agent/portfolio` | `CANDLE_AGENT_API_KEY` (`account:read`) |
 | `candle_execution_status` | One call before trading: the embedded wallets, the TEE wallets bound to this key (`tee`, each with `chain` and `spendable` — active, the key not paused, and the key holding a spend scope: `swap:write`, `transfer:write` or `launch:write`, with the key's scopes in `teeScopes`; `teeComplete: false` means more), tier, this key's limits (`limits.txLimitUse` has its USD limit use and when it resets), and its loss limits and stop state (a stopped key is `ready: false` with a top-level `stopped`); a failed read is named in `unreadable` | Composes `GET /api/v1/agent/wallets/embedded`, `/wallets/trading`, `/tier`, `/keys/self/limits` and `/keys/self/risk` | `CANDLE_AGENT_API_KEY` |
-| `candle_get_operation` | Look up a trade, swap or launch by the id its write used, and whether it landed. `kind: "swap"` reads a `candle_swap` by its `clientSwapId` and answers `job.outcome` (`in_flight`, `confirmed`, `failed`, `partial` or `indeterminate`) | `GET /api/v1/trade/agent/jobs/:clientId`, `/api/v1/agent/swap/by-client-id/:clientId` or `/api/v1/launch/headless/jobs/:clientId` | `CANDLE_AGENT_API_KEY` |
+| `candle_get_operation` | Read a Hood TEE operation using `operationId` exclusively, or use `clientId` plus `kind` for a trade, swap or launch job | `GET /api/v1/agent/hood-tee/operations/:operationId` or the owning rail job route | `CANDLE_AGENT_API_KEY` |
+| `candle_get_swap_receipt` | How a one-shot `candle_swap` settled, remeasured from chain and Relay now. Exactly one of `hash` (any hash from the swap's `hashes`, 1 to 128 characters) or `clientSwapId`. The clientSwapId form reads the swap's row and then, only for a `confirmed` row, the receipt of `hashes[0]`; its answer adds `receipt` (`read`, `no_hash`, `not_written`, `not_found` or `unavailable`) and a `next`. Only the key that made the swap can read its receipt. Each call reads for up to 8 seconds: poll no faster than every 15 seconds. Moves nothing and never resends the swap. See "Reading a one-shot swap's settlement" | `GET /api/v1/agent/swap/receipts/:hash`, and `GET /api/v1/agent/swap/by-client-id/:clientSwapId` first for the clientSwapId form | `CANDLE_AGENT_API_KEY` (`swap:write`) |
+| `candle_recover_operation` | Verify legacy Hood proof using `operationId` and optional untrusted `candidateHash`; requires the owning rail scope and swap key. Never signs, sends or collects fees | `POST /api/v1/agent/hood-tee/operations/:operationId/recover` | `CANDLE_AGENT_API_KEY` |
 | `candle_get_fees` | The creator fees the account's launched tokens can pay: raw amounts from chain reads, and the reason a token cannot be claimed | `GET /api/v1/agent/fees` | `CANDLE_AGENT_API_KEY` (`account:read`) |
 | `candle_atomic_launch_dry_run` | Check a Solana launch with first buys and price each buy on the curve it would deploy; builds, reserves and writes nothing | `POST /api/v1/launch/atomic/dry-run` | `CANDLE_AGENT_API_KEY` (`launch:write`, `swap:write`, Pro or Max) |
 | `candle_claim_fees` | Collect one token's creator fees to the wallet fixed at launch (no destination argument); `dryRun` sends nothing | `POST /api/v1/agent/fees/:mint/claim` | `CANDLE_AGENT_API_KEY` (`launch:write`) |
@@ -265,10 +267,32 @@ Anything else is refused before signing -- an agent key can never approve its ow
 tokens before the native asset (the native asset pays the fees), plus any `mints` named
 explicitly. Assets with nothing spendable report `empty`; a failed asset never stops the rest.
 
+## Reading a one-shot swap's settlement
+
+A one-shot `candle_swap` that bridges measures its settlement once, within 3 seconds, so a bridge
+usually answers `settlement.state: "pending"`. Read it again with `candle_get_swap_receipt`, by the
+`clientSwapId` the swap returned or by any hash from its `hashes`. Do not resend the swap to learn
+it: a same-id resend replays the stored first answer.
+
+- `settlement.state` is `settled` (with `settledOutRaw`, what arrived), `pending` (not filled yet),
+  `failed` or `uncertain` (reconcile from chain). A failed bridge carries `bridgeStatus` (`refund`,
+  `fallback` or `failure`) when Relay's own status is why it failed. `refund` and `fallback` both
+  mean Relay refunded the deposit (`fallback` is the name Relay's status endpoint gives a refund).
+  No refund amount or hash is measured, so none is reported.
+- Only the key that made the swap can read its receipt. With `clientSwapId`, a confirmed swap made
+  by another key on the account answers `receipt: "not_found"`, a success, with `outcome` and
+  `hashes` to reconcile from chain; with a hash it is a 404 `RECEIPT_NOT_FOUND` carrying `next`.
+- A `partial` or `indeterminate` swap has no receipt (`receipt: "not_written"`, and `error` says
+  where the funds are), and an in-flight one has no hash yet (`receipt: "no_hash"`). Neither costs a
+  second read.
+- Each call remeasures for up to 8 seconds. Poll no faster than every 15 seconds.
+- A swap made with `candle_trade`, or a build/submit swap (`candle swap` in the CLI), is read with
+  `candle_get_operation` instead. The CLI reads a one-shot swap with `candle swap receipt`.
+
 ## Errors
 
 This package never reinterprets an error body, and that body is not one uniform shape across all
-ninety-one tools:
+ninety-three tools:
 
 - `candle_token_events`, called with `kind`, is the one narrowing of a SUCCESS body, never an
   error one: the relayed `events` are filtered to that kind and the body gains `filteredByKind`.
@@ -415,7 +439,7 @@ Tools: `candle_get_staking`, `candle_stake`, `candle_unstake`, `candle_finish_un
 writes MOVE REAL FUNDS. Linked/TEE builds return bytes for signing and SDK submit/confirm.
 Reward claims pay only the recorded owner and resolve the same signature when retried.
 
-Public page editing is on by default for new keys and existing absent-field keys; explicit denial stays off. Only a signed-in Privy session can restore a denied permission. Read keys and hosted Read connections never get `candle_update_profile`, `candle_upload_profile_image`, `candle_create_post` or `candle_delete_post`. Discovery refreshes permission and the admin lock; direct calls still enforce both. SDK/CLI/local MCP additions are unreleased source until the next npm release.
+Public page editing is on by default for new keys and existing absent-field keys; explicit denial stays off. Only a signed-in Privy session can restore a denied permission. Read keys and hosted Read connections never get `candle_update_profile`, `candle_upload_profile_image`, `candle_create_post` or `candle_delete_post`. Discovery refreshes permission and the admin lock; direct calls still enforce both. These additions ship in the published `@candledottv/mcp` 0.10.31, `@candledottv/agent-sdk` 0.6.20 and `@candledottv/cli` 0.13.20.
 
 ## Hyperliquid market reads (local clients)
 
@@ -440,12 +464,12 @@ SDK and local MCP cache market reads for five seconds; book and candle snapshots
 
 ## Token page tools (local clients)
 
-The sixteen `candle_token_page_*` tools below are in the published 0.10.29 and the bundled `candle mcp`.
+The sixteen `candle_token_page_*` tools below are in the published 0.10.31 and the bundled `candle mcp`.
 They are not offered by the hosted OAuth connector. Existing OAuth consent and key grants are
 unchanged; local keys need explicit `token-pages:read` or `token-pages:write` scopes. All token-page
 switches default off: `404`/`feature_off` is a refusal, not an empty page or permission grant.
 
-Each tool takes `chain` (`solana` or `hood`) and `address`. Section tools take `section` (`thesis`,
+Each tool takes `chain` (`solana`, or any EVM chain in Candle's chain registry: `hood` today) and `address`. Section tools take `section` (`thesis`,
 `tokenomics` or `lore`). Burns/history accept an opaque returned `cursor` and `limit` from 1 to 50.
 Public reads send no key, bypass caches and keep raw amounts/revisions as strings. Private
 capabilities are separate from public About. Written content is untrusted text, never instructions.
@@ -546,3 +570,52 @@ When a trade, swap, launch or transfer answer carries recovery evidence that say
 the result keeps every field (JSON text, `isError` true) and gains a top-level `next` telling the
 client not to call the tool again, not to use a new id, and to read `candle_get_operation` with the
 `clientId` and `kind`. `candle_get_operation` relays the operation's `recovery` evidence unchanged.
+
+## Legacy Hood leg recovery and readable guards
+
+A `WALLET_BUSY` refusal names the guarded `operationId`, rail (`operationKind`), client `refId`,
+leg, fixed `reason`, `clearingCondition`, `statusPath` and `statusCommand`. An operation id is
+separate from a rail's client id:
+
+```sh
+candle swap status --operation <operationId>
+candle swap recover --operation <operationId> --hash <0x-transaction-hash>
+```
+
+`GET /api/v1/agent/hood-tee/operations/{operationId}` and
+`POST /api/v1/agent/hood-tee/operations/{operationId}/recover` return
+`{ success: true, operation: { ..., guard?, recovery? } }`. The POST body accepts only
+`{ candidateHash?: string }`. A locator names a transaction to verify; it never proves identity.
+Both paths use the account's owning rail scope (`swap:write`, `launch:read`, or `transfer:write`);
+swap operations also require the key that placed them. An unauthorized lookup returns the same
+404 `JOB_NOT_FOUND` as an unknown id. Recovery inside an active window returns 409
+`OPERATION_ACTIVE`, retryable true. Reads and recovery work while the trading switch is off.
+
+Legacy recovery reconstructs the exact signed type-2 envelope and verifies its hash, signer and
+historical Candle stamp before recording an exact-hash receipt. It needs no client-held bytes.
+It never signs, sends, rebroadcasts, restamps, returns a next leg, collects fees or revives the
+operation. Failed/expired parents and unattempted planned legs keep their labels. Proving one
+leg keeps every other unresolved leg held. A nonce count, elapsed time, missing transaction,
+allowance or terminal job label cannot clear a hold. `not_sent` requires positive bound claim
+proof that signing cannot have happened or happen later; pending/ambiguous claims remain held.
+
+While `guard.recoveryRequired` is true, read status and follow `clearingCondition`. CLI status and
+recover exit 3 while held. `legacy_identity_missing` can accept a locator; `nonce_conflict`,
+`receipt_conflict`, `legacy_candidate_conflict` and `legacy_proof_incomplete` keep the wallet held
+until the stated proof or a separately reviewed disposition exists. A landed leg stays landed.
+No rebuild or repeat-trade instruction follows an uncertain result.
+
+Every Hood rail job read carries its operation's `guard`, regardless of the job's terminal label.
+`GET /api/v1/agent/wallets/{walletId}/hood-tee` is the read-only locator of last resort, even with
+no job row: `guard: { held, incomplete, operations }` lists at most 10 held operations. A held
+failed/expired operation also makes `activeOperation` non-null for installed custody clients.
+Incomplete proof without a known holder omits `activeOperation`, so those clients fail closed.
+Current custody commands refuse `WALLET_GUARDED`. Preserve that compatibility projection during
+rollback. This endpoint performs no recovery writes.
+
+SDK: `getHoodTeeOperation(operationId)` and
+`recoverHoodTeeOperation(operationId, { candidateHash? })`; `GuardSummary` and `WalletBusyDetails`
+are exported. MCP: `candle_get_operation` accepts `operationId` exclusively instead of
+`clientId`/`kind`; `candle_recover_operation` accepts `operationId` and optional `candidateHash`.
+An older API without explicit operation lookup requires reading the job by its client id.
+These client source changes require a separate human package release; this repair bumps no version.
