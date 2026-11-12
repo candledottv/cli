@@ -1693,10 +1693,25 @@ export const PROFILE_PNL_HYPERLIQUID =
   "`pnl.totalUsd` is spot only, `perpsInTotal` is false and `reason` says why; that is never a zero. Check " +
   "`historyPartial` and `partialReasons`."
 
-export function registerTools(server: McpServer, env: Record<string, string | undefined> = process.env): void {
+const localServerConfigs = new WeakMap<McpServer, RequestConfig>()
+function serverConfig(
+  server: McpServer,
+  env: Record<string, string | undefined>,
+  resolved?: RequestConfig,
+): RequestConfig {
+  const cfg = localServerConfigs.get(server) ?? resolved ?? resolveConfig(env)
+  localServerConfigs.set(server, cfg)
+  return cfg
+}
+
+export function registerTools(
+  server: McpServer,
+  env: Record<string, string | undefined> = process.env,
+  resolved?: RequestConfig,
+): void {
   // `env`, not the ambient environment: an in-process host (`candle mcp`) passes a deliberately
   // reduced environment, and reading process.env here would restore what that strip removed.
-  const cfg = resolveConfig(env)
+  const cfg = serverConfig(server, env, resolved)
   // Fail-fast at startup on a bad allowlist: the process exits before the transport connects,
   // and the operator sees the valid names instead of a server that silently has the wrong tools.
   const allowed = resolveToolAllowlist(env)
@@ -2004,7 +2019,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     {
       title: "Get market state",
       description:
-        "Read Candle and indexed external markets, including indexed-but-not-routable tokens. No key needed. " +
+        "Read Candle and indexed external markets, including indexed-but-not-routable tokens. No key needed. quoteAsset names the pool pair; quoteAssets lists accepted settlement ids, with quoteAssets[0] the default (not a liquidity promise). " +
         EXTERNAL_MARKET_DISCLOSURE +
         " " +
         "Read candleLaunched, launchpad, venue and trade.routable; jupiterOk and discovery flags are distinct. " +
@@ -3355,8 +3370,9 @@ export async function registerEligibleProfileTool(
   server: McpServer,
   env: Record<string, string | undefined> = process.env,
   doFetch: FetchLike = fetch,
+  resolved?: RequestConfig,
 ): Promise<boolean> {
-  const cfg = resolveConfig(env)
+  const cfg = serverConfig(server, env, resolved)
   const allowlist = resolveToolAllowlist(env)
   const wanted = PROFILE_EDIT_TOOL_NAMES.filter((name) => allowlist.has(name))
   let eligible = false
