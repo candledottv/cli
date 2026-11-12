@@ -225,6 +225,11 @@ function ownerConfirmChallengeOf(result) {
   const verificationUriComplete = str("verificationUriComplete");
   if (!confirmId || !userCode || !verificationUriComplete)
     return null;
+  const accountRaw = oc.account;
+  const account = accountRaw && typeof accountRaw === "object" && !Array.isArray(accountRaw) && typeof accountRaw.wallet === "string" ? {
+    wallet: accountRaw.wallet,
+    displayName: typeof accountRaw.displayName === "string" ? accountRaw.displayName : null
+  } : undefined;
   return {
     confirmId,
     userCode,
@@ -234,6 +239,7 @@ function ownerConfirmChallengeOf(result) {
     interval: Math.max(1, num("interval") ?? 5),
     step: str("step") ?? "",
     summary: str("summary") ?? "",
+    ...account ? { account } : {},
     reason: str("reason") ?? "required"
   };
 }
@@ -755,7 +761,7 @@ var init_terminal_theme = __esm(() => {
 });
 
 // src/version.ts
-var CLI_VERSION = "0.13.23";
+var CLI_VERSION = "0.13.24";
 
 // src/presentation.ts
 function terminalStyle(deps, stream, machine = false) {
@@ -47895,17 +47901,27 @@ async function keysRevoke(args, ctx) {
     return 2;
   }
   if (parsed.positionals.length !== 1) {
-    deps.stderr.write(`Usage: candle keys revoke <prefix>
+    deps.stderr.write(`Usage: candle keys revoke <prefix|label>
 `);
     return 2;
   }
-  const prefix = parsed.positionals[0];
+  const target = parsed.positionals[0];
   await printIdentity(ctx);
   const deviceToken = await resolveDeviceToken(deps, ctx.profile);
   if (!deviceToken) {
     writeLocalFailure(deps, NO_DEVICE_TOKEN, json);
     return 1;
   }
+  const resolved = await resolveTargetKey(ctx, deviceToken, target, {
+    codePrefix: "KEY_REVOKE",
+    writeListFailure: (failure3) => {
+      writeFailure(deps, failure3, { apiUrl, authType: "device" }, json);
+      return 1;
+    }
+  });
+  if (!resolved.ok)
+    return resolved.code;
+  const prefix = resolved.keyPrefix;
   const result2 = await apiRequest(`${KEYS_PATH3}/${encodeURIComponent(prefix)}`, {
     method: "DELETE",
     auth: "device",
@@ -47955,6 +47971,7 @@ var init_keys = __esm(() => {
   init_secret_store();
   init_key_output();
   init_keys_embedded_wallet();
+  init_tee_rebind();
   ACCESS_LEVELS = {
     read: "read",
     write: "readwrite",
@@ -78928,13 +78945,16 @@ var HELP = {
         invocation: "self embedded-wallet deny",
         description: "The profile's own key gives up the embedded wallet, with no prompt. A key can never allow itself: the owner does that with keys update"
       },
-      { invocation: "stop <prefix>", description: "Pause one key with the device token; reversible with keys resume" },
-      { invocation: "resume <prefix>", description: "Resume a stopped key with the device token" },
+      {
+        invocation: "stop <prefix|label>",
+        description: "Pause one key with the device token; reversible with keys resume"
+      },
+      { invocation: "resume <prefix|label>", description: "Resume a stopped key with the device token" },
       {
         invocation: "rotate <prefix|label> ([--grace <duration> | --now] [--force] [--yes] | --finish)",
         description: "Give a key a new secret, keeping its prefix, label, access, limits, wallets and history. The old secret works through --grace (default 1h, at most 24h) or stops at once with --now; --finish ends an open window early. The profile's own key is replaced in the keychain; update CANDLE_API_KEY or CANDLE_API_KEY_FILE yourself and restart MCP. --force rotates again while a window is open"
       },
-      { invocation: "revoke <prefix>", description: "Revoke an API key permanently" },
+      { invocation: "revoke <prefix|label>", description: "Revoke an API key permanently" },
       {
         invocation: "signer approve <code> --key <prefix|label> [--reject]",
         description: "Approve (or reject) a key's signer request with the device token; type the full fingerprint the trading machine printed"
@@ -85264,6 +85284,13 @@ init_evm_lite();
 init_client();
 var EXIT_OWNER_CONFIRM_PENDING = 7;
 var OWN_NO_WAIT_COMMANDS = [["tee"], ["lab"], ["wallets", "authorize"]];
+function shortWallet(wallet3) {
+  return wallet3.length >= 12 ? `${wallet3.slice(0, 4)}…${wallet3.slice(-4)}` : wallet3;
+}
+function accountLabel(account) {
+  const short = shortWallet(account.wallet);
+  return account.displayName ? `${account.displayName} (${short})` : short;
+}
 function ownerConfirmPendingLine(challenge) {
   return JSON.stringify({
     ok: false,
@@ -85274,7 +85301,8 @@ function ownerConfirmPendingLine(challenge) {
       verificationUriComplete: challenge.verificationUriComplete,
       expiresIn: challenge.expiresIn,
       step: challenge.step,
-      summary: challenge.summary
+      summary: challenge.summary,
+      ...challenge.account ? { account: challenge.account } : {}
     }
   });
 }
@@ -85291,10 +85319,12 @@ function cliOwnerConfirmHooks(deps, opts, state) {
 `);
       } else {
         const minutes = Math.max(1, Math.round(challenge.expiresIn / 60));
+        const as = challenge.account ? ` as ${accountLabel(challenge.account)}` : "";
         deps.stderr.write([
-          `This needs your approval in the browser: ${challenge.summary}`,
+          `This needs your approval in the browser${as}: ${challenge.summary}`,
           `Open ${challenge.verificationUriComplete}`,
           `Code: ${challenge.userCode}`,
+          ...challenge.account ? [`The browser must be signed in as ${accountLabel(challenge.account)}.`] : [],
           "Only approve if you just ran this command.",
           opts.wait ? `Waiting for approval (expires in ${minutes} minute${minutes === 1 ? "" : "s"})...` : ""
         ].filter(Boolean).join(`
@@ -93591,6 +93621,7 @@ init_presentation();
 init_profiles();
 init_key_output();
 init_keys();
+init_tee_rebind();
 function keysStop(args, ctx) {
   return setKeyPaused(args, ctx, true);
 }
@@ -93599,14 +93630,14 @@ function keysResume(args, ctx) {
 }
 async function setKeyPaused(args, ctx, paused) {
   const { deps, apiUrl, json } = ctx;
-  const parsed = parseArgs(args, {});
+  const parsed = parseArgs(args, { keyPrefixPositional: true });
   if ("error" in parsed) {
     writeScreenUsageFailure(deps, parsed.error, json);
     return 2;
   }
-  const prefix = parsed.positionals[0];
-  if (!prefix?.trim() || parsed.positionals.length !== 1) {
-    writeScreenUsageFailure(deps, `Usage: candle keys ${paused ? "stop" : "resume"} <prefix>`, json);
+  const target = parsed.positionals[0];
+  if (!target?.trim() || parsed.positionals.length !== 1) {
+    writeScreenUsageFailure(deps, `Usage: candle keys ${paused ? "stop" : "resume"} <prefix|label>`, json);
     return 2;
   }
   await printIdentity(ctx);
@@ -93615,6 +93646,16 @@ async function setKeyPaused(args, ctx, paused) {
     writeScreenLocalFailure(deps, NO_DEVICE_TOKEN, json);
     return 1;
   }
+  const resolved = await resolveTargetKey(ctx, deviceToken, target, {
+    codePrefix: paused ? "KEY_STOP" : "KEY_RESUME",
+    writeListFailure: (failure3) => {
+      writeScreenFailure(deps, failure3, { apiUrl, authType: "device" }, json);
+      return 1;
+    }
+  });
+  if (!resolved.ok)
+    return resolved.code;
+  const prefix = resolved.keyPrefix;
   const result2 = await apiRequest(`/api/v1/agent/keys/${encodeURIComponent(prefix)}/stop`, {
     method: "POST",
     auth: "device",
