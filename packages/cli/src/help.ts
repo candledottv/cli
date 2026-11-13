@@ -286,7 +286,7 @@ export const HELP: Record<string, Topic> = {
     intro: "Quote, swap and bridge on Solana or Hood; read an operation",
     summary: "Quote, confirm and swap on Solana or Hood, bridge between them; read an operation by id",
     description:
-      "Swaps run through a TEE wallet's bound key: the quote is shown and confirmed before anything is sent. The first buy after a launch is this command, unless the launch carried it with candle launch --buy. The assets decide the chain (ETH, USDG or a 0x token is Hood; SOL, USDC, CNDL or a mint is Solana) and a named wallet must be on it. A Hood TEE wallet signs one leg at a time: approve, Permit2, trade, then the fee, each only after the one before it landed. SOL or USDC to ETH or USDG, or back, is a bridge through Relay from a TEE wallet into this key's own TEE wallet on the other chain (--to names it when there are several); Candle charges no fee, only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and this machine checks Relay's deposit before it is signed. The bridge prints its deposit and returns while Relay fills; --wait follows it for up to ten minutes. While it is open, a sweep of either wallet refuses BRIDGE_IN_FLIGHT for two hours. Vault to vault: fund the Solana TEE wallet from the vault, bridge, then disable and sweep the Hood TEE wallet into its vault. Every plan can trade Candle-launched tokens and base assets, and buy or sell a token that was not launched on Candle. Each trade pays the plan's agent fee on top; a base-pair swap or a bridge between this key's own wallets pays none. candle plans shows the fees in force. With --dry-run, stdout reports per-check results and the quote; nothing is signed or sent. Otherwise with --json, stdout is one JSON value for every swap, trade, replay and status read: kind, status, clientTradeId, signature (the primary transaction, or null), signatures (a list) and raw (the original response); every human line is on stderr. The keys older versions printed stay beside them.",
+      "Swaps run through a TEE wallet's bound key: the quote is shown and confirmed before anything is sent. The first buy after a launch is this command, unless the launch carried it with candle launch --buy. The assets decide the chain (ETH, USDG or a 0x token is Hood; SOL, USDC, CNDL or a mint is Solana) and a named wallet must be on it. A Hood TEE wallet signs one leg at a time: approve, Permit2, trade, then the fee, each only after the one before it landed. SOL or USDC to ETH or USDG, or back, is a bridge through Relay from a TEE wallet into this key's own TEE wallet on the other chain (--to names it when there are several); Candle charges no fee, only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and this machine checks Relay's deposit before it is signed. The bridge prints its deposit and returns while Relay fills; --wait follows it for up to ten minutes. While it is open, a sweep of either wallet refuses BRIDGE_IN_FLIGHT for two hours. On a Hood TEE swap, --wait follows the trade and fee legs for up to ten minutes and prints the same operation response as candle swap status --operation <id>; exit 0 means completed, 1 failed, and 3 partial execution, unresolved settlement or timeout. Embedded and Solana same-chain swaps use candle swap status <client-trade-id>. Vault to vault: fund the Solana TEE wallet from the vault, bridge, then disable and sweep the Hood TEE wallet into its vault. Every plan can trade Candle-launched tokens and base assets, and buy or sell a token that was not launched on Candle. Each trade pays the plan's agent fee on top; a base-pair swap or a bridge between this key's own wallets pays none. candle plans shows the fees in force. With --dry-run, stdout reports per-check results and the quote; nothing is signed or sent. Otherwise with --json, stdout is one JSON value: swaps, trades, replays and job status reads carry kind, status, clientTradeId, signature (the primary transaction, or null), signatures (a list) and raw (the original response); Hood --wait and explicit --operation reads return the operation response. Every human line is on stderr. The keys older versions printed stay beside them.",
     usage: [
       "candle swap <from> <to> [flags]",
       "candle swap status <id>",
@@ -301,9 +301,9 @@ export const HELP: Record<string, Topic> = {
         description: "Quote, confirm and swap on Solana or Hood, or bridge between them",
       },
       {
-        invocation: "status <id> [--kind trade|swap|launch] [--wait] | status --operation <operationId>",
+        invocation: "status <id> [--kind trade|swap|launch] [--wait] | status --operation <operationId> [--wait]",
         description:
-          "Read without resending; --wait follows a bridge. --operation reads a Hood TEE guard with no signing or sending, and exits 3 while held",
+          "Read without resending; --wait follows a bridge. --operation reads a Hood TEE guard; add --wait to follow all legs for up to ten minutes (0 completed, 1 failed, 3 partial or unresolved)",
       },
       {
         invocation: "recover --operation <operationId> [--hash <0x…>]",
@@ -1224,9 +1224,13 @@ export const HELP: Record<string, Topic> = {
       },
       {
         invocation: "stop <prefix|label>",
-        description: "Pause one key with the device token; reversible with keys resume",
+        description: "Pause one key with the device token (starting it again is done in the signed-in console)",
       },
-      { invocation: "resume <prefix|label>", description: "Resume a stopped key with the device token" },
+      {
+        invocation: "resume <prefix|label>",
+        description:
+          "Resume a stopped key in the signed-in console, because the server refuses a device token here (LOOSEN_REQUIRES_SESSION)",
+      },
       {
         invocation: "rotate <prefix|label> ([--grace <duration> | --now] [--force] [--yes] | --finish)",
         description:
@@ -1331,7 +1335,7 @@ export const HELP: Record<string, Topic> = {
         invocation:
           "close-empty [--wallet embedded|<tee address|label>] [--keep <mint>]... [--client-trade-id <id>] [--preview] [--yes]",
         description:
-          "Close a wallet's empty token accounts and return their rent to it, after a preview: the embedded wallet (transfer:write), or a TEE wallet bound to this key, signed by its key signer (swap:write). --preview prints what would close (one JSON document on stdout under --json) and closes nothing",
+          "Close a wallet's empty token accounts and return their rent to it, after a preview: the embedded wallet (swap:write or transfer:write), or a TEE wallet bound to this key, signed by its key signer (swap:write). --preview prints what would close (one JSON document on stdout under --json) and closes nothing",
       },
     ],
     flags: [
@@ -1577,9 +1581,10 @@ export const HELP: Record<string, Topic> = {
     usage: ["candle tee <subcommand> [flags]"],
     rows: [
       {
-        invocation: "check <address|id|label>... [--label-prefix <p>] [--sign] [--max <n>] [--rpc-url <url>]",
+        invocation:
+          "check <address|id|label>... [--label-prefix <p>] [--chain solana|hood] [--sign] [--max <n>] [--rpc-url <url>]",
         description:
-          "Check payable membership, record parity and this machine's signer without spending. --sign builds a tiny SOL/USDC quote, checks spend, signs and simulates; never broadcasts (default cap 10). Needs swap:write",
+          "Check payable membership, record parity and this machine's signer without spending. Each wallet is checked on its own chain; --chain checks every wallet against one chain (CHAIN_MISMATCH otherwise). --sign builds a tiny SOL/USDC quote on a Solana wallet, checks spend, signs and simulates; never broadcasts (default cap 10). A Hood wallet skips sign: a Hood build holds the wallet. Needs swap:write",
       },
       {
         invocation: "new [--label <name>]",
@@ -1656,6 +1661,7 @@ export const HELP: Record<string, Topic> = {
     examples: [
       "candle tee check --label-prefix pool- --json",
       "candle tee check AgentOne --sign --rpc-url <url>",
+      "candle tee check hood-1 --chain hood --json",
       "candle tee new --label AgentOne",
       "candle tee status AgentOneAddress",
       "candle tee sweep AgentOneAddress",

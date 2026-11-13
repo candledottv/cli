@@ -37,6 +37,7 @@ import {
   toChecksumAddress,
 } from "../evm-lite"
 import { hoodFeeTreasury, hoodTradeLegCheck, registeredCurveFor } from "../hood-legs"
+import { waitForHoodOperation } from "../hood-operation-wait"
 import { writeFields } from "../human-output"
 import { notice as outputNotice } from "../presentation"
 import { apiKeyPrefix } from "../profiles"
@@ -44,6 +45,7 @@ import { writeLocalFailure, writeUsageFailure } from "../render"
 import { describeRpcFailure, type SolanaClient } from "../solana-endpoint"
 import { isRateLimited, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "../solana-lite"
 import { solanaSpendProblem } from "../solana-verify"
+import { terminalLines } from "../terminal-text"
 import {
   BASES,
   baseAsset,
@@ -264,7 +266,9 @@ export function printTradingResult(ctx: CommandContext, result: Json): number {
     describeSwapEvidence(ctx, job, job.status === "failed")
   }
   const printed = ctx.json && (result.kind === "swap" || result.kind === "trade") ? swapJsonResult(result) : result
-  ctx.deps.stdout.write(ctx.json ? `${JSON.stringify(printed)}\n` : `${JSON.stringify(result, null, 2)}\n`)
+  ctx.deps.stdout.write(
+    ctx.json ? `${JSON.stringify(printed)}\n` : `${terminalLines(JSON.stringify(result, null, 2))}\n`,
+  )
   const job = result.job as Json | undefined
   const operation = job?.operation as Json | undefined
   return (operation?.guard as Json | undefined)?.recoveryRequired === true ||
@@ -368,11 +372,11 @@ export async function lookupOperation(
 export async function swapStatus(args: string[], ctx: CommandContext): Promise<number> {
   const parsed = parseArgs(args, { valueFlags: ["--kind", "--operation"], booleanFlags: ["--wait"] })
   if (!("error" in parsed) && parsed.values["--operation"] !== undefined) {
-    if (parsed.positionals.length || parsed.values["--kind"] || parsed.booleans.has("--wait")) {
-      writeUsageFailure(ctx.deps, "Usage: candle swap status --operation <operationId>", ctx.json)
+    if (parsed.positionals.length || parsed.values["--kind"]) {
+      writeUsageFailure(ctx.deps, "Usage: candle swap status --operation <operationId> [--wait]", ctx.json)
       return 2
     }
-    return hoodOperationRead(ctx, parsed.values["--operation"])
+    return hoodOperationRead(ctx, parsed.values["--operation"], undefined, false, parsed.booleans.has("--wait"))
   }
   if (
     "error" in parsed ||
@@ -488,7 +492,7 @@ export async function swapReceipt(args: string[], ctx: CommandContext): Promise<
       return 1
     }
     describeReceipt(ctx, body, answer.job)
-    ctx.deps.stdout.write(ctx.json ? `${JSON.stringify(body)}\n` : `${JSON.stringify(body, null, 2)}\n`)
+    ctx.deps.stdout.write(ctx.json ? `${JSON.stringify(body)}\n` : `${terminalLines(JSON.stringify(body, null, 2))}\n`)
     return 0
   } catch (error) {
     return tradingFailure(ctx, error)
@@ -499,7 +503,7 @@ export async function swapReceipt(args: string[], ctx: CommandContext): Promise<
 function describeReceipt(ctx: CommandContext, body: Json, job: Json | undefined): void {
   const settlement = body.settlement
   if (settlement === null || typeof settlement !== "object") {
-    if (typeof body.next === "string") ctx.deps.stderr.write(`${body.next}\n`)
+    if (typeof body.next === "string") ctx.deps.stderr.write(`${terminalLines(body.next)}\n`)
     return
   }
   const { state, settledOutRaw, bridgeStatus } = settlement as Json
@@ -685,7 +689,7 @@ export async function swap(args: string[], ctx: CommandContext): Promise<number>
     const fromAsset = classifyAsset(parsed.positionals[0] as string)
     const toAsset = classifyAsset(parsed.positionals[1] as string)
     // Ember 4c (R1): a base asset on each chain is a bridge. Every other cross-chain pair is still
-    // CHAIN_MISMATCH below, and --to and --wait mean nothing on a same-chain swap.
+    // CHAIN_MISMATCH below. --to only selects a bridge destination.
     const bridge = bridgePair(fromAsset, toAsset)
     if (bridge)
       return await bridgeSwap(ctx, {
@@ -696,14 +700,16 @@ export async function swap(args: string[], ctx: CommandContext): Promise<number>
         slippage,
         ...bridge,
       })
-    if (flags["--to"] !== undefined || parsed.booleans.has("--wait"))
-      throw new TradingUsage("--to and --wait are for a bridge: SOL or USDC to ETH or USDG, or back.")
+    const unsupportedWait =
+      "--to is for a bridge: SOL or USDC to ETH or USDG, or back. --wait follows a bridge or a Hood TEE swap. Follow a Hood swap with candle swap status --operation <id>; use candle swap status <client-trade-id> for a job."
+    if (flags["--to"] !== undefined) throw new TradingUsage(unsupportedWait)
     const chain = pairChain(fromAsset, toAsset)
     const walletFlag = flags["--wallet"]
     const named = walletFlag === undefined ? undefined : walletNameChain(walletFlag)
     if (named !== undefined && named !== chain) throw chainMismatch(`--wallet ${safeText(walletFlag)}`, named, chain)
     if (chain === "hood")
       return await hoodSwap(ctx, {
+        wait: parsed.booleans.has("--wait"),
         flags,
         yes: parsed.booleans.has("--yes"),
         id,
@@ -711,6 +717,7 @@ export async function swap(args: string[], ctx: CommandContext): Promise<number>
         from: fromAsset,
         to: toAsset,
       })
+    if (parsed.booleans.has("--wait")) throw new TradingUsage(unsupportedWait)
     const from = fromAsset.asset
     const to = toAsset.asset
     if (from === to) throw new TradingError("PAIR_UNSUPPORTED", "Choose two distinct assets.")
@@ -1029,6 +1036,7 @@ async function hoodSwap(
   args: {
     flags: Record<string, string>
     yes: boolean
+    wait: boolean
     id: string
     slippage: number
     from: TradeAsset
@@ -1052,8 +1060,21 @@ async function hoodSwap(
   const kind: OperationKind = from.base && to.base ? "swap" : "trade"
   const key = await tradingKey(ctx)
   const prior = await lookupOperation(ctx, key, id, kind)
-  if (prior) return printTradingResult(ctx, prior)
+  const replay = async (result: Json): Promise<number> => {
+    if (!args.wait) return printTradingResult(ctx, result)
+    const operation = (result.job as Json | undefined)?.operation as Json | undefined
+    if (typeof operation?.operationId !== "string")
+      throw new TradingUsage(
+        `No Hood TEE operationId is available. Follow with candle swap status ${id}; a Hood TEE swap uses candle swap status --operation <id>.`,
+      )
+    return waitForHoodOperation(ctx, key, operation.operationId)
+  }
+  if (prior) return replay(prior)
   const payer = await tradingPayer(ctx, key, flags["--wallet"], "swap:write", "hood")
+  if (args.wait && payer.kind !== "tee")
+    throw new TradingUsage(
+      `--wait follows a bridge or a Hood TEE swap. Follow this swap with candle swap status ${id}; a Hood TEE swap uses candle swap status --operation <id>.`,
+    )
   const payerAddress = payer.kind === "tee" ? payer.wallet.address : payer.address
   const rpc = lazyEvmRpc(ctx, flags["--rpc-url"])
   const decimals = await hoodDecimals(from, rpc)
@@ -1097,7 +1118,7 @@ async function hoodSwap(
           payer: payerBody,
           ...(payer.kind === "embedded" ? { deferExecution: true } : {}),
         })
-  if (built.job || built.status === "executed") return printTradingResult(ctx, { ...built, clientTradeId: id, kind })
+  if (built.job || built.status === "executed") return replay({ ...built, clientTradeId: id, kind })
   const body = (kind === "swap" ? built.payload : built) as Json | undefined
   const data = swapBuildSchema.parse(body)
   const echoed = kind === "swap" ? body?.recipient : body?.walletAddress
@@ -1215,21 +1236,31 @@ async function hoodSwap(
     treasury: () => hoodFeeTreasury(rpc()),
     curve: () => registeredCurveFor(rpc(), token),
   })
-  const run = await runSequencedLegs(ctx, key, {
-    wallet,
-    first: sequenced,
-    submitPath: kind === "swap" ? "/api/v1/agent/swap/submit" : "/api/v1/trade/agent/submit",
-    submitFields: kind === "swap" ? { clientTradeId: id, swapId: data.swapId } : { clientTradeId: id },
-    unwrap: (answer) => (kind === "swap" ? ((answer.payload ?? {}) as Json) : answer),
-    clientId: id,
-    kind,
-    allowedLegs: HOOD_TRADE_LEGS,
-    checkLeg,
-    onLanded: async (_leg: LandedLeg) => {
-      const notice = await recordTradedToken(ctx, wallet.address, toChecksumAddress(recorded))
-      if (notice) notices.push(notice)
-    },
-  })
+  const execute = () =>
+    runSequencedLegs(ctx, key, {
+      wallet,
+      first: sequenced,
+      submitPath: kind === "swap" ? "/api/v1/agent/swap/submit" : "/api/v1/trade/agent/submit",
+      submitFields: kind === "swap" ? { clientTradeId: id, swapId: data.swapId } : { clientTradeId: id },
+      unwrap: (answer) => (kind === "swap" ? ((answer.payload ?? {}) as Json) : answer),
+      clientId: id,
+      kind,
+      allowedLegs: HOOD_TRADE_LEGS,
+      checkLeg,
+      onLanded: async (_leg: LandedLeg) => {
+        const notice = await recordTradedToken(ctx, wallet.address, toChecksumAddress(recorded))
+        if (notice) notices.push(notice)
+      },
+    })
+  let run: Awaited<ReturnType<typeof execute>>
+  try {
+    run = await execute()
+  } catch (error) {
+    if (args.wait && error instanceof TradingError && (error.exitCode === 3 || error.details?.stage === "reverted"))
+      return waitForHoodOperation(ctx, key, sequenced.operationId, error.details)
+    throw error
+  }
+  if (args.wait) return waitForHoodOperation(ctx, key, sequenced.operationId)
   // BE-505 (R8.4): the Hood sequenced `completed` payload carries `settlement` itself.
   const settled =
     kind === "swap" ? reportSettlement(ctx, run.final.settlement, { asset: to.asset, decimals: outDecimals }, id) : {}
@@ -1614,6 +1645,7 @@ async function hoodOperationRead(
   id: string,
   candidateHash?: string,
   recover = false,
+  wait = false,
 ): Promise<number> {
   if (!validClientId(id)) {
     writeUsageFailure(ctx.deps, "An operationId is required", ctx.json)
@@ -1621,11 +1653,13 @@ async function hoodOperationRead(
   }
   try {
     const key = await tradingKey(ctx)
+    if (wait) return await waitForHoodOperation(ctx, key, id)
     const path = `/api/v1/agent/hood-tee/operations/${encodeURIComponent(id)}${recover ? "/recover" : ""}`
     const result = await request(ctx, key, path, recover ? (candidateHash ? { candidateHash } : {}) : undefined)
     const operation = result.operation as Json | undefined
     const guard = operation?.guard as Json | undefined
-    ctx.deps.stdout.write(`${JSON.stringify(result, null, ctx.json ? undefined : 2)}\n`)
+    const output = JSON.stringify(result, null, ctx.json ? undefined : 2)
+    ctx.deps.stdout.write(`${ctx.json ? output : terminalLines(output)}\n`)
     if (guard)
       ctx.deps.stderr.write(
         `${safeText(guard.reason)}: ${safeText(guard.clearingCondition)} Read: candle swap status --operation ${id}.\n`,
