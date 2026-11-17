@@ -50,7 +50,7 @@ import { keysWallets } from "./commands/keys-wallets"
 import { labEdges, labReplay, labRunners, labStatus } from "./commands/lab"
 import { launch } from "./commands/launch"
 import { launchStatus } from "./commands/launch-status"
-import { lpAdd, lpClaim, lpPools, lpPositions, lpRemove } from "./commands/lp"
+import { lpAdd, lpClaim, lpPools, lpPositions, lpRemove, lpStatus } from "./commands/lp"
 import { mcp, mcpActsAsIdentity } from "./commands/mcp"
 import {
   perpsCancel,
@@ -87,9 +87,10 @@ import { scan } from "./commands/scan"
 import { secretsList, secretsRemove, secretsSet } from "./commands/secrets"
 import { setup } from "./commands/setup"
 import { sign, signMessage } from "./commands/sign"
+import { signalsRecord, signalsRecords, signalsScorecard } from "./commands/signals"
 import { spendLimit, spendMaxPerCall, spendPause, spendResume, spendShow } from "./commands/spend"
 import { stake, stakeAdd, stakeClaim, stakeFinish, stakeRemove } from "./commands/stake"
-import { swap, swapReceipt, swapRecover, swapStatus } from "./commands/swap"
+import { swap, swapCancel, swapReceipt, swapRecover, swapStatus } from "./commands/swap"
 import { teeDisable, teeEnable, teeFund, teeNew, teeStatus, teeSweep } from "./commands/tee"
 import { teeRebind, teeRebinds } from "./commands/tee-rebind"
 import { teeRename } from "./commands/tee-rename"
@@ -259,7 +260,10 @@ interface CommandRoute {
 const COMMANDS: Record<string, CommandRoute> = {
   stake: { bare: stake, subcommands: { add: stakeAdd, remove: stakeRemove, finish: stakeFinish, claim: stakeClaim } },
   // BE-3140 (R97): `receipt` re-reads a one-shot swap's settlement (one made through MCP or the SDK).
-  swap: { bare: swap, subcommands: { status: swapStatus, recover: swapRecover, receipt: swapReceipt } },
+  swap: {
+    bare: swap,
+    subcommands: { status: swapStatus, recover: swapRecover, receipt: swapReceipt, cancel: swapCancel },
+  },
   // Transfer (BE-332 PR C): move funds out of a TEE wallet through its bound key, to
   // the account's own wallets or the wallet's vault. Server-built, relay-signed, never a vault key.
   transfer: { bare: transfer },
@@ -319,6 +323,8 @@ const COMMANDS: Record<string, CommandRoute> = {
   // x402 C4 (spec 7.3): Quant's terms over the key route, which a paid Quant turn needs first.
   quant: { subcommands: { ask: quantAsk, terms: quantTerms } },
   lab: { subcommands: { status: labStatus, replay: labReplay, runners: labRunners, edges: labEdges } },
+  // BE-3411 (hacc north-star CL1): hacc's public scorecard and signal records. Read-only GETs.
+  signals: { subcommands: { scorecard: signalsScorecard, records: signalsRecords, record: signalsRecord } },
   // x402 C7 (BE-1878): Pro or Max by x402 from a vault key, the wallet-as-identity signup, and the
   // local auto-renew flag. Plan payments are outside the per-use limits (spec 10.3).
   plan: {
@@ -326,7 +332,16 @@ const COMMANDS: Record<string, CommandRoute> = {
   },
   // Ember Phase 3 PR D (BE-315, R4): Meteora DAMM v2 liquidity from a TEE wallet, on the agent
   // rail under the bound key's opt-in `lp:write`. Server-built, relay-signed, never a vault key.
-  lp: { subcommands: { pools: lpPools, add: lpAdd, positions: lpPositions, remove: lpRemove, claim: lpClaim } },
+  lp: {
+    subcommands: {
+      pools: lpPools,
+      add: lpAdd,
+      positions: lpPositions,
+      remove: lpRemove,
+      claim: lpClaim,
+      status: lpStatus,
+    },
+  },
   // Hyperliquid perps B (BE-646): perpetuals from the key's EVM TEE wallet under the bound key's
   // opt-in `perps:write`. Server-built, checked here before signing, relay-signed, submitted here.
   perps: {

@@ -56,6 +56,23 @@ test("TEE diagnostics document signing and dry-run restrictions", () => {
   expect(HELP.swap?.flags?.find((r) => r.invocation === "--dry-run")?.description).toContain("Never signs")
 })
 
+test("Hood CLI README says what staging does: tee check, --wait, preview, swap cancel, dry run (BE-3364)", () => {
+  // The docs site page is pinned in apps/docs/hood-cli-docs.test.ts; the CLI mirror does not carry apps/.
+  const readme = readFileSync(join(import.meta.dir, "../README.md"), "utf8")
+  expect(readme).toContain("[--chain solana\\|hood]")
+  expect(readme).toContain("tee check` never takes a Hood wallet lock")
+  expect(readme).toContain("swap status --operation <operationId> [--wait]")
+  expect(readme).toContain("the quote is a read-only preview and the operation is built only after you confirm")
+  expect(readme).toContain("`QUOTE_MOVED`")
+  expect(readme).toContain("| `candle swap cancel --operation <operationId>` |")
+  expect(readme).toContain("On a Hood TEE swap and on every bridge pair it reads Candle's previews only")
+  // The pre-BE-3369/BE-3363 wording must not come back.
+  expect(readme).not.toContain("still holds the wallet for 30 minutes")
+  expect(readme).not.toContain("refuses embedded, Hood and bridge payers")
+  // The help documents the same command the README does.
+  expect(documentedSubcommands(HELP.swap as Topic)).toContain("cancel")
+})
+
 describe("the help data stays in step with dispatch", () => {
   test("lab help and completion expose the four routed operations and hacc override", () => {
     const topic = HELP.lab as Topic
@@ -80,6 +97,16 @@ describe("the help data stays in step with dispatch", () => {
     expect(topic.env).toContain("CANDLE_HACC_URL")
     expect(ENVIRONMENT.find((e) => e.name === "CANDLE_HACC_URL")?.description).toContain("HTTPS only")
     expect(topic.description).toContain("The lab never trades")
+  })
+
+  test("signals help documents the three read-only records reads, the fixed line and hacc override (BE-3411)", () => {
+    const topic = HELP.signals as Topic
+    expect(documentedSubcommands(topic)).toEqual(["scorecard", "records", "record"])
+    expect(documentedFlags(topic)).toEqual(expect.arrayContaining(["--date", "--source", "--before", "--limit"]))
+    expect(topic.description).toContain('"Measured record, not a forecast."')
+    expect(topic.description).toContain("Read-only")
+    expect(topic.env).toContain("CANDLE_HACC_URL")
+    expect(ENVIRONMENT.find((e) => e.name === "CANDLE_HACC_URL")?.description).toContain("signal records")
   })
 
   test("T1: every routed word has a topic, and every topic routes", () => {

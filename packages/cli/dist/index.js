@@ -778,7 +778,7 @@ var init_terminal_theme = __esm(() => {
 });
 
 // src/version.ts
-var CLI_VERSION = "0.13.25";
+var CLI_VERSION = "0.13.26";
 
 // src/presentation.ts
 function terminalStyle(deps, stream, machine = false) {
@@ -6553,6 +6553,41 @@ var init_launch_definition = __esm(() => {
       eth: 18,
       usdg: 6
     },
+    quoteSelection: {
+      flag: "--quote",
+      key: "quote",
+      checkKey: "check",
+      checkHelp: "Read launch paths and quote admission without uploading, building, signing or sending. No name, image or launch id is needed. Pass check or dryRun, never both. Admission is separate from executionEnabled; a successful check does not enable a new quote.",
+      value: "<symbol|address>",
+      help: "Select a quote by featured symbol or token address. With --check, show admission checks, curve figures, graduation raise and issuer disclosure. New quotes require server launch support; --quote-asset remains supported for fixed pairs.",
+      fixedPairs: [
+        {
+          id: "sol",
+          address: "So11111111111111111111111111111111111111112",
+          chain: "solana"
+        },
+        {
+          id: "usdc",
+          address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+          chain: "solana"
+        },
+        {
+          id: "cndl",
+          address: "9dXSV8VWuYvGfTzqvkBeoFwH9ihVTybDuWo5VaJPCNDL",
+          chain: "solana"
+        },
+        {
+          id: "eth",
+          address: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+          chain: "hood"
+        },
+        {
+          id: "usdg",
+          address: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+          chain: "hood"
+        }
+      ]
+    },
     quoteChains: {
       sol: "solana",
       usdc: "solana",
@@ -7498,6 +7533,159 @@ var init_launch_definition = __esm(() => {
   };
 });
 
+// ../mcp/src/launch-preflight.ts
+function fixedLaunchQuote(input) {
+  if (input.quote === undefined)
+    return input.quoteAsset;
+  if (typeof input.quote !== "string" || !input.quote.trim() || input.quote.trim().length > 120)
+    throw new LaunchCheckError("VALIDATION_FAILED", "quote needs a symbol or token address.", "quote");
+  if (input.quoteAsset !== undefined)
+    throw new LaunchCheckError("VALIDATION_FAILED", "Pass quote or quoteAsset, never both.", "quote");
+  const value = input.quote.trim();
+  const pair = LAUNCH_DEFINITION.quoteSelection.fixedPairs.find((p) => p.id === value.toLowerCase() || p.address === value || p.chain === "hood" && p.address.toLowerCase() === value.toLowerCase());
+  if (!pair)
+    throw new LaunchCheckError("QUOTE_LAUNCH_UNAVAILABLE", "New-quote execution is unavailable. Use check: true for admission and economics only.", "quote");
+  if (input.chain !== undefined && input.chain !== pair.chain)
+    throw new LaunchCheckError("CHAIN_MISMATCH", "The quote disagrees with the launch chain.", "quote");
+  return pair.id;
+}
+function launchCheckPath(input) {
+  if (input.dryRun)
+    throw new LaunchCheckError("VALIDATION_FAILED", "Pass check or dryRun, never both.", "check");
+  if (input.quote !== undefined && input.quoteAsset !== undefined)
+    throw new LaunchCheckError("VALIDATION_FAILED", "Pass quote or quoteAsset, never both.", "quote");
+  const query2 = new URLSearchParams;
+  if (input.quote !== undefined) {
+    if (typeof input.quote !== "string" || !input.quote.trim() || input.quote.trim().length > 120)
+      throw new LaunchCheckError("VALIDATION_FAILED", "quote needs a symbol or token address.", "quote");
+    query2.set("quote", input.quote.trim());
+    for (const key of ["chain", "mode", "stakerAllocationBps", "dexVersion"])
+      if (input[key] !== undefined)
+        query2.set(key, String(input[key]));
+  }
+  return `/api/v1/launch/preflight${query2.size ? `?${query2}` : ""}`;
+}
+function object(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function readLaunchCheck(value, input) {
+  const fail2 = (message) => {
+    throw new LaunchCheckError("QUOTE_CHECK_UNAVAILABLE", message);
+  };
+  if (!object(value) || value.success !== true || !object(value.key) || !object(value.switches) || !Array.isArray(value.wallets))
+    return fail2("The server returned an invalid launch preflight.");
+  const { key, switches } = value;
+  if (typeof key.keyPrefix !== "string" || typeof key.tier !== "string" || !Array.isArray(key.scopes) || !key.scopes.every((s) => typeof s === "string") || typeof key.selfLaunch !== "boolean" || !["allowed", "denied"].includes(String(key.embeddedWalletPermission)) || ["headlessLaunch", "agentTrading", "teeLaunchBuys"].some((k) => typeof switches[k] !== "boolean"))
+    return fail2("The server returned incomplete launch permissions.");
+  for (const wallet of value.wallets)
+    if (!object(wallet) || ["id", "address", "chain"].some((k) => typeof wallet[k] !== "string") || !(wallet.label === null || typeof wallet.label === "string") || typeof wallet.allowLaunch !== "boolean" || typeof wallet.active !== "boolean")
+      return fail2("The server returned an invalid launch wallet.");
+  if (value.embedded !== undefined) {
+    if (!object(value.embedded))
+      return fail2("The server returned invalid embedded wallets.");
+    for (const chain2 of ["solana", "evm"]) {
+      const wallet = value.embedded[chain2];
+      if (wallet != null && (!object(wallet) || typeof wallet.address !== "string" || wallet.delegated !== undefined && typeof wallet.delegated !== "boolean"))
+        return fail2("The server returned an invalid embedded wallet.");
+    }
+  }
+  const q = value.quote;
+  if (input.quote !== undefined) {
+    if (!object(q) || q.requested !== input.quote.trim() || typeof q.ok !== "boolean" || typeof q.executionEnabled !== "boolean" || !(q.disclosure === null || typeof q.disclosure === "string") || !Array.isArray(q.checks) || q.checks.length === 0 || q.checks.some((c) => !object(c) || typeof c.check !== "string" || typeof c.message !== "string" || !["pass", "skip", "refuse"].includes(String(c.status)) || c.code !== undefined && typeof c.code !== "string") || q.chain !== undefined && q.chain !== "solana" && q.chain !== "hood" || ["address", "symbol"].some((k) => q[k] !== undefined && typeof q[k] !== "string") || q.decimals !== undefined && (!Number.isInteger(q.decimals) || Number(q.decimals) < 0 || Number(q.decimals) > 255) || q.classification !== undefined && !["ordinary", "featured", "trusted", "stock"].includes(String(q.classification)))
+      return fail2("The server did not return a valid check for the requested quote.");
+    const e = q.economics;
+    if (e !== undefined && (!object(e) || !["fixed", "derived"].includes(String(e.kind)) || typeof e.economicsDigest !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(e.economicsDigest) || !raw(e.thresholdRaw) || !positive(e.startFdv) || !positive(e.bondingFdv) || !object(e.curve) || !Object.values(e.curve).every(raw) || e.priceUsd !== undefined && !positive(e.priceUsd) || e.raiseUsd !== undefined && !positive(e.raiseUsd)))
+      return fail2("The server returned invalid quote economics.");
+    const refused = q.checks.some((c) => c.status === "refuse");
+    if (q.ok && (!e || !q.chain || !q.address || q.decimals === undefined || refused) || !q.ok && !refused)
+      return fail2("The server returned contradictory quote admission.");
+    if (input.chain && q.chain && input.chain !== q.chain)
+      throw new LaunchCheckError("CHAIN_MISMATCH", "The checked quote disagrees with the launch chain.");
+  }
+  const answer = value;
+  const chain = input.chain ?? answer.quote?.chain;
+  const embeddedOnly = input.wallet !== undefined && LAUNCH_DEFINITION.wallet.embeddedNames.includes(input.wallet);
+  const named = input.wallet === undefined || embeddedOnly ? answer.wallets : answer.wallets.filter((w) => w.id === input.wallet || w.address === input.wallet || w.label === input.wallet);
+  if (input.wallet !== undefined && !embeddedOnly && named.length !== 1)
+    throw new LaunchCheckError("TEE_WALLET_REQUIRED", "Name exactly one bound TEE wallet by id, address or label.", "wallet");
+  const embedded = (chain ? [chain] : ["solana", "hood"]).some((c) => {
+    const wallet = c === "solana" ? answer.embedded?.solana : answer.embedded?.evm;
+    return wallet != null && wallet.delegated !== false;
+  });
+  const walletWorks = key.scopes.includes("launch:write") && switches.headlessLaunch === true && ((input.wallet === undefined || embeddedOnly) && key.embeddedWalletPermission === "allowed" && embedded || !embeddedOnly && key.selfLaunch === true && named.some((w) => w.active && w.allowLaunch && (!chain || (w.chain === "evm" ? "hood" : w.chain) === chain)));
+  return {
+    ...answer,
+    check: true,
+    walletWorks,
+    works: walletWorks && (input.quote === undefined || answer.quote?.ok === true)
+  };
+}
+var LaunchCheckError, positive = (value) => typeof value === "number" && Number.isFinite(value) && value > 0, raw = (value) => typeof value === "string" && /^\d+$/.test(value);
+var init_launch_preflight = __esm(() => {
+  init_launch_definition();
+  LaunchCheckError = class LaunchCheckError extends Error {
+    code;
+    field;
+    constructor(code, message, field) {
+      super(message);
+      this.code = code;
+      this.field = field;
+    }
+  };
+});
+
+// ../mcp/src/launch-check.ts
+async function launchCheck(args, cfg, fetch2) {
+  try {
+    if (!cfg.apiKey)
+      throw new LaunchCheckError("UNAUTHORIZED", "An API key is required for launch checks.");
+    const input = args;
+    const path = launchCheckPath(input);
+    const response = await fetch2(`${cfg.apiUrl.replace(/\/$/, "")}${path}`, {
+      method: "GET",
+      headers: { "x-api-key": cfg.apiKey }
+    });
+    const text = await response.text();
+    if (!response.ok)
+      return { content: [{ type: "text", text }], isError: true };
+    const result2 = readLaunchCheck(JSON.parse(text), { ...input, wallet: "embedded" });
+    return {
+      content: [{ type: "text", text: JSON.stringify(result2) }],
+      ...!result2.works ? { isError: true } : {}
+    };
+  } catch (error) {
+    return launchControlError(error);
+  }
+}
+function launchControlError(error) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          success: false,
+          error: {
+            code: error instanceof LaunchCheckError ? error.code : "QUOTE_CHECK_UNAVAILABLE",
+            message: error instanceof Error ? error.message : "Launch check unavailable.",
+            ...error instanceof LaunchCheckError && error.field ? { field: error.field } : {}
+          }
+        })
+      }
+    ],
+    isError: true
+  };
+}
+function launchExecutionArgs(args) {
+  const { quote, check: _check, ...body } = args;
+  const quoteAsset = fixedLaunchQuote({ quote, quoteAsset: args.quoteAsset, chain: args.chain });
+  const chain = quote === undefined || body.chain !== undefined ? body.chain : LAUNCH_DEFINITION.quoteChains[quoteAsset];
+  return { ...body, ...quoteAsset === undefined ? {} : { quoteAsset }, ...chain === undefined ? {} : { chain } };
+}
+var init_launch_check = __esm(() => {
+  init_launch_definition();
+  init_launch_preflight();
+});
+
 // ../mcp/src/launch-schema.ts
 function mcpKey(field) {
   const surface = field.surfaces.mcp;
@@ -7648,6 +7836,8 @@ function scalarSchema(field) {
 }
 function buildLaunchTokenShape() {
   const shape = {};
+  shape[LAUNCH_DEFINITION.quoteSelection.key] = exports_external.string().optional().describe(LAUNCH_DEFINITION.quoteSelection.help);
+  shape[LAUNCH_DEFINITION.quoteSelection.checkKey] = exports_external.boolean().optional().describe(LAUNCH_DEFINITION.quoteSelection.checkHelp);
   for (const field of mcpLaunchFields()) {
     const key = mcpKey(field);
     if (!key)
@@ -7664,13 +7854,24 @@ function buildLaunchTokenShape() {
   shape.buyAmount = exports_external.union([exports_external.string(), exports_external.number()]).optional().describe(BUY_AMOUNT_DESCRIPTION);
   return shape;
 }
-var M2_TOP_KEYS, GROUPED_TOP_KEYS, LAUNCH_SHARED_SENTENCES, SOCIAL_KEYS, SOCIALS_ONLY, BUY_AMOUNT_DESCRIPTION = "Initial buy, in quote base units (string or number)", DEV_BUY_DESCRIPTION, launchTokenShape, launchAndSeedShape;
+function checkableLaunchShape(shape) {
+  return Object.fromEntries(Object.entries(shape).map(([key, value]) => [key, value.optional().describe(value.description ?? "")]));
+}
+var M2_TOP_KEYS, GROUPED_TOP_KEYS, MCP_QUOTE_CONTROL_KEYS, LAUNCH_SHARED_SENTENCES, SOCIAL_KEYS, SOCIALS_ONLY, BUY_AMOUNT_DESCRIPTION = "Initial buy, in quote base units (string or number)", DEV_BUY_DESCRIPTION, launchTokenShape, launchAndSeedShape;
 var init_launch_schema = __esm(() => {
   init_zod();
   init_launch_definition();
   M2_TOP_KEYS = new Set(["wallet", "buy", "feeWallet", "feeWalletMultisig"]);
   GROUPED_TOP_KEYS = new Set(["socials", "curve", "poolFee", "launchRules"]);
-  LAUNCH_SHARED_SENTENCES = mcpLaunchFields().map((field) => field.help).join(" ");
+  MCP_QUOTE_CONTROL_KEYS = [
+    LAUNCH_DEFINITION.quoteSelection.key,
+    LAUNCH_DEFINITION.quoteSelection.checkKey
+  ];
+  LAUNCH_SHARED_SENTENCES = [
+    ...mcpLaunchFields().map((field) => field.help),
+    LAUNCH_DEFINITION.quoteSelection.help,
+    LAUNCH_DEFINITION.quoteSelection.checkHelp
+  ].join(" ");
   SOCIAL_KEYS = mcpLaunchFields().flatMap((field) => {
     const key = mcpKey(field);
     return key?.startsWith("socials.") ? [key.slice("socials.".length)] : [];
@@ -8961,10 +9162,10 @@ function actionShapeProblem(action) {
   const orders = action.type === "order" ? action.orders : action.type === "modify" ? [action.order] : [];
   if (!Array.isArray(orders))
     return "invalid orders";
-  for (const raw of orders) {
-    if (!exactKeys(raw, ["a", "b", "p", "s", "r", "t"], ["c"]))
+  for (const raw2 of orders) {
+    if (!exactKeys(raw2, ["a", "b", "p", "s", "r", "t"], ["c"]))
       return "an order carries unexpected or missing fields";
-    const o = raw;
+    const o = raw2;
     const t = o.t;
     const limit = exactKeys(t, ["limit"]) && exactKeys(t.limit, ["tif"]);
     const trigger = exactKeys(t, ["trigger"]) && exactKeys(t.trigger, ["isMarket", "triggerPx", "tpsl"]);
@@ -8997,10 +9198,10 @@ function checkActionIntent(action, opts) {
   const orderList = action.type === "order" ? action.orders : action.type === "modify" ? [action.order] : [];
   if (!Array.isArray(orderList))
     return "invalid orders";
-  for (const raw of orderList) {
-    if (!raw || typeof raw !== "object")
+  for (const raw2 of orderList) {
+    if (!raw2 || typeof raw2 !== "object")
       return "invalid order";
-    const o = raw;
+    const o = raw2;
     if (!mainAsset(o.a))
       return "order asset is outside the main perp universe";
     if (typeof o.b !== "boolean" || typeof o.r !== "boolean" || (decimal(o.s) ?? 0n) <= 0n || (decimal(o.p) ?? 0n) <= 0n)
@@ -9463,8 +9664,8 @@ async function hyperliquidWalletSnapshot(fetcher, network, address, now = Date.n
   if (!Array.isArray(open2))
     throw new Error("Hyperliquid returned an unreadable order list");
   const orders = [];
-  for (const raw of open2) {
-    const o = raw;
+  for (const raw2 of open2) {
+    const o = raw2;
     const coin = o?.coin;
     if (typeof coin !== "string") {
       unsupported.push("an unreadable order");
@@ -9635,6 +9836,16 @@ function hyperliquidExchangeBody(action, nonce, signature) {
 }
 function hyperliquidRelayBody(typedData) {
   return { method: "eth_signTypedData_v4", params: { typed_data: typedData } };
+}
+function hyperliquidSignatureHex(value) {
+  if (typeof value === "string") {
+    hyperliquidSplitSignature(value);
+    return value;
+  }
+  const sig = value;
+  if (!sig || typeof sig.r !== "string" || typeof sig.s !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(sig.r) || !/^0x[0-9a-fA-F]{64}$/.test(sig.s) || ![0, 1, 27, 28].includes(Number(sig.v)))
+    throw new Error("Invalid embedded Hyperliquid signature");
+  return `${sig.r}${sig.s.slice(2)}${Number(sig.v).toString(16).padStart(2, "0")}`;
 }
 var HYPERLIQUID_ALLOWED_ACTION_TYPES, HYPERLIQUID_EXCHANGE_URLS, HYPERLIQUID_INFO_URLS, CANDLE_HYPERLIQUID_BUILDER_ADDRESS = "0xc43ff1f6ad9f93fc94558e07c2071b8458e7470b", HYPERLIQUID_MAX_BUILDER_FEE_TENTHS_BPS = 100, HYPERLIQUID_MAX_BUILDER_FEE_RATE = "0.1%", HYPERLIQUID_SIGNATURE_CHAIN_ID = "0xa4b1", ZERO_ADDRESS = "0x0000000000000000000000000000000000000000", UINT64_MAX, INT64_MIN, EVM_ADDRESS_RE, HYPERLIQUID_CLOID_RE, HYPERLIQUID_STANDARD_ACCOUNT_MODES, ACTION_KEYS, HYPERLIQUID_DEFAULT_SLIPPAGE_BPS = 100, HYPERLIQUID_MID_DRIFT_BPS = 100, HYPERLIQUID_TPSL_SLIPPAGE_BPS = 500, HYPERLIQUID_SCHEDULE_CANCEL_MIN_LEAD_MS = 5000, HYPERLIQUID_SCHEDULE_CANCEL_DRIFT_MS = 60000;
 var init_hyperliquid = __esm(() => {
@@ -9817,10 +10028,10 @@ async function runPerpsTpsl(io, params) {
   const coin = typeof server.coin === "string" ? server.coin : params.coin.toUpperCase();
   const venueLegs = snapshot.orders.filter((o) => o.coin === coin && o.tpsl !== null);
   const tracked = [];
-  for (const raw of Array.isArray(server.tracked) ? server.tracked : []) {
-    const seen = venueLegs.find((o) => o.oid === raw.oid && o.tpsl === raw.leg && (o.cloid ?? null) === (raw.cloid ?? null));
+  for (const raw2 of Array.isArray(server.tracked) ? server.tracked : []) {
+    const seen = venueLegs.find((o) => o.oid === raw2.oid && o.tpsl === raw2.leg && (o.cloid ?? null) === (raw2.cloid ?? null));
     if (seen)
-      tracked.push({ leg: raw.leg, oid: seen.oid, cloid: seen.cloid, triggerPx: seen.triggerPx });
+      tracked.push({ leg: raw2.leg, oid: seen.oid, cloid: seen.cloid, triggerPx: seen.triggerPx });
   }
   const trackedOids = new Set(tracked.map((l) => l.oid));
   const unowned = venueLegs.filter((o) => !trackedOids.has(o.oid)).map((o) => ({ leg: o.tpsl, oid: o.oid, cloid: o.cloid, triggerPx: o.triggerPx }));
@@ -10130,7 +10341,7 @@ function unavailable() {
 function usage(message) {
   throw new PerpsMarketError("PERPS_USAGE", message);
 }
-function object(value) {
+function object2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function decimal2(value) {
@@ -10166,10 +10377,10 @@ function parseMarkets(value) {
   if (!Array.isArray(value) || value.length !== 2)
     return unavailable();
   const [meta, ctxs] = value;
-  if (!object(meta) || !Array.isArray(meta.universe) || !Array.isArray(ctxs) || meta.universe.length !== ctxs.length)
+  if (!object2(meta) || !Array.isArray(meta.universe) || !Array.isArray(ctxs) || meta.universe.length !== ctxs.length)
     return unavailable();
   for (const row of meta.universe) {
-    if (!object(row) || typeof row.name !== "string" || !integer(row.szDecimals) || row.szDecimals > 6 || !integer(row.maxLeverage))
+    if (!object2(row) || typeof row.name !== "string" || !integer(row.szDecimals) || row.szDecimals > 6 || !integer(row.maxLeverage))
       return unavailable();
     for (const key of ["isDelisted", "onlyIsolated"])
       if (row[key] !== undefined && typeof row[key] !== "boolean")
@@ -10178,7 +10389,7 @@ function parseMarkets(value) {
       return unavailable();
   }
   for (const ctx of ctxs) {
-    if (!object(ctx))
+    if (!object2(ctx))
       return unavailable();
     for (const key of ["markPx", "midPx", "oraclePx", "openInterest", "funding", "dayNtlVlm", "prevDayPx", "premium"]) {
       if (ctx[key] !== undefined && ctx[key] !== null && !decimal2(ctx[key]))
@@ -10192,11 +10403,11 @@ function parseMarkets(value) {
     if (!Array.isArray(meta.marginTables))
       return unavailable();
     for (const entry of meta.marginTables) {
-      if (!Array.isArray(entry) || !integer(entry[0]) || !object(entry[1]) || !Array.isArray(entry[1].marginTiers))
+      if (!Array.isArray(entry) || !integer(entry[0]) || !object2(entry[1]) || !Array.isArray(entry[1].marginTiers))
         return unavailable();
       const tiers = [];
       for (const tier of entry[1].marginTiers) {
-        if (!object(tier) || nonnegative(tier.lowerBound) === null || !integer(tier.maxLeverage))
+        if (!object2(tier) || nonnegative(tier.lowerBound) === null || !integer(tier.maxLeverage))
           return unavailable();
         tiers.push({ lowerBoundUsd: tier.lowerBound, maxLeverage: tier.maxLeverage });
       }
@@ -10257,15 +10468,15 @@ function perpsCandleWindow(opts, now) {
   if (index < 0)
     return usage(`interval must be one of ${PERPS_CANDLE_INTERVALS.join(" ")}.`);
   const count = bounded(opts.count, 100, 1, 5000, "count");
-  const raw = opts.end;
-  const endTime = raw === undefined ? now : epoch(raw);
+  const raw2 = opts.end;
+  const endTime = raw2 === undefined ? now : epoch(raw2);
   const startTime = endTime - count * at(INTERVAL_MS, index);
   if (!Number.isSafeInteger(endTime) || endTime < 0 || endTime > now || startTime < 0)
     return usage("end must be an ISO 8601 time or epoch milliseconds, no later than now.");
   return { interval, count, startTime, endTime };
 }
-function epoch(raw) {
-  return typeof raw === "number" || /^\d+$/.test(raw) ? Number(raw) : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(raw) ? Date.parse(raw) : NaN;
+function epoch(raw2) {
+  return typeof raw2 === "number" || /^\d+$/.test(raw2) ? Number(raw2) : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(raw2) ? Date.parse(raw2) : NaN;
 }
 function perpsFundingWindow(opts, now) {
   const endTime = opts.end === undefined ? now : epoch(opts.end);
@@ -10289,7 +10500,7 @@ function parsePerpsFundingHistory(value, coin, window) {
     return unavailable();
   const funding = [];
   for (const row of value) {
-    if (!object(row) || row.coin !== coin || !integer(row.time) || !decimal2(row.fundingRate) || !decimal2(row.premium))
+    if (!object2(row) || row.coin !== coin || !integer(row.time) || !decimal2(row.fundingRate) || !decimal2(row.premium))
       return unavailable();
     if (row.time >= window.startTime && row.time <= window.endTime)
       funding.push({
@@ -10327,7 +10538,7 @@ class PerpsMarketReader {
     this.configPromise ??= (async () => {
       try {
         const value = await this.opts.readConfig();
-        if (!object(value) || !object(value.limits) || !integer(value.limits.minOpenInterestUsd) || value.network !== "mainnet" && value.network !== "testnet")
+        if (!object2(value) || !object2(value.limits) || !integer(value.limits.minOpenInterestUsd) || value.network !== "mainnet" && value.network !== "testnet")
           throw new Error("config shape");
         return {
           minOpenInterestUsd: value.limits.minOpenInterestUsd,
@@ -10375,7 +10586,7 @@ class PerpsMarketReader {
               if (!Array.isArray(venue) || typeof venue[0] !== "string")
                 return unavailable();
               if (venue[0] === "HlPerp" && venue[1] !== null) {
-                if (!object(venue[1]) || !decimal2(venue[1].fundingRate) || !integer(venue[1].nextFundingTime))
+                if (!object2(venue[1]) || !decimal2(venue[1].fundingRate) || !integer(venue[1].nextFundingTime))
                   return unavailable();
                 map.set(entry[0], { fundingRate: venue[1].fundingRate, nextFundingTime: venue[1].nextFundingTime });
               }
@@ -10516,7 +10727,7 @@ class PerpsMarketReader {
       coin: canonical2,
       ...opts.sigFigs === undefined ? {} : { nSigFigs: opts.sigFigs }
     });
-    if (!object(value) || value.coin !== canonical2 || !integer(value.time) || !Array.isArray(value.levels) || value.levels.length !== 2)
+    if (!object2(value) || value.coin !== canonical2 || !integer(value.time) || !Array.isArray(value.levels) || value.levels.length !== 2)
       return unavailable();
     const sides = [];
     for (const side of value.levels) {
@@ -10524,7 +10735,7 @@ class PerpsMarketReader {
         return unavailable();
       const levels = [];
       for (const level of side) {
-        if (!object(level) || nonnegative(level.px) === null || nonnegative(level.sz) === null || !integer(level.n))
+        if (!object2(level) || nonnegative(level.px) === null || nonnegative(level.sz) === null || !integer(level.n))
           return unavailable();
         levels.push({ px: level.px, sz: level.sz, n: level.n });
       }
@@ -10560,7 +10771,7 @@ class PerpsMarketReader {
       return unavailable();
     const candles = [];
     for (const c of value) {
-      if (!object(c) || !integer(c.t) || !integer(c.T) || !integer(c.n) || ![c.o, c.h, c.l, c.c, c.v].every((v) => nonnegative(v) !== null) || c.s !== canonical2 || c.i !== window.interval)
+      if (!object2(c) || !integer(c.t) || !integer(c.T) || !integer(c.n) || ![c.o, c.h, c.l, c.c, c.v].every((v) => nonnegative(v) !== null) || c.s !== canonical2 || c.i !== window.interval)
         return unavailable();
       if (c.t <= window.endTime && c.T >= window.startTime)
         candles.push({
@@ -10732,14 +10943,14 @@ function canonical2(value) {
 function isDecimalString(value) {
   return typeof value === "string" && /^-?[0-9]+(\.[0-9]+)?$/.test(value);
 }
-function asFill(raw) {
-  const row = raw;
+function asFill(raw2) {
+  const row = raw2;
   if (!row || typeof row !== "object" || typeof row.coin !== "string" || !isTime(row.time) || !Number.isSafeInteger(row.tid) || !Number.isSafeInteger(row.oid) || !isDecimalString(row.px) || !isDecimalString(row.sz) || typeof row.side !== "string" || !isDecimalString(row.closedPnl) || !isDecimalString(row.fee) || row.builderFee !== undefined && !isDecimalString(row.builderFee))
     throw unavailable2("Hyperliquid returned a fill this client cannot read");
   return row;
 }
-function asFunding(raw) {
-  const row = raw;
+function asFunding(raw2) {
+  const row = raw2;
   const delta = row?.delta;
   if (!row || typeof row !== "object" || !isTime(row.time) || typeof row.hash !== "string" || !delta || typeof delta !== "object" || typeof delta.coin !== "string" || !isDecimalString(delta.usdc) || !isDecimalString(delta.fundingRate) || !isDecimalString(delta.szi))
     throw unavailable2("Hyperliquid returned a funding payment this client cannot read");
@@ -10876,11 +11087,11 @@ async function readPerpsHistoryPage(req) {
         break;
       }
       const body = kind === "fills" ? { type: "userFillsByTime", user: state.w, startTime: t, endTime: state.e, aggregateByTime: false } : { type: "userFunding", user: state.w, startTime: t, endTime: state.e };
-      const raw = await postInfo(req, body, kind === "fills" ? "fills" : "funding");
+      const raw2 = await postInfo(req, body, kind === "fills" ? "fills" : "funding");
       requests++;
-      if (!Array.isArray(raw))
+      if (!Array.isArray(raw2))
         throw unavailable2(`Hyperliquid returned an unreadable ${kind} response`);
-      const rows = raw.map((r) => kind === "fills" ? asFill(r) : asFunding(r));
+      const rows = raw2.map((r) => kind === "fills" ? asFill(r) : asFunding(r));
       const keyed = rows.map((row) => ({ row, id: identity(kind, row) })).sort((a, b) => a.row.time - b.row.time || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
       const full = rows.length >= max;
       const startedAt = t;
@@ -10995,11 +11206,11 @@ function perpsRiskFromLimits(body) {
   const source = stored && Object.keys(stored).length > 0 ? "key" : "defaults";
   return { thresholds: { ...effective, source }, stored };
 }
-function pickSettings(raw) {
+function pickSettings(raw2) {
   const out = {};
   for (const field of PERPS_RISK_FIELDS)
-    if (typeof raw[field] === "number")
-      out[field] = raw[field];
+    if (typeof raw2[field] === "number")
+      out[field] = raw2[field];
   return out;
 }
 async function hyperliquidInfo(fetcher, network, body, opts = {}) {
@@ -11683,18 +11894,32 @@ async function call(cfg, fetch2, method, path, body) {
   if (!res.ok) {
     if (res.status === 404 && (typeof parsed !== "object" || parsed === null))
       throw new Refusal(fail2("PERPS_NOT_ENABLED", "This Candle deployment does not serve perps routes."));
-    throw new Refusal({ text: typeof parsed === "string" ? parsed : JSON.stringify(parsed), isError: true });
+    throw Object.assign(new Refusal({ text: typeof parsed === "string" ? parsed : JSON.stringify(parsed), isError: true }), { httpStatus: res.status });
   }
   if (typeof parsed !== "object" || parsed === null)
     throw new Refusal(fail2("INVALID_RESPONSE", "Not a JSON object"));
   return parsed;
 }
 async function walletFor(cfg, fetch2, name, scope) {
+  const embedded = async () => {
+    const found = await call(cfg, fetch2, "GET", "/api/v1/agent/wallets/embedded");
+    const evm2 = found.wallets?.evm;
+    if (!evm2?.address || scope && found.embeddedWalletPermission === "denied")
+      throw new Refusal(fail2("AGENT_WALLET_MISSING", "Embedded EVM wallet unavailable"));
+    return { row: { id: "embedded", address: evm2.address.toLowerCase(), chain: "evm" }, appId: "" };
+  };
+  if (name === "embedded")
+    return embedded();
   const listed = await call(cfg, fetch2, "GET", "/api/v1/agent/wallets/trading");
   if (scope && !(Array.isArray(listed.scopes) && listed.scopes.includes(scope)))
     throw new Refusal(fail2("SCOPE_MISSING", `The key needs ${scope}.`));
   const rows = Array.isArray(listed.page) ? listed.page : [];
   const evm = rows.filter((row) => row.chain === "evm");
+  if (name === undefined && evm.length === 0) {
+    const fallback = await embedded().catch(() => null);
+    if (fallback)
+      return fallback;
+  }
   const matches = name === undefined ? evm : evm.filter((row) => row.id === name || row.label === name || row.address.toLowerCase() === name.toLowerCase());
   if (matches.length !== 1)
     throw new Refusal(fail2("TEE_WALLET_REQUIRED", evm.length === 0 ? "This key has no EVM TEE wallet bound to it." : `Name exactly one EVM TEE wallet: ${evm.map((row) => row.label ?? row.id).join(", ")}`));
@@ -11756,7 +11981,7 @@ async function executePerps(tool, args, cfg, env, fetch2) {
     if (tool === "candle_perps_reduce_only")
       return await executeReduceOnly(args, cfg, fetch2);
     const { wallet: _w, submit: _s, ...rest } = args;
-    const clientId2 = typeof rest.clientId === "string" ? rest.clientId.toLowerCase() : undefined;
+    let clientId2 = typeof rest.clientId === "string" ? rest.clientId.toLowerCase() : undefined;
     let fields2 = { ...rest, ...clientId2 !== undefined ? { clientId: clientId2 } : {} };
     let path = PATHS[tool];
     let method = path.split("/").at(-1);
@@ -11803,10 +12028,15 @@ async function executePerps(tool, args, cfg, env, fetch2) {
       if (problem)
         return fail2("MCP_VALIDATION", problem);
     }
+    const { row, appId } = await walletFor(cfg, fetch2, name, "perps:write");
+    if (row.id === "embedded" && ["open", "close"].includes(method) && clientId2 === undefined) {
+      clientId2 = `0x${randomBytes2(16).toString("hex")}`;
+      fields2.clientId = clientId2;
+    }
     const willSubmit = args.submit !== false;
     const pemFile = env.CANDLE_KEY_SIGNER_PEM_FILE?.trim();
     let signerPem = null;
-    if (willSubmit) {
+    if (willSubmit && row.id !== "embedded") {
       if (!pemFile)
         return fail2("SIGNER_UNAVAILABLE", "Set CANDLE_KEY_SIGNER_PEM_FILE to the key signer PEM (candle tee signer new --out <pem>) to sign perps actions.");
       try {
@@ -11816,9 +12046,11 @@ async function executePerps(tool, args, cfg, env, fetch2) {
         return fail2("SIGNER_UNAVAILABLE", "CANDLE_KEY_SIGNER_PEM_FILE does not hold a readable private key PEM.");
       }
     }
-    const { row, appId } = await walletFor(cfg, fetch2, name, "perps:write");
     const builder = builderPin(env);
+    let embeddedSignature;
     const relaySign = async (typedData) => {
+      if (row.id === "embedded")
+        return hyperliquidSignatureHex(embeddedSignature);
       if (signerPem === null || !appId || !row.privyWalletId)
         throw new Refusal(fail2("SIGNER_UNAVAILABLE", "The server did not return its relay identifiers."));
       const body = hyperliquidRelayBody(typedData);
@@ -11848,7 +12080,11 @@ async function executePerps(tool, args, cfg, env, fetch2) {
         keyReduceOnly: reduceOnly === null ? true : reduceOnly.perpsReduceOnly === true,
         fetcher: fetch2,
         now: Date.now,
-        build: (p, body) => call(cfg, fetch2, "POST", p, body),
+        build: async (p, body) => {
+          const build2 = await call(cfg, fetch2, "POST", p, body);
+          embeddedSignature = build2.signature;
+          return build2;
+        },
         read: (p) => call(cfg, fetch2, "GET", p),
         sign: relaySign,
         mode: willSubmit ? "submit" : "no-submit",
@@ -11874,11 +12110,19 @@ async function executePerps(tool, args, cfg, env, fetch2) {
       if (!HYPERLIQUID_STANDARD_ACCOUNT_MODES.includes(mode))
         return fail2("PERPS_ACCOUNT_MODE", `This Hyperliquid account is in ${mode} mode. Candle trades only a standard account and does not change modes; this is not a missing fee approval. Nothing was requested or signed.`, { mode });
     }
-    const build = await call(cfg, fetch2, "POST", path, {
-      walletId: row.id,
-      ...fields2,
-      ...tool === "candle_perps_open" ? { type: fields2.price === undefined ? "market" : "limit" } : {}
-    });
+    let build;
+    try {
+      build = await call(cfg, fetch2, "POST", path, {
+        walletId: row.id,
+        ...fields2,
+        ...tool === "candle_perps_open" ? { type: fields2.price === undefined ? "market" : "limit" } : {}
+      });
+    } catch (error) {
+      const status = error instanceof Refusal ? Number(error.httpStatus) : NaN;
+      if (row.id !== "embedded" || !clientId2 || status >= 400 && status < 500)
+        throw error;
+      throw new Refusal(fail2("PERPS_MAYBE_LANDED", "The build answer was lost. Retry the same clientId; read orders and reconcile before continuing.", { clientId: clientId2, cloid: clientId2, exchangeBody: null }));
+    }
     build.preview = {
       ...build.preview,
       builderTrust: {
@@ -11893,7 +12137,7 @@ async function executePerps(tool, args, cfg, env, fetch2) {
     }
     if (build.ready === true)
       return { text: JSON.stringify(build) };
-    if (build.replayed === true) {
+    if (build.replayed === true && row.id !== "embedded") {
       if (clientId2 === undefined || build.clientId !== clientId2 || build.walletId !== row.id)
         return fail2("PERPS_BUILD_REFUSED", "Refused a replay that does not name this request's client id and wallet. Nothing was signed.");
       return { text: JSON.stringify(build) };
@@ -11910,8 +12154,9 @@ async function executePerps(tool, args, cfg, env, fetch2) {
     const check = method === "setup" ? verifyPerpsBuild(build, verifyOpts) : await verifyPerpsBuildAgainstVenue(build, { ...verifyOpts, fetcher: fetch2 });
     if (!check.ok)
       return fail2("PERPS_BUILD_REFUSED", `Refused to sign this build: ${check.reason}. Nothing was signed.`);
-    if (!willSubmit || signerPem === null)
-      return { text: JSON.stringify({ ...build, signed: false, submitted: false }) };
+    if (!willSubmit || signerPem === null && row.id !== "embedded")
+      return { text: JSON.stringify({ ...build, signed: row.id === "embedded", submitted: false }) };
+    embeddedSignature = build.signature;
     const signature = await relaySign(build.typedData);
     const exchangeBody = hyperliquidExchangeBody(build.action, build.nonce, signature);
     let exchange;
@@ -11926,7 +12171,7 @@ async function executePerps(tool, args, cfg, env, fetch2) {
         throw new Error(`HTTP ${res.status}`);
       exchange = JSON.parse(text);
     } catch (error) {
-      return fail2("PERPS_SUBMIT_FAILED", `Signed, but the submit to Hyperliquid failed (${error instanceof Error ? error.message : "unknown"}). POST exchangeBody to Hyperliquid's /exchange to resubmit.`, { perpOrderId: build.perpOrderId, exchangeBody });
+      return fail2("PERPS_SUBMIT_FAILED", `Signed, but the submit to Hyperliquid failed (${error instanceof Error ? error.message : "unknown"}). POST exchangeBody to Hyperliquid's /exchange to resubmit.`, { clientId: clientId2 ?? null, cloid: build.cloid ?? null, perpOrderId: build.perpOrderId, exchangeBody });
     }
     const outcome = hyperliquidExchangeOutcome(exchange);
     const accepted = outcome.status === "confirmed";
@@ -11962,6 +12207,8 @@ async function executePerps(tool, args, cfg, env, fetch2) {
       });
     if (outcome.status === "unknown")
       return fail2("PERPS_SUBMIT_FAILED", `Hyperliquid's answer could not be read (${outcome.error}); reconcile before acting again.`, {
+        clientId: clientId2 ?? null,
+        cloid: build.cloid ?? null,
         perpOrderId: build.perpOrderId,
         exchangeBody,
         exchange
@@ -12003,8 +12250,8 @@ function rawUnits(amount, decimals) {
   const [whole = "", fraction = ""] = amount.split(".");
   if (fraction.length > decimals)
     return null;
-  const raw = BigInt(whole + fraction.padEnd(decimals, "0"));
-  return raw > 0n ? raw.toString() : null;
+  const raw2 = BigInt(whole + fraction.padEnd(decimals, "0"));
+  return raw2 > 0n ? raw2.toString() : null;
 }
 function pickWallet(rows, chain, name, what) {
   const onChain = rows.filter((row) => row.chain === chain);
@@ -12048,6 +12295,25 @@ async function executePerpsDeposit(args, cfg, env, fetch2) {
   const hood = spec.chain === "evm";
   const clientDepositId = typeof args.clientDepositId === "string" ? args.clientDepositId : `deposit-${crypto.randomUUID()}`;
   const willSubmit = args.submit !== false;
+  if (args.wallet === "embedded") {
+    if (args.perpsWallet !== undefined && args.perpsWallet !== "embedded")
+      return fail2("MCP_VALIDATION", "Embedded deposits land only on their own Hyperliquid account");
+    try {
+      const result2 = await call(cfg, fetch2, "POST", "/api/v1/agent/perps/deposit", {
+        clientDepositId,
+        walletId: "embedded",
+        asset,
+        amountRaw,
+        ...typeof args.maxSlippageBps === "number" ? { maxSlippageBps: args.maxSlippageBps } : {},
+        ...willSubmit ? {} : { preview: true }
+      });
+      return { text: JSON.stringify(result2) };
+    } catch (error) {
+      if (error instanceof Refusal)
+        return error.tool;
+      throw error;
+    }
+  }
   let signerPem = null;
   if (willSubmit) {
     const pemFile = env.CANDLE_KEY_SIGNER_PEM_FILE?.trim();
@@ -12197,9 +12463,9 @@ var init_perps = __esm(() => {
     ...PERPS_RISK_TOOL_NAMES
   ];
   decimal3 = exports_external.string().regex(/^(0|[1-9][0-9]*)(\.[0-9]+)?$/, "a plain decimal string");
-  wallet2 = exports_external.string().optional().describe("The EVM TEE wallet by id, address or label. Omit when the key has exactly one.");
-  submit = exports_external.boolean().optional().describe("false: build and check only, sign and submit nothing. Default true.");
-  clientId = exports_external.string().regex(/^0x[0-9a-fA-F]{32}$/).optional().describe("Optional client order id (0x + 32 hex) used as the order's cloid. Retrying with the same id and request returns " + "the original operation (replayed: true) and signs nothing; the same id with another request is refused " + "(PERPS_CLIENT_ID_CONFLICT). It deduplicates, it does not resume. Use a new id for a new order.");
+  wallet2 = exports_external.string().optional().describe("The EVM TEE wallet by id, address or label, or embedded. Defaults to the only TEE, then embedded when permitted.");
+  submit = exports_external.boolean().optional().describe("false: build and check without venue submission. Embedded builds already carry the server signature. Default true.");
+  clientId = exports_external.string().regex(/^0x[0-9a-fA-F]{32}$/).optional().describe("Optional client order id (0x + 32 hex) used as the order's cloid. Retrying with the same id and request returns " + "the original operation (replayed: true); embedded returns its stored signature and resumes submission. Another request under that id is refused (PERPS_CLIENT_ID_CONFLICT). Embedded open/close generate an id when omitted. Use a new id for a new order.");
   epochMs = exports_external.number().int().min(0);
   perpsShapes = {
     candle_perps_setup: { wallet: wallet2, submit },
@@ -12483,6 +12749,205 @@ var init_plans = __esm(() => {
   PLAN_LABELS = { free: "Free", believer: "Believer", pro: "Pro", max: "Max" };
 });
 
+// ../mcp/src/signal-records.ts
+function isObject2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function withMeasure(body) {
+  return { ...isObject2(body) ? body : {}, measure: MEASURE };
+}
+function isScorecardDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value))
+    return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+function isRecordSource(value) {
+  return typeof value === "string" && RECORD_SOURCES.includes(value);
+}
+function localRefusal(code, message) {
+  return { ok: false, refusal: { status: 0, code, message, body: withMeasure({ error: message, code }) } };
+}
+function createSignalRecordsClient(options) {
+  const base2 = new URL(options.apiUrl ?? SIGNAL_RECORDS_DEFAULT_URL);
+  if (base2.protocol !== "https:" || base2.username || base2.password || base2.search || base2.hash) {
+    throw new Error("Signal records need an HTTPS CANDLE_HACC_URL without credentials, query or fragment.");
+  }
+  const root = base2.toString().replace(/\/+$/, "");
+  const doFetch = options.fetch ?? globalThis.fetch;
+  const timeoutMs = options.timeoutMs ?? SIGNAL_RECORDS_TIMEOUT_MS;
+  async function get(path) {
+    const controller = new AbortController;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    try {
+      const response = await doFetch(`${root}${path}`, {
+        method: "GET",
+        redirect: "error",
+        signal: controller.signal,
+        headers: { authorization: `Bearer ${options.apiKey}`, accept: "application/json" }
+      });
+      const received = await response.json().catch(() => {
+        return;
+      });
+      if (timedOut)
+        return localRefusal("TIMEOUT", "The signal records request timed out.");
+      if (!response.ok) {
+        const message = isObject2(received) && typeof received.error === "string" ? received.error : `Signal records request failed (${response.status}).`;
+        const code = isObject2(received) && typeof received.code === "string" ? received.code : response.status === 404 ? "NOT_FOUND" : `HTTP_${response.status}`;
+        return {
+          ok: false,
+          refusal: {
+            status: response.status,
+            code,
+            message,
+            body: withMeasure(isObject2(received) ? received : { error: message })
+          }
+        };
+      }
+      if (!isObject2(received))
+        return localRefusal("BAD_RESPONSE", "hacc returned an unreadable response.");
+      return { ok: true, status: response.status, body: withMeasure(received) };
+    } catch {
+      return timedOut ? localRefusal("TIMEOUT", "The signal records request timed out.") : localRefusal("NETWORK_ERROR", "Could not reach hacc.");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return {
+    scorecard(date) {
+      if (date !== undefined && !isScorecardDate(date)) {
+        return Promise.resolve(localRefusal("INVALID_DATE", "date must be YYYY-MM-DD."));
+      }
+      return get(date === undefined ? "/v1/public/scorecard" : `/v1/public/scorecard/${date}`);
+    },
+    records(query2 = {}) {
+      const search = new URLSearchParams;
+      if (query2.source !== undefined) {
+        if (!isRecordSource(query2.source)) {
+          return Promise.resolve(localRefusal("INVALID_SOURCE", `source must be one of ${RECORD_SOURCES.join(", ")}.`));
+        }
+        search.set("source", query2.source);
+      }
+      if (query2.before !== undefined) {
+        if (!Number.isSafeInteger(query2.before) || query2.before < 1) {
+          return Promise.resolve(localRefusal("INVALID_BEFORE", "before must be a positive integer."));
+        }
+        search.set("before", String(query2.before));
+      }
+      if (query2.limit !== undefined) {
+        if (!Number.isInteger(query2.limit) || query2.limit < 1 || query2.limit > RECORDS_LIMIT_MAX) {
+          return Promise.resolve(localRefusal("INVALID_LIMIT", `limit must be an integer from 1 to ${RECORDS_LIMIT_MAX}.`));
+        }
+        search.set("limit", String(query2.limit));
+      }
+      return get(`/v1/public/signal-records${search.size ? `?${search}` : ""}`);
+    },
+    record(source, sourceId) {
+      if (!isRecordSource(source)) {
+        return Promise.resolve(localRefusal("INVALID_SOURCE", `source must be one of ${RECORD_SOURCES.join(", ")}.`));
+      }
+      if (typeof sourceId !== "string" || sourceId.length < 1 || sourceId.length > SOURCE_ID_MAX) {
+        return Promise.resolve(localRefusal("INVALID_SOURCE_ID", `source_id must be 1 to ${SOURCE_ID_MAX} characters.`));
+      }
+      return get(`/v1/public/signal-records/${source}/${encodeURIComponent(sourceId)}`);
+    }
+  };
+}
+var SIGNAL_RECORDS_DEFAULT_URL = "https://api.hacc.fun", SIGNAL_RECORDS_TIMEOUT_MS = 1e4, MEASURE = "Measured record, not a forecast.", RECORD_SOURCES, RECORDS_LIMIT_MAX = 100, SOURCE_ID_MAX = 128;
+var init_signal_records = __esm(() => {
+  RECORD_SOURCES = ["pattern", "quant_call", "holder_band", "launch_read"];
+});
+
+// ../mcp/src/signal-record-tools.ts
+function refusal2(code, error) {
+  return { text: JSON.stringify({ error, code, measure: MEASURE }), isError: true };
+}
+function answerText2(answer) {
+  if (answer.ok)
+    return { text: JSON.stringify(answer.body), isError: false };
+  const { status, code, message, body } = answer.refusal;
+  return {
+    text: JSON.stringify({ error: message, code, ...status ? { status, body } : {}, measure: MEASURE }),
+    isError: true
+  };
+}
+async function executeSignalRecordTool(name, args, cfg, env, doFetch) {
+  const apiKey = cfg.apiKey;
+  if (!apiKey?.startsWith("cndl_live_")) {
+    return refusal2("SIGNAL_RECORDS_PRODUCTION_KEY_REQUIRED", SIGNAL_RECORDS_PRODUCTION_KEY_MESSAGE);
+  }
+  let hacc;
+  try {
+    hacc = createSignalRecordsClient({
+      apiKey,
+      apiUrl: env.CANDLE_HACC_URL?.trim() || undefined,
+      fetch: doFetch
+    });
+  } catch {
+    return refusal2("SIGNAL_RECORDS_URL_INVALID", "Signal records need a valid HTTPS CANDLE_HACC_URL without credentials, query or fragment.");
+  }
+  switch (name) {
+    case "candle_signal_scorecard":
+      return answerText2(await hacc.scorecard(args.date));
+    case "candle_signal_records": {
+      const a = args;
+      return answerText2(await hacc.records({ source: a.source, before: a.before, limit: a.limit }));
+    }
+    case "candle_signal_record": {
+      const a = args;
+      return answerText2(await hacc.record(a.source, a.source_id));
+    }
+  }
+}
+var SIGNAL_RECORDS_PRODUCTION_KEY_MESSAGE = "Signal records need a production agent key. Create one with `candle keys create`.", SIGNAL_RECORD_ANNOTATIONS, SIGNAL_RECORD_TITLES, signalRecordValidationErrorMap = (issue, ctx) => {
+  const detail = exports_external.defaultErrorMap(issue, ctx).message;
+  const path = issue.path.length ? `${issue.path.join(".")}: ` : "";
+  throw new Error(refusal2("SIGNAL_RECORDS_INVALID_ARGUMENTS", `Invalid arguments: ${path}${detail}`).text);
+}, validationParams, source, signalRecordShapes, FIXED_LINE_NOTE, KEY_NOTE, SIGNAL_RECORD_DESCRIPTIONS;
+var init_signal_record_tools = __esm(() => {
+  init_zod();
+  init_signal_records();
+  SIGNAL_RECORD_ANNOTATIONS = { readOnlyHint: true, openWorldHint: true };
+  SIGNAL_RECORD_TITLES = {
+    candle_signal_scorecard: "hacc signal scorecard",
+    candle_signal_records: "hacc signal records",
+    candle_signal_record: "hacc signal record"
+  };
+  validationParams = {
+    errorMap: (issue, ctx) => {
+      if (ctx.data === undefined && issue.path.length === 0)
+        return exports_external.defaultErrorMap(issue, ctx);
+      return signalRecordValidationErrorMap(issue, ctx);
+    }
+  };
+  source = exports_external.enum(RECORD_SOURCES, validationParams);
+  signalRecordShapes = {
+    candle_signal_scorecard: {
+      date: exports_external.string(validationParams).date().optional().describe("YYYY-MM-DD; absent is the latest.")
+    },
+    candle_signal_records: {
+      source: source.optional(),
+      before: exports_external.number(validationParams).int().min(1).optional().describe("The previous page's next_before."),
+      limit: exports_external.number(validationParams).int().min(1).max(RECORDS_LIMIT_MAX).default(50)
+    },
+    candle_signal_record: {
+      source,
+      source_id: exports_external.string(validationParams).min(1).max(SOURCE_ID_MAX).describe("The source's own id: the signal id for pattern, chain:mint for launch_read.")
+    }
+  };
+  FIXED_LINE_NOTE = ' Every response carries measure: "Measured record, not a forecast." Quote that line with any figure you take from ' + "it. A record is a fact, never a forecast or advice.";
+  KEY_NOTE = " Needs a production agent key (cndl_live_), sent to hacc as a Bearer; read-only. Optional CANDLE_HACC_URL " + "overrides https://api.hacc.fun (https only).";
+  SIGNAL_RECORD_DESCRIPTIONS = {
+    candle_signal_scorecard: "The daily hacc scorecard's signal aggregates: signal lift against the matched baseline, and per source, rule " + `and horizon counts, mean net returns, tails and delay.${FIXED_LINE_NOTE}${KEY_NOTE}`,
+    candle_signal_records: "Per-signal measured records, newest first: marks, conservative and priced net returns, the 24 h path and the " + `matched baseline.${FIXED_LINE_NOTE}${KEY_NOTE}`,
+    candle_signal_record: `One signal's measured record.${FIXED_LINE_NOTE}${KEY_NOTE}`
+  };
+});
+
 // ../mcp/src/token-metadata.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
 function editSocialsSchema() {
@@ -12763,6 +13228,7 @@ __export(exports_tools, {
   SWAP_SETTLEMENT_REREAD: () => SWAP_SETTLEMENT_REREAD,
   SWAP_RECEIPT_DESCRIPTION: () => SWAP_RECEIPT_DESCRIPTION,
   STAKING_DISCLOSURE: () => STAKING_DISCLOSURE,
+  SIGNAL_RECORD_TOOL_NAMES: () => SIGNAL_RECORD_TOOL_NAMES,
   PROFILE_PNL_HYPERLIQUID: () => PROFILE_PNL_HYPERLIQUID,
   PROFILE_EDIT_TOOL_NAMES: () => PROFILE_EDIT_TOOL_NAMES,
   OPERATION_NOT_FOUND_RULE: () => OPERATION_NOT_FOUND_RULE,
@@ -12770,10 +13236,10 @@ __export(exports_tools, {
 });
 import { randomUUID as randomUUID3 } from "node:crypto";
 function resolveToolAllowlist(env) {
-  const raw = env.CANDLE_MCP_TOOLS?.trim();
-  if (!raw)
+  const raw2 = env.CANDLE_MCP_TOOLS?.trim();
+  if (!raw2)
     return new Set(TOOL_NAMES);
-  const requested = raw.split(",").map((name) => name.trim()).filter((name) => name.length > 0);
+  const requested = raw2.split(",").map((name) => name.trim()).filter((name) => name.length > 0);
   const unknown = requested.filter((name) => !TOOL_NAMES.includes(name));
   if (requested.length === 0 || unknown.length > 0) {
     throw new Error(`CANDLE_MCP_TOOLS contains unknown tool name(s): ${unknown.join(", ") || "(none given)"}. Valid names: ${TOOL_NAMES.join(", ")}`);
@@ -13391,7 +13857,7 @@ function registerToolSubset(server, options) {
   const register = (name, definition, handler) => {
     if (!allowed.has(name))
       return;
-    const inputSchema = isProfileEditTool(name) || isTokenPageTool(name) ? exports_external.object(definition.inputSchema).strict() : definition.inputSchema;
+    const inputSchema = isSignalRecordTool(name) ? exports_external.object(definition.inputSchema, { errorMap: signalRecordValidationErrorMap }).strict() : isProfileEditTool(name) || isTokenPageTool(name) ? exports_external.object(definition.inputSchema).strict() : definition.inputSchema;
     const registered = server.registerTool(name, { ...definition, inputSchema, ...options.metadata?.[name] }, handler);
     if (isProfileEditTool(name) && registered) {
       const tools = localProfileTools.get(server) ?? new Map;
@@ -13498,8 +13964,20 @@ function registerToolSubset(server, options) {
   register("candle_launch_token", {
     title: "Launch a token on Candle",
     description: "Launch a new token via the Candle headless launch API, from the account's embedded wallet. Works on every plan, Free included. Set dryRun: true to validate without spending anything. " + LAUNCH_SHARED_SENTENCES + (imageDir ? IMAGE_PATH_DISCLOSURE : ""),
-    inputSchema: imageDir ? localLaunchTokenShape : launchTokenShape
+    inputSchema: checkableLaunchShape(imageDir ? localLaunchTokenShape : launchTokenShape)
   }, async (args) => {
+    if ("check" in args && args.check === true)
+      return launchCheck(args, getConfig(), doFetch);
+    try {
+      args = launchExecutionArgs(args);
+      if (!imageDir && args.imageUrl === undefined && !("imagePath" in args))
+        return launchControlError(new LaunchCheckError("VALIDATION_FAILED", "imageUrl is required for a launch."));
+      const parsed = exports_external.object(imageDir ? localLaunchTokenShape : launchTokenShape).omit({ imageUrl: true }).safeParse(args);
+      if (!parsed.success)
+        return launchControlError(new LaunchCheckError("VALIDATION_FAILED", parsed.error.message));
+    } catch (error) {
+      return launchControlError(error);
+    }
     const socialsProblem = socialsRefusal("socials" in args ? args.socials : undefined);
     if (socialsProblem) {
       return { content: [{ type: "text", text: imageRefusalBody(socialsProblem) }], isError: true };
@@ -13875,8 +14353,20 @@ function registerToolSubset(server, options) {
   register("candle_launch_and_seed", {
     title: "Launch a token and seed it",
     description: "Launch a new token from the account's embedded wallet, with an optional dev-buy seed, then " + "return the fresh market state and token links in one result. On solana a seed makes this " + (options.headlessSeed === true ? "the seed is a separate first-buy transaction in the same Jito bundle as the launch, so " + "both land or neither does. That works on every plan, Free included, and needs no " + "swap:write. On hood the seed is " : "the atomic launch: the launch and the seed are two transactions Candle signs and sends as " + "one Jito bundle, so both land or neither does. That needs Pro or Max (TIER_REQUIRED " + "otherwise) and swap:write on the key, and the result carries bundleId. On hood the seed is ") + "a best-effort follow-up. A launch with no seed works on every plan, Free included. MOVES " + "REAL FUNDS unless dryRun; dry-run first, which spends nothing. Seeds above the platform " + "dev-buy ceiling are rejected (DEV_BUY_TOO_HIGH): at most 0.5 SOL / 500 USDC / 2,000,000 " + "CNDL, or on an exp- curve 10% of the threshold when that is lower; the server holds the " + "creator's own seed to the effective ceiling, so launch with the largest devBuy it allows " + "and top up with candle_trade. " + LAUNCH_SHARED_SENTENCES + (imageDir ? IMAGE_PATH_DISCLOSURE : ""),
-    inputSchema: imageDir ? localLaunchAndSeedShape : launchAndSeedShape
+    inputSchema: checkableLaunchShape(imageDir ? localLaunchAndSeedShape : launchAndSeedShape)
   }, async (args) => {
+    if ("check" in args && args.check === true)
+      return launchCheck(args, getConfig(), doFetch);
+    try {
+      args = launchExecutionArgs(args);
+      if (!imageDir && args.imageUrl === undefined && !("imagePath" in args))
+        return launchControlError(new LaunchCheckError("VALIDATION_FAILED", "imageUrl is required for a launch."));
+      const parsed = exports_external.object(imageDir ? localLaunchAndSeedShape : launchAndSeedShape).omit({ imageUrl: true }).safeParse(args);
+      if (!parsed.success)
+        return launchControlError(new LaunchCheckError("VALIDATION_FAILED", parsed.error.message));
+    } catch (error) {
+      return launchControlError(error);
+    }
     const result2 = await executeLaunchAndSeed(args, getConfig(), doFetch, imageDir, undefined, {
       headlessSeed: options.headlessSeed === true
     });
@@ -13898,10 +14388,10 @@ function registerToolSubset(server, options) {
     const result2 = await executePerps(tool, args, getConfig(), env, doFetch);
     return { content: [{ type: "text", text: result2.text }], ...result2.isError ? { isError: true } : {} };
   };
-  const perpsWrite = " MOVES REAL FUNDS on Hyperliquid unless submit is false. Candle builds the action within this key's limits " + "(USD window, maximum leverage, maximum position, slippage and price bands, main-exchange markets only); this " + "server recomputes its hash and checks the action type and Candle's builder before signing, then submits it to " + "Hyperliquid itself. Needs perps:write on the key and CANDLE_KEY_SIGNER_PEM_FILE. A refusal names the limit " + "that refused it (error.limit).";
+  const perpsWrite = " MOVES REAL FUNDS on Hyperliquid unless submit is false. Candle builds the action within this key's limits " + "(USD window, maximum leverage, maximum position, slippage and price bands, main-exchange markets only); this " + "server recomputes its hash and checks the action type and Candle's builder before signing, then submits it to " + "Hyperliquid itself. Needs perps:write on the key and CANDLE_KEY_SIGNER_PEM_FILE for TEE signing. wallet=embedded uses the recorded server signature and requires no PEM; the embedded switch ships off. Embedded open/close generate client ids; repeat only the same id after an uncertain result. A refusal names the limit " + "that refused it (error.limit).";
   register("candle_perps_setup", {
     title: "Set up Hyperliquid perps",
-    description: "Approve Candle's Hyperliquid builder fee (0.1%) once for the key's EVM TEE wallet, and report the " + "account's mode and balance. Idempotent: nothing is signed when the approval is already on Hyperliquid. " + "Refused (PERPS_ACCOUNT_MODE) unless Hyperliquid itself shows the account in standard mode." + perpsWrite,
+    description: "Approve Candle's Hyperliquid builder fee (0.1%) once for the key's EVM TEE or embedded wallet, and report the " + "account's mode and balance. Idempotent: nothing is signed when the approval is already on Hyperliquid. " + "Refused (PERPS_ACCOUNT_MODE) unless Hyperliquid itself shows the account in standard mode." + perpsWrite,
     inputSchema: perpsShapes.candle_perps_setup
   }, perpsTool("candle_perps_setup"));
   register("candle_perps_open", {
@@ -13921,23 +14411,23 @@ function registerToolSubset(server, options) {
   }, perpsTool("candle_perps_cancel"));
   register("candle_perps_orders", {
     title: "Perps orders",
-    description: "Open orders on Hyperliquid for the key's EVM TEE wallet, and every action Candle built for it with what " + "the venue shows. Reads only; moves nothing.",
+    description: "Open orders on Hyperliquid for the key's EVM TEE or embedded wallet, and every action Candle built for it with what " + "the venue shows. Reads only; moves nothing.",
     inputSchema: perpsShapes.candle_perps_orders
   }, perpsTool("candle_perps_orders"));
   register("candle_perps_positions", {
     title: "Perps positions",
-    description: "Positions, account value and withdrawable balance on Hyperliquid for the key's EVM TEE wallet, read " + "live by its address. Also `rows` (per position: side, size, entry, mark, unrealized P&L, ROE, leverage, " + "liquidation price, liquidation distance, funding since open with Hyperliquid's sign where positive is paid, " + "margin, value, level), `accountLine` and `risk` (the candle_perps_risk report without positions), read by " + "this server from Hyperliquid directly. Reads only; moves nothing.",
+    description: "Positions, account value and withdrawable balance on Hyperliquid for the key's EVM TEE or embedded wallet, read " + "live by its address. Also `rows` (per position: side, size, entry, mark, unrealized P&L, ROE, leverage, " + "liquidation price, liquidation distance, funding since open with Hyperliquid's sign where positive is paid, " + "margin, value, level), `accountLine` and `risk` (the candle_perps_risk report without positions), read by " + "this server from Hyperliquid directly. Reads only; moves nothing.",
     inputSchema: perpsShapes.candle_perps_positions
   }, perpsTool("candle_perps_positions"));
   const riskRead = " Read by this server from Hyperliquid's public API; Candle is asked only for the wallet and the key's " + "thresholds. Reads only; moves nothing. Phase 1 has no server-side monitor: nothing warns you unless you " + "poll candle_perps_risk.";
   register("candle_perps_account", {
     title: "Perps account line",
-    description: "The Hyperliquid account line for the key's EVM TEE wallet: account value and margin used (totals, " + "isolated included), cross account value, free margin (an estimate), withdrawable (what can leave), " + "cross maintenance margin and the cross margin ratio (liquidation at 1), unrealized P&L, and over a recent " + "window (`since`, default 24h) realized P&L, fees and funding (positive received), with the risk level." + riskRead,
+    description: "The Hyperliquid account line for the key's EVM TEE or embedded wallet: account value and margin used (totals, " + "isolated included), cross account value, free margin (an estimate), withdrawable (what can leave), " + "cross maintenance margin and the cross margin ratio (liquidation at 1), unrealized P&L, and over a recent " + "window (`since`, default 24h) realized P&L, fees and funding (positive received), with the risk level." + riskRead,
     inputSchema: perpsRiskShapes.candle_perps_account
   }, perpsTool("candle_perps_account"));
   register("candle_perps_risk", {
     title: "Perps liquidation risk",
-    description: "The risk level now for the key's EVM TEE wallet: `level` ok, warn or critical, the `drivers` that put it " + "there (a position closer to liquidation than the warn or critical distance, default 15% and 7%; the cross " + "margin ratio above 0.6 or 0.8; a position with no mark is at least warn), `closest` at ok, the thresholds " + "applied, the account line and every position. warn and critical are results, not errors. An account mode " + "this cannot read, or a stale read, is an error with code PERPS_ACCOUNT_MODE or PERPS_READ_STALE: never " + "treat it as ok. One stateless read; poll it to watch (no hysteresis here)." + riskRead,
+    description: "The risk level now for the key's EVM TEE or embedded wallet: `level` ok, warn or critical, the `drivers` that put it " + "there (a position closer to liquidation than the warn or critical distance, default 15% and 7%; the cross " + "margin ratio above 0.6 or 0.8; a position with no mark is at least warn), `closest` at ok, the thresholds " + "applied, the account line and every position. warn and critical are results, not errors. An account mode " + "this cannot read, or a stale read, is an error with code PERPS_ACCOUNT_MODE or PERPS_READ_STALE: never " + "treat it as ok. One stateless read; poll it to watch (no hysteresis here)." + riskRead,
     inputSchema: perpsRiskShapes.candle_perps_risk
   }, perpsTool("candle_perps_risk"));
   register("candle_perps_thresholds", {
@@ -13950,7 +14440,7 @@ function registerToolSubset(server, options) {
     description: "Tighten this key's own Hyperliquid risk thresholds (bps): a higher distance, a lower ratio or a wider " + "band. A field set to null clears it; clear: true clears all. Anything looser than what applies now, " + "defaults included (clearing a field stored stricter than its default counts), is refused with " + "LOOSEN_REQUIRES_SESSION: only the owner loosens, with candle perps thresholds set --key <prefix>. " + "Changes only when warnings fire; moves no funds.",
     inputSchema: perpsRiskShapes.candle_perps_set_thresholds
   }, perpsTool("candle_perps_set_thresholds"));
-  const historyNote = " Read directly from Hyperliquid's public /info for the key's EVM TEE wallet (Candle only resolves which wallet; " + "the API key never goes to Hyperliquid), so any key that can list its wallets can read it and no signer is needed. " + "Wallet-level live venue data, not Candle's ledger and not an all-time total. Default window: the last 7 days, " + "fixed on the first page; pass nextCursor back as cursor for the next. truncated means coverage stopped short " + "(warnings say why). Rate limits and timeouts are errors (PERPS_UNAVAILABLE), never an empty page. Reads only.";
+  const historyNote = " Read directly from Hyperliquid's public /info for the key's EVM TEE or embedded wallet (Candle only resolves which wallet; " + "the API key never goes to Hyperliquid), so any key that can list its wallets can read it and no signer is needed. " + "Wallet-level live venue data, not Candle's ledger and not an all-time total. Default window: the last 7 days, " + "fixed on the first page; pass nextCursor back as cursor for the next. truncated means coverage stopped short " + "(warnings say why). Rate limits and timeouts are errors (PERPS_UNAVAILABLE), never an empty page. Reads only.";
   register("candle_perps_fills", {
     title: "Perps fills",
     description: "One page of the wallet's Hyperliquid perp fills: time, coin, side, size, price, closedPnl (gross), fee " + "(already includes builderFee; never subtract it again). Hyperliquid serves only the 10,000 most recent " + "fills." + historyNote,
@@ -13998,7 +14488,7 @@ function registerToolSubset(server, options) {
   }, perpsTool("candle_perps_reduce_only"));
   register("candle_perps_deposit", {
     title: "Deposit to Hyperliquid",
-    description: "MOVES REAL FUNDS unless submit is false. Deposit onto the key's Hyperliquid account through Relay: SOL or " + "USDC from its Solana TEE wallet, or ETH or USDG from its Hood TEE wallet, credited as Hyperliquid perps " + "USDC at the key's EVM TEE wallet's own address (Candle resolves it; no recipient is taken). Refused below a " + "floor that covers Hyperliquid's 1 USDC first-deposit charge. No Candle fee. Needs swap:write (any cap on " + "the asset still applies), and CANDLE_KEY_SIGNER_PEM_FILE to sign. There is no withdrawal from Hyperliquid yet.",
+    description: "MOVES REAL FUNDS unless submit is false. Deposit onto the key's Hyperliquid account through Relay: SOL or " + "USDC from its Solana wallet, or ETH or USDG from its Hood wallet (TEE or wallet=embedded), credited as Hyperliquid perps " + "USDC at the key's EVM TEE wallet's own address (Candle resolves it; no recipient is taken). Refused below a " + "floor that covers Hyperliquid's 1 USDC first-deposit charge. No Candle fee. Needs swap:write (any cap on " + "the asset still applies), and CANDLE_KEY_SIGNER_PEM_FILE to sign. There is no withdrawal from Hyperliquid yet.",
     inputSchema: perpsDepositShape
   }, async (args) => {
     const result2 = await executePerpsDeposit(args, getConfig(), env, doFetch);
@@ -14044,6 +14534,28 @@ function registerToolSubset(server, options) {
     inputSchema: labShapes.candle_lab_edges,
     annotations: labRead
   }, labTool("candle_lab_edges"));
+  const signalRecordTool = (tool) => async (args) => {
+    const result2 = await executeSignalRecordTool(tool, args, getConfig(), env, doFetch);
+    return { content: [{ type: "text", text: result2.text }], ...result2.isError ? { isError: true } : {} };
+  };
+  register("candle_signal_scorecard", {
+    title: SIGNAL_RECORD_TITLES.candle_signal_scorecard,
+    description: SIGNAL_RECORD_DESCRIPTIONS.candle_signal_scorecard,
+    inputSchema: signalRecordShapes.candle_signal_scorecard,
+    annotations: { ...SIGNAL_RECORD_ANNOTATIONS }
+  }, signalRecordTool("candle_signal_scorecard"));
+  register("candle_signal_records", {
+    title: SIGNAL_RECORD_TITLES.candle_signal_records,
+    description: SIGNAL_RECORD_DESCRIPTIONS.candle_signal_records,
+    inputSchema: signalRecordShapes.candle_signal_records,
+    annotations: { ...SIGNAL_RECORD_ANNOTATIONS }
+  }, signalRecordTool("candle_signal_records"));
+  register("candle_signal_record", {
+    title: SIGNAL_RECORD_TITLES.candle_signal_record,
+    description: SIGNAL_RECORD_DESCRIPTIONS.candle_signal_record,
+    inputSchema: signalRecordShapes.candle_signal_record,
+    annotations: { ...SIGNAL_RECORD_ANNOTATIONS }
+  }, signalRecordTool("candle_signal_record"));
 }
 async function registerEligibleProfileTool(server, env = process.env, doFetch = fetch, resolved) {
   const cfg = serverConfig(server, env, resolved);
@@ -14074,7 +14586,7 @@ async function registerEligibleProfileTool(server, env = process.env, doFetch = 
   }
   return eligible;
 }
-var VAMP_CANDIDATES_DESCRIPTION, localProfileTools, STAKING_DISCLOSURE = "No instant unstake. Read pool.withdrawalTimelockSeconds for the wait. Solana rewards accrue to the holding wallet. sCNDL in any eligible account wallet counts toward Pro and earns the account's Hood staking reward, except a wallet another account also claims, wallets past the 200-wallet cap, and an account with no EVM wallet. CNDL in a pending withdrawal counts toward nothing for Pro.", stakingWriteShape, TOOL_NAMES, LAB_TOOL_NAMES, PROFILE_EDIT_TOOL_NAMES, isProfileEditTool = (name) => PROFILE_EDIT_TOOL_NAMES.includes(name), OPERATION_NOT_FOUND_RULE, SWAP_RECEIPT_DESCRIPTION, SWAP_SETTLEMENT_REREAD, getMarketShape, quoteShape, priceHistoryShape, TOKEN_EVENTS_LIMIT_MESSAGE = "limit must be a whole number from 1 to 1000", tokenEventsLimit, TOKEN_EVENTS_KIND_NOTE = "kept back from the request and applied to the returned page by this server, so a filtered page can be shorter than limit while older events of other kinds remain: page with nextCursor as before until it is null", tokenCardShape, tokenEventsShape, tokenForensicsShape, FEED_LIMIT_MESSAGE = "limit must be a whole number from 1 to 200", feedLimit, getFeedShape, reportActivityShape, getAgentProfileShape, listAgentsShape, createPostShape, deletePostShape, listAgentPostsShape, getAgentPositionsShape, getOperationShape, getSwapReceiptShape, vampCandidatesShape, getFeesShape, atomicPayerShape, atomicLaunchDryRunShape, claimFeesShape, resolveTokenShape, tradingWalletsShape, spendableBalancesShape, profileWalletsShape, profilePnlShape, profileTradesShape, noArgsShape, setProfileWalletsShape, swapShape, tradeShape, tradeExecuteShape, tokenImageUrl, tokenBannerUrl, localImageShape, localLaunchTokenShape, localLaunchAndSeedShape, IMAGE_PATH_DISCLOSURE, transferShape, sweepShape, PROFILE_PNL_HYPERLIQUID, localServerConfigs;
+var VAMP_CANDIDATES_DESCRIPTION, localProfileTools, STAKING_DISCLOSURE = "No instant unstake. Read pool.withdrawalTimelockSeconds for the wait. Solana rewards accrue to the holding wallet. sCNDL in any eligible account wallet counts toward Pro and earns the account's Hood staking reward, except a wallet another account also claims, wallets past the 200-wallet cap, and an account with no EVM wallet. CNDL in a pending withdrawal counts toward nothing for Pro.", stakingWriteShape, TOOL_NAMES, LAB_TOOL_NAMES, SIGNAL_RECORD_TOOL_NAMES, isSignalRecordTool = (name) => SIGNAL_RECORD_TOOL_NAMES.includes(name), PROFILE_EDIT_TOOL_NAMES, isProfileEditTool = (name) => PROFILE_EDIT_TOOL_NAMES.includes(name), OPERATION_NOT_FOUND_RULE, SWAP_RECEIPT_DESCRIPTION, SWAP_SETTLEMENT_REREAD, getMarketShape, quoteShape, priceHistoryShape, TOKEN_EVENTS_LIMIT_MESSAGE = "limit must be a whole number from 1 to 1000", tokenEventsLimit, TOKEN_EVENTS_KIND_NOTE = "kept back from the request and applied to the returned page by this server, so a filtered page can be shorter than limit while older events of other kinds remain: page with nextCursor as before until it is null", tokenCardShape, tokenEventsShape, tokenForensicsShape, FEED_LIMIT_MESSAGE = "limit must be a whole number from 1 to 200", feedLimit, getFeedShape, reportActivityShape, getAgentProfileShape, listAgentsShape, createPostShape, deletePostShape, listAgentPostsShape, getAgentPositionsShape, getOperationShape, getSwapReceiptShape, vampCandidatesShape, getFeesShape, atomicPayerShape, atomicLaunchDryRunShape, claimFeesShape, resolveTokenShape, tradingWalletsShape, spendableBalancesShape, profileWalletsShape, profilePnlShape, profileTradesShape, noArgsShape, setProfileWalletsShape, swapShape, tradeShape, tradeExecuteShape, tokenImageUrl, tokenBannerUrl, localImageShape, localLaunchTokenShape, localLaunchAndSeedShape, IMAGE_PATH_DISCLOSURE, transferShape, sweepShape, PROFILE_PNL_HYPERLIQUID, localServerConfigs;
 var init_tools = __esm(() => {
   init_zod();
   init_chain_registry();
@@ -14083,6 +14595,8 @@ var init_tools = __esm(() => {
   init_convert();
   init_image();
   init_lab_tools();
+  init_launch_check();
+  init_launch_preflight();
   init_launch_schema();
   init_market_disclosure();
   init_orchestrate();
@@ -14090,6 +14604,7 @@ var init_tools = __esm(() => {
   init_perps_markets();
   init_perps_risk();
   init_plans();
+  init_signal_record_tools();
   init_swap_receipt();
   init_token_metadata();
   init_token_pages();
@@ -14196,7 +14711,10 @@ var init_tools = __esm(() => {
     "candle_lab_replay",
     "candle_lab_replay_result",
     "candle_lab_runners",
-    "candle_lab_edges"
+    "candle_lab_edges",
+    "candle_signal_scorecard",
+    "candle_signal_records",
+    "candle_signal_record"
   ];
   LAB_TOOL_NAMES = [
     "candle_lab_status",
@@ -14204,6 +14722,11 @@ var init_tools = __esm(() => {
     "candle_lab_replay_result",
     "candle_lab_runners",
     "candle_lab_edges"
+  ];
+  SIGNAL_RECORD_TOOL_NAMES = [
+    "candle_signal_scorecard",
+    "candle_signal_records",
+    "candle_signal_record"
   ];
   PROFILE_EDIT_TOOL_NAMES = [
     "candle_update_profile",
@@ -15153,11 +15676,11 @@ function createHmacDrbg(hashLen, qByteLen, hmacFn) {
   };
   return genUntil;
 }
-function _validateObject(object2, fields2, optFields = {}) {
-  if (!object2 || typeof object2 !== "object")
+function _validateObject(object3, fields2, optFields = {}) {
+  if (!object3 || typeof object3 !== "object")
     throw new Error("expected valid options object");
   function checkField(fieldName, expectedType, isOpt) {
-    const val = object2[fieldName];
+    const val = object3[fieldName];
     if (isOpt && val === undefined)
       return;
     const current = typeof val;
@@ -17817,18 +18340,18 @@ function signTransaction(tx, secret) {
   }
   const signature = secp256k1.sign(signingPayload(tx), secret, { lowS: true, prehash: false });
   const yParity = signature.recovery === 1 ? 1 : 0;
-  const raw = concat(TYPE_2, rlpEncode([
+  const raw2 = concat(TYPE_2, rlpEncode([
     ...unsignedFields(tx),
     uintToMinimalBytes(BigInt(yParity)),
     uintToMinimalBytes(signature.r),
     uintToMinimalBytes(signature.s)
   ]));
-  return { raw, hash: bytesToHex2(keccak_256(raw)), yParity, r: signature.r, s: signature.s };
+  return { raw: raw2, hash: bytesToHex2(keccak_256(raw2)), yParity, r: signature.r, s: signature.s };
 }
-function signedTransactionCovers(raw, tx) {
-  if (raw[0] !== 2)
+function signedTransactionCovers(raw2, tx) {
+  if (raw2[0] !== 2)
     return false;
-  const list = raw.subarray(1);
+  const list = raw2.subarray(1);
   const body = rlpListBody(list);
   if (body === undefined)
     return false;
@@ -17860,9 +18383,9 @@ function rlpListBody(bytes) {
     return;
   return bytes.subarray(start);
 }
-function formatUnits(raw, decimals) {
-  const negative = raw < 0n;
-  const magnitude = negative ? -raw : raw;
+function formatUnits(raw2, decimals) {
+  const negative = raw2 < 0n;
+  const magnitude = negative ? -raw2 : raw2;
   const base2 = 10n ** BigInt(decimals);
   const whole = magnitude / base2;
   const fraction = decimals === 0 ? "" : (magnitude % base2).toString().padStart(decimals, "0").replace(/0+$/, "");
@@ -17875,10 +18398,10 @@ function parseUnits(decimal4, decimals) {
   const [whole, fraction = ""] = decimal4.split(".");
   if (fraction.length > decimals)
     return { ok: false, reason: "precision" };
-  const raw = BigInt((whole ?? "0") + fraction.padEnd(decimals, "0"));
-  if (raw === 0n)
+  const raw2 = BigInt((whole ?? "0") + fraction.padEnd(decimals, "0"));
+  if (raw2 === 0n)
     return { ok: false, reason: "zero" };
-  return { ok: true, raw };
+  return { ok: true, raw: raw2 };
 }
 function addressTopic(address) {
   return `0x${"0".repeat(24)}${address.toLowerCase().replace(/^0x/, "")}`;
@@ -17979,8 +18502,8 @@ function createEvmRpc(url, fetchFn) {
         throw new EvmRpcError("rpc", "eth_call", "RPC eth_call answered without data");
       return hexToBytes2(r);
     },
-    async sendRawTransaction(raw) {
-      const r = await call2("eth_sendRawTransaction", [bytesToHex2(raw)]);
+    async sendRawTransaction(raw2) {
+      const r = await call2("eth_sendRawTransaction", [bytesToHex2(raw2)]);
       if (typeof r !== "string") {
         throw new EvmRpcError("rpc", "eth_sendRawTransaction", "RPC eth_sendRawTransaction answered without a hash");
       }
@@ -18084,17 +18607,17 @@ function resolveEvmRpcUrl(flag, envValue, flagName) {
   const fromFlag = flag?.trim() || undefined;
   const fromEnv = envValue?.trim() || undefined;
   const url = fromFlag ?? fromEnv ?? DEFAULT_HOOD_RPC_URL;
-  const source = fromFlag !== undefined ? flagName : fromEnv !== undefined ? EVM_RPC_URL_ENV : undefined;
+  const source2 = fromFlag !== undefined ? flagName : fromEnv !== undefined ? EVM_RPC_URL_ENV : undefined;
   let parsed;
   try {
     parsed = new URL(url);
   } catch {
-    return { error: `${source ?? flagName} is not a valid URL: ${url}` };
+    return { error: `${source2 ?? flagName} is not a valid URL: ${url}` };
   }
   const local = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
   if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && local)) {
     return {
-      error: `${source ?? flagName} must be https:// (plain http is allowed only for 127.0.0.1 / localhost).`
+      error: `${source2 ?? flagName} must be https:// (plain http is allowed only for 127.0.0.1 / localhost).`
     };
   }
   return { url, builtIn: url === DEFAULT_HOOD_RPC_URL };
@@ -20374,10 +20897,10 @@ async function serializeKeystore(entries2, key, salt, iterations, purpose) {
   return `${JSON.stringify(file, null, 2)}
 `;
 }
-async function readKeystore(raw, passphrase, opts = {}) {
+async function readKeystore(raw2, passphrase, opts = {}) {
   let file;
   try {
-    file = JSON.parse(raw);
+    file = JSON.parse(raw2);
   } catch {
     throw new Error("The keystore file is not valid JSON.");
   }
@@ -21595,10 +22118,10 @@ async function derivePassphraseKek(passphrase, kdf, notice2, derivationLabel = "
     testKekReuse?.set(reuseKey, Uint8Array.from(kek));
   return ownSecret(kek);
 }
-async function importAesKey(raw) {
-  if (raw.length !== 32)
-    throw new VaultError("VAULT_UNREADABLE", `expected a 32-byte key, got ${raw.length}`);
-  return crypto.subtle.importKey("raw", raw, { name: "AES-GCM", length: 256 }, false, [
+async function importAesKey(raw2) {
+  if (raw2.length !== 32)
+    throw new VaultError("VAULT_UNREADABLE", `expected a 32-byte key, got ${raw2.length}`);
+  return crypto.subtle.importKey("raw", raw2, { name: "AES-GCM", length: 256 }, false, [
     "encrypt",
     "decrypt"
   ]);
@@ -21822,10 +22345,10 @@ function evmRecordKeyAad(vaultId) {
 function refuse(code, message) {
   throw new VaultError(code, message);
 }
-function parseVaultFile(raw) {
+function parseVaultFile(raw2) {
   let value;
   try {
-    value = JSON.parse(raw);
+    value = JSON.parse(raw2);
   } catch {
     refuse("VAULT_UNREADABLE", "The vault file is not valid JSON.");
   }
@@ -22583,19 +23106,19 @@ function splitRecord(bytes) {
 }
 async function appendEvmRecordEntry(input) {
   const path = evmRecordPath(input.vaultPath);
-  let raw;
+  let raw2;
   try {
     const bytes = await readIfPresent(input.vaultPath);
-    raw = bytes === null ? null : bytes.toString("utf8");
+    raw2 = bytes === null ? null : bytes.toString("utf8");
   } catch (error) {
     return { written: false, reason: "header-unreadable", detail: messageOf(error), path };
   }
-  if (raw === null)
+  if (raw2 === null)
     return { written: false, reason: "no-vault", detail: `no vault at ${input.vaultPath}`, path };
   let publicKey;
   let vaultId;
   try {
-    const header = parseVaultFile(raw);
+    const header = parseVaultFile(raw2);
     vaultId = header.vaultId;
     publicKey = header.version === EVM_TEE_VAULT_VERSION ? header.evmRecordPublicKey : undefined;
   } catch (error) {
@@ -22796,14 +23319,14 @@ function sourceDigest(vaultId, bytes) {
   return b64u(sha2562(joined));
 }
 async function readSidecar(path) {
-  let raw;
+  let raw2;
   try {
-    raw = await readFile4(path, "utf8");
+    raw2 = await readFile4(path, "utf8");
   } catch {
     return null;
   }
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = JSON.parse(raw2);
     if (typeof parsed?.vaultId !== "string" || !Number.isInteger(parsed?.lastGeneration))
       return null;
     return {
@@ -22884,9 +23407,9 @@ import { dirname as dirname4, join as join3 } from "node:path";
 function candleConfigDir(env, home) {
   const configured = env.CANDLE_CONFIG_DIR?.trim();
   if (configured) {
-    const refusal2 = refuseUnexpandedTilde(CONFIG_DIR_ENV, configured);
-    if (refusal2 !== undefined)
-      throw new UsageError(refusal2);
+    const refusal3 = refuseUnexpandedTilde(CONFIG_DIR_ENV, configured);
+    if (refusal3 !== undefined)
+      throw new UsageError(refusal3);
     return configured;
   }
   return join3(home, ".config", "candle");
@@ -22959,25 +23482,25 @@ async function inspectConfigDir(path) {
 function closeVault(vault) {
   wipe(vault.dek);
 }
-async function unlockVault(path, raw, request, opts = {}) {
-  const file = parseVaultFile(raw);
+async function unlockVault(path, raw2, request, opts = {}) {
+  const file = parseVaultFile(raw2);
   const envelope = pickEnvelope(file, request);
   const dek = await unwrapDek(file, envelope, request, opts.notice, opts.derivationLabel);
   if (dek.length !== DEK_BYTES) {
     wipe(dek);
     throw new VaultError("VAULT_UNLOCK_FAILED", "The unwrapped key is the wrong length; this file is corrupt.");
   }
-  return openWithDek(path, raw, file, envelope, dek);
+  return openWithDek(path, raw2, file, envelope, dek);
 }
-async function reopenWithHeldDek(path, raw, held) {
-  const file = parseVaultFile(raw);
+async function reopenWithHeldDek(path, raw2, held) {
+  const file = parseVaultFile(raw2);
   if (file.vaultId !== held.file.vaultId) {
     throw new VaultError("VAULT_UNLOCK_FAILED", `${path} is not the vault this command unlocked.`);
   }
   const envelope = file.envelopes.find((candidate) => candidate.id === held.envelope.id) ?? held.envelope;
-  return openWithDek(path, raw, file, envelope, new Uint8Array(held.dek));
+  return openWithDek(path, raw2, file, envelope, new Uint8Array(held.dek));
 }
-async function openWithDek(path, raw, file, envelope, dek) {
+async function openWithDek(path, raw2, file, envelope, dek) {
   try {
     const payloadKey = await derivePayloadKey(dek, unb64u(file.vaultId, "vaultId"));
     const indexBytes = await open2(payloadKey, file.index, canonicalHeader(file), {
@@ -22996,7 +23519,7 @@ async function openWithDek(path, raw, file, envelope, dek) {
       const secret = await openEvmRecordKey(payloadKey, file.vaultId, index.evmRecordKey, file.evmRecordPublicKey);
       wipe(secret);
     }
-    return { path, raw, file, index, payloadKey, dek, envelope };
+    return { path, raw: raw2, file, index, payloadKey, dek, envelope };
   } catch (error) {
     wipe(dek);
     throw error;
@@ -23051,8 +23574,8 @@ function pickEnvelope(file, request) {
   }
   return first;
 }
-async function unlockWithPassphrase(path, raw, passphrase, opts = {}) {
-  const file = parseVaultFile(raw);
+async function unlockWithPassphrase(path, raw2, passphrase, opts = {}) {
+  const file = parseVaultFile(raw2);
   const envelopes = file.envelopes.filter((envelope) => envelope.factor === "passphrase");
   if (envelopes.length === 0) {
     throw new VaultError("VAULT_FACTOR_UNAVAILABLE", "This vault has no passphrase envelope.");
@@ -23060,7 +23583,7 @@ async function unlockWithPassphrase(path, raw, passphrase, opts = {}) {
   let last;
   for (const envelope of envelopes) {
     try {
-      return await unlockVault(path, raw, { factor: "passphrase", passphrase, envelopeId: envelope.id }, opts);
+      return await unlockVault(path, raw2, { factor: "passphrase", passphrase, envelopeId: envelope.id }, opts);
     } catch (error) {
       if (error instanceof VaultError && error.code !== "VAULT_UNLOCK_FAILED")
         throw error;
@@ -23520,16 +24043,16 @@ class EncryptedFileSecretStore {
     throw new Error("No keychain available and no CANDLE_KEYRING_PASSPHRASE set; set it to use the encrypted file store on this machine");
   }
   async readContents() {
-    let raw;
+    let raw2;
     try {
-      raw = await readFile6(this.path, "utf8");
+      raw2 = await readFile6(this.path, "utf8");
     } catch (err) {
       if (err.code === "ENOENT")
         return {};
       throw err;
     }
     try {
-      return JSON.parse(raw);
+      return JSON.parse(raw2);
     } catch {
       throw new Error(`The credentials file at ${this.path} is not valid JSON and cannot be read. Delete it and re-run ` + "the command that stores your device token / API key to recreate it.");
     }
@@ -23968,23 +24491,23 @@ var init_key_signers = __esm(() => {
 });
 
 // src/solana-endpoint.ts
-function validateSolanaRpcUrl(url, source) {
+function validateSolanaRpcUrl(url, source2) {
   let parsed;
   try {
     parsed = new URL(url);
   } catch {
-    return `${source} is not a valid URL`;
+    return `${source2} is not a valid URL`;
   }
   const local = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
   if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && local)) {
-    return `${source} must be https:// (plain http is allowed only for 127.0.0.1 / localhost).`;
+    return `${source2} must be https:// (plain http is allowed only for 127.0.0.1 / localhost).`;
   }
   return;
 }
-function sourceLabel(source, ctx) {
-  if (source === "flag")
+function sourceLabel(source2, ctx) {
+  if (source2 === "flag")
     return "--rpc-url";
-  if (source === "env")
+  if (source2 === "env")
     return RPC_URL_ENV;
   return `profile ${ctx.profile}'s rpcUrl`;
 }
@@ -24004,13 +24527,13 @@ function resolveSolanaEndpoint(ctx, flag, config) {
     ["env", ctx.deps.env[RPC_URL_ENV]?.trim() || undefined],
     ["profile", profileUrl]
   ];
-  for (const [source, url] of candidates) {
+  for (const [source2, url] of candidates) {
     if (url === undefined)
       continue;
-    const fault = validateSolanaRpcUrl(url, sourceLabel(source, ctx));
+    const fault = validateSolanaRpcUrl(url, sourceLabel(source2, ctx));
     if (fault !== undefined)
       return { error: fault };
-    return { url, host: new URL(url).host, source };
+    return { url, host: new URL(url).host, source: source2 };
   }
   return { url: PUBLIC_SOLANA_RPC, host: PUBLIC_SOLANA_RPC_HOST, source: "default" };
 }
@@ -24220,13 +24743,13 @@ function rawAmount(value, decimals) {
   const [whole = "", fraction = ""] = value.split(".");
   if (fraction.length > decimals)
     throw new TradingError("INVALID_AMOUNT", `This asset supports ${decimals} decimal places.`);
-  const raw = BigInt(whole + fraction.padEnd(decimals, "0"));
-  if (raw <= 0n)
+  const raw2 = BigInt(whole + fraction.padEnd(decimals, "0"));
+  if (raw2 <= 0n)
     throw new TradingError("INVALID_AMOUNT", "Amount must be greater than zero.");
-  return raw.toString();
+  return raw2.toString();
 }
-function decimalAmount(raw, decimals) {
-  const digits = BigInt(raw).toString().padStart(decimals + 1, "0");
+function decimalAmount(raw2, decimals) {
+  const digits = BigInt(raw2).toString().padStart(decimals + 1, "0");
   return decimals ? `${digits.slice(0, -decimals)}.${digits.slice(-decimals)}` : digits;
 }
 async function tradingKey(ctx) {
@@ -24249,8 +24772,8 @@ async function request(ctx, key, path, body) {
     env: ctx.deps.env
   });
   if (!result2.ok) {
-    const raw = result2.raw;
-    const error = raw?.error;
+    const raw2 = result2.raw;
+    const error = raw2?.error;
     const details = {};
     const kept = path === "/api/v1/agent/swap/submit" ? SWAP_SUBMIT_EVIDENCE : TRADE_BROADCAST_PATHS.has(path) ? TRADE_BROADCAST_EVIDENCE : ["field"];
     for (const field of kept) {
@@ -24493,16 +25016,16 @@ function legTransaction(leg) {
 }
 async function relaySignEvmLeg(ctx, key, wallet3, leg) {
   const result2 = await request(ctx, key, `/api/v1/agent/wallets/${encodeURIComponent(wallet3.id)}/sign`, evmAuthorizationSignature(wallet3, leg));
-  const raw = result2.signedTransaction;
-  if (typeof raw !== "string" || !/^0x02([0-9a-fA-F]{2})+$/.test(raw))
+  const raw2 = result2.signedTransaction;
+  if (typeof raw2 !== "string" || !/^0x02([0-9a-fA-F]{2})+$/.test(raw2))
     throw new TradingError("INVALID_RESPONSE", "The relay did not return a raw signed type-2 transaction.");
-  const bytes = hexToBytes2(raw);
+  const bytes = hexToBytes2(raw2);
   if (!signedTransactionCovers(bytes, legTransaction(leg)))
     throw new TradingError("INVALID_RESPONSE", "The relay returned a signature over a different transaction than the leg Candle built; nothing was sent.");
-  return { raw, hash: bytesToHexHash(bytes) };
+  return { raw: raw2, hash: bytesToHexHash(bytes) };
 }
-function bytesToHexHash(raw) {
-  return `0x${Buffer.from(keccak_256(raw)).toString("hex")}`;
+function bytesToHexHash(raw2) {
+  return `0x${Buffer.from(keccak_256(raw2)).toString("hex")}`;
 }
 function plannedLegKinds(first, count2, hasFee, primary = "trade") {
   if (primary === "bridgeDeposit") {
@@ -24615,8 +25138,8 @@ async function runSequencedLegs(ctx, key, opts) {
 function describeLanded(landed) {
   return landed.length === 0 ? " No leg is confirmed yet." : ` Confirmed: ${landed.map((leg) => `${leg.kind} ${safeText(leg.hash)}`).join(", ")}.`;
 }
-function recoveryEvidenceFrom(raw, error) {
-  const top = raw && typeof raw === "object" ? raw : {};
+function recoveryEvidenceFrom(raw2, error) {
+  const top = raw2 && typeof raw2 === "object" ? raw2 : {};
   const pick = (key) => top[key] !== undefined ? top[key] : error[key];
   const out = {};
   for (const key of ["legEvidence", "reconciliation", "recoveryRequired", "safeAction", "pollAfterMs", "legIndex"]) {
@@ -24626,14 +25149,14 @@ function recoveryEvidenceFrom(raw, error) {
   }
   return out;
 }
-function errorObject(raw) {
-  if (!raw || typeof raw !== "object")
+function errorObject(raw2) {
+  if (!raw2 || typeof raw2 !== "object")
     return {};
-  const error = raw.error;
+  const error = raw2.error;
   return error && typeof error === "object" ? error : {};
 }
-function landedFrom(raw, error) {
-  const top = raw && typeof raw === "object" ? raw.landedLegs : undefined;
+function landedFrom(raw2, error) {
+  const top = raw2 && typeof raw2 === "object" ? raw2.landedLegs : undefined;
   const list = Array.isArray(top) ? top : Array.isArray(error.landedLegs) ? error.landedLegs : [];
   const parsed = exports_external.array(landedLegSchema).safeParse(list);
   return parsed.success ? parsed.data.map((leg) => ({ kind: leg.kind, hash: leg.hash })) : [];
@@ -24689,7 +25212,7 @@ async function claimOperation(ctx, key, id, kind) {
 function safeText(value) {
   return String(value).replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
 }
-async function confirmQuote(ctx, quote, yes) {
+function printQuote(ctx, quote) {
   const output = ctx.json ? ctx.deps.stderr : ctx.deps.stdout;
   if (quote.intent)
     output.write(`${safeText(quote.intent)}
@@ -24735,6 +25258,9 @@ ${quote.fee ? `Tier fee: ${safeText(quote.fee.bps)} bps (${safeText(quote.fee.fe
   for (const risk of quote.tokenRisks ?? [])
     output.write(`Warning (${safeText(risk.mint)}): ${safeText(risk.message)}
 `);
+}
+async function confirmQuote(ctx, quote, yes) {
+  printQuote(ctx, quote);
   if (yes)
     return true;
   if (!ctx.deps.isTTY.stdin)
@@ -25111,12 +25637,12 @@ async function relaySolanaDepositProblem(transactionBase64, payer, rpc) {
 function walletBridgesOf(body) {
   if (!body || typeof body !== "object" || !("bridges" in body))
     return;
-  const raw = body.bridges;
-  if (raw === undefined)
+  const raw2 = body.bridges;
+  if (raw2 === undefined)
     return;
-  if (raw === null)
+  if (raw2 === null)
     return null;
-  const parsed = exports_external.array(walletBridgeSchema).safeParse(raw);
+  const parsed = exports_external.array(walletBridgeSchema).safeParse(raw2);
   return parsed.success ? parsed.data : null;
 }
 function direction(bridge) {
@@ -26406,21 +26932,22 @@ async function swapCheck(args, ctx) {
     }
     const from = classifyAsset(parsed.positionals[0]);
     const to = classifyAsset(parsed.positionals[1]);
-    if (from.chain !== "solana" || to.chain !== "solana")
-      throw new TradingError("VALIDATION_FAILED", "Dry run checks Solana TEE pairs; Hood and bridge pairs are unsupported.");
-    if (parsed.values["--to"] !== undefined || parsed.booleans.has("--wait")) {
-      writeUsageFailure(ctx.deps, "--to selects a bridge destination; --wait follows a bridge or a Hood TEE swap without --dry-run. Follow a Hood swap with candle swap status --operation <id>, or a job with candle swap status <client-trade-id>.", ctx.json);
+    const bridge = bridgePair(from, to);
+    if (from.chain !== to.chain && !bridge)
+      throw new TradingError("CHAIN_MISMATCH", "Only SOL or USDC and ETH or USDG bridge between chains.");
+    if (!bridge && parsed.values["--to"] !== undefined || parsed.booleans.has("--wait")) {
+      writeUsageFailure(ctx.deps, "--to selects a bridge destination; --wait cannot be used with --dry-run.", ctx.json);
       return 2;
     }
-    if (from.asset === to.asset || !from.base && !to.base)
-      throw new TradingError("PAIR_UNSUPPORTED", "Choose distinct assets with SOL, USDC or CNDL on one side.");
+    if (from.asset === to.asset || !bridge && !from.base && !to.base)
+      throw new TradingError("PAIR_UNSUPPORTED", "Choose distinct assets with a base asset on one side.");
     rawAmount(parsed.values["--amount"], 18);
     const key = await tradingKey(ctx);
     const listing = await diagnosticListing(ctx, key);
     let row;
     let payable;
     try {
-      const selected = await selectTradingPayer(ctx, key, parsed.values["--wallet"], listing);
+      const selected = await selectTradingPayer(ctx, key, parsed.values["--wallet"], listing, from.chain);
       if (selected.kind === "embedded")
         throw new TradingError("VALIDATION_FAILED", "dry run checks TEE payers");
       row = selected.row;
@@ -26433,7 +26960,9 @@ async function swapCheck(args, ctx) {
     }
     const records = await readWalletRecords(ctx, key);
     const { report, wallet: wallet3 } = await inspectReport(ctx, key, row, listing, records, payable, parsed.values["--wallet"], from.chain);
-    if (wallet3)
+    if (wallet3 && (from.chain === "hood" || bridge))
+      await previewCheck(ctx, key, wallet3, report, listing, from, to, parsed.values, slippage);
+    else if (wallet3)
       await buildCheck(ctx, key, wallet3, report, from.asset, to.asset, parsed.values["--amount"], slippage, parsed.values["--rpc-url"], false);
     else
       report.checks.push(skipped("quote", report.checks.find((check) => check.status === "fail")?.id ?? "signer"), skipped("spend", "quote"));
@@ -26442,13 +26971,130 @@ async function swapCheck(args, ctx) {
     return tradingFailure(ctx, error);
   }
 }
-var pass = (id) => ({ id, status: "pass" }), skipped = (id, because) => ({ id, status: "skipped", because }), linkedRow;
+async function previewCheck(ctx, key, wallet3, report, listing, from, to, flags, slippage) {
+  const blocked = report.checks.find((check) => check.status === "fail");
+  if (blocked) {
+    report.checks.push(skipped("quote", blocked.id));
+    return;
+  }
+  try {
+    const bridge = bridgePair(from, to);
+    const payer = { type: "linked", linkedWalletId: wallet3.id };
+    if (bridge) {
+      const matching = flags["--to"] === undefined ? listing.rows.filter((row) => rowChain(row) === to.chain && row.active) : listing.rows.filter((row) => matchesName(row, flags["--to"]));
+      const destination = matching[0];
+      if (matching.length !== 1 || !destination || rowChain(destination) !== to.chain || !destination.active)
+        throw new TradingError("BRIDGE_DESTINATION_MISSING", "Name one verified-active TEE destination on the other chain with --to.");
+      const amountRaw2 = rawAmount(flags["--amount"], BRIDGE_ASSETS[bridge.from].decimals);
+      const answer = await request(ctx, key, "/api/v1/agent/swap/preview", {
+        from: from.asset,
+        to: to.asset,
+        amountRaw: amountRaw2,
+        maxSlippageBps: slippage,
+        payer,
+        toWalletId: destination.id
+      });
+      const parsed = bridgePreviewSchema().safeParse(answer);
+      if (!parsed.success)
+        throw new TradingError("INVALID_RESPONSE", "Candle did not return a complete bridge preview.");
+      const data = parsed.data;
+      const same = (a, b, chain2) => chain2 === "hood" ? sameEvmAddress(a, b) : a === b;
+      if (data.chain !== from.chain || !same(data.walletAddress, wallet3.address, from.chain) || data.route.from !== from.asset || data.route.to !== to.asset || data.destination.chain !== to.chain || data.destination.linkedWalletId !== destination.id || !same(data.destination.address, destination.address, to.chain) || data.outDecimals !== BRIDGE_ASSETS[bridge.to].decimals || data.fee.bps !== 0 || data.fee.feeRaw !== "0")
+        throw new TradingError("INVALID_RESPONSE", "The bridge preview does not match the payer, pair, destination or zero Candle fee.");
+      if (from.chain === "hood") {
+        if (!data.firstLeg || !bridgePlanAdmitted(bridge.from, data.legs) || data.firstLeg.kind !== data.legs[0])
+          throw new TradingError("INVALID_RESPONSE", "The preview has no complete Hood bridge gas or leg plan.");
+      } else if (data.legs.length !== 1 || data.legs[0] !== "bridgeDeposit" || !/^[0-9]+$/.test(String(data.gas.networkFeeRaw ?? "")) || data.gas.asset !== "SOL")
+        throw new TradingError("INVALID_RESPONSE", "The preview has no complete Solana deposit fee.");
+      const minimum = (BigInt(data.expectedOutRaw) * BigInt(1e4 - slippage) / 10000n).toString();
+      if (data.minOutRaw !== minimum)
+        throw new TradingError("INVALID_RESPONSE", "The bridge minimum differs from the quoted slippage bound.");
+      report.quote = {
+        venue: "relay",
+        route: data.route,
+        destination: data.destination,
+        fee: data.fee,
+        expectedOutRaw: data.expectedOutRaw,
+        minOutRaw: data.minOutRaw,
+        minimumReceivedRaw: data.minOutRaw,
+        minimumReceived: `${decimalAmount(data.minOutRaw, data.outDecimals)} ${to.asset}`,
+        legs: data.legs,
+        gas: data.gas,
+        ...data.firstLeg ? { firstLeg: data.firstLeg } : {},
+        ...data.venueCostUsd !== undefined ? { venueCostUsd: data.venueCostUsd } : {},
+        ...data.venueTimeEstimateSec !== undefined ? { venueTimeEstimateSec: data.venueTimeEstimateSec } : {},
+        wallet: data.wallet,
+        limitsChecked: data.limitsChecked,
+        quotedAt: data.quotedAt
+      };
+      report.checks.push(pass("destination"), pass("quote"));
+      if (!data.gas.ok)
+        report.checks.push(failure2("gas", new TradingError("GAS_INSUFFICIENT", "The preview reports insufficient gas; nothing was built.")));
+      else
+        report.checks.push(pass("gas"));
+      if (data.wallet.held)
+        report.checks.push(failure2("wallet", new TradingError("WALLET_BUSY", data.wallet.statusCommand ?? data.wallet.cancelCommand ?? "The wallet is held by another operation.")));
+      return;
+    }
+    const rpc = lazyEvmRpc(ctx, flags["--rpc-url"]);
+    const decimals = await hoodDecimals(from, rpc);
+    const outDecimals = await hoodDecimals(to, rpc);
+    const amountRaw = rawAmount(flags["--amount"], decimals);
+    const kind = from.base && to.base ? "swap" : "trade";
+    const token2 = from.base ? to.asset : from.asset;
+    const base2 = from.base ?? to.base;
+    const body = kind === "swap" ? { from: from.asset, to: to.asset, amountRaw, maxSlippageBps: slippage, payer } : {
+      chain: "hood",
+      mint: token2,
+      side: from.base ? "buy" : "sell",
+      quoteAsset: base2?.toLowerCase(),
+      amountRaw,
+      maxSlippageBps: slippage,
+      payer
+    };
+    const preview = await hoodPreview(ctx, key, body, kind);
+    if (!preview)
+      throw new TradingError("PREVIEW_UNSUPPORTED", "This API has no read-only preview; update the API before using --dry-run. Nothing was built.");
+    if (!sameEvmAddress(preview.walletAddress, wallet3.address) || kind === "trade" && preview.artifacts.quoteAsset !== base2?.toLowerCase())
+      throw new TradingError("INVALID_RESPONSE", "The preview does not name the requested Hood payer or quote asset.");
+    report.quote = {
+      ...previewQuote(preview, { intent: "Dry run", wallet: wallet3.address, kind, token: token2, from, to, outDecimals }),
+      route: preview.artifacts.route ?? { venue: preview.artifacts.venue, from: from.asset, to: to.asset },
+      destination: { ok: true, address: wallet3.address, linkedWalletId: wallet3.id, chain: "hood" },
+      gasFacts: preview.gas,
+      firstLeg: preview.firstLeg,
+      wallet: preview.wallet,
+      quotedAt: preview.quotedAt
+    };
+    report.checks.push(pass("quote"), pass("destination"));
+    const stop = previewStop(preview);
+    report.checks.push(stop ? failure2(stop.code === "GAS_INSUFFICIENT" ? "gas" : "wallet", stop) : pass("gas"));
+  } catch (error) {
+    report.checks.push(failure2("quote", error));
+  }
+}
+var pass = (id) => ({ id, status: "pass" }), skipped = (id, because) => ({ id, status: "skipped", because }), linkedRow, bridgePreviewSchema = () => hoodPreviewSchema.extend({
+  chain: exports_external.enum(["hood", "solana"]),
+  firstLeg: hoodPreviewSchema.shape.firstLeg.optional(),
+  route: exports_external.object({ venue: exports_external.literal("relay"), from: exports_external.string(), to: exports_external.string() }),
+  destination: exports_external.object({
+    ok: exports_external.literal(true),
+    linkedWalletId: exports_external.string(),
+    address: exports_external.string(),
+    chain: exports_external.enum(["hood", "solana"])
+  }),
+  outDecimals: exports_external.number().int().nonnegative(),
+  venueCostUsd: exports_external.number().finite().nonnegative().optional(),
+  venueTimeEstimateSec: exports_external.number().finite().nonnegative().optional()
+});
 var init_trading_checks = __esm(() => {
   init_ed25519();
   init_esm();
   init_zod();
   init_args();
+  init_bridge();
   init_swap();
+  init_evm_lite();
   init_render();
   init_solana_alt();
   init_solana_endpoint();
@@ -26531,16 +27177,16 @@ function tradeSignatures(result2) {
   const job = nested("job");
   const sources = [result2, payload, job];
   const operation = job.operation && typeof job.operation === "object" ? job.operation : {};
-  const legs = [...sources.map((source) => source.landedLegs), operation.legs].flatMap((value) => Array.isArray(value) ? value.filter((leg) => leg !== null && typeof leg === "object") : []);
-  const primary = sources.map((source) => source.signature).find(isText) ?? legs.find((leg) => (leg.kind === "trade" || leg.kind === "bridgeDeposit") && isText(leg.hash))?.hash;
+  const legs = [...sources.map((source2) => source2.landedLegs), operation.legs].flatMap((value) => Array.isArray(value) ? value.filter((leg) => leg !== null && typeof leg === "object") : []);
+  const primary = sources.map((source2) => source2.signature).find(isText) ?? legs.find((leg) => (leg.kind === "trade" || leg.kind === "bridgeDeposit") && isText(leg.hash))?.hash;
   return [
     ...new Set([
       ...isText(primary) ? [primary] : [],
-      ...sources.flatMap((source) => [
-        ...isText(source.signature) ? [source.signature] : [],
-        ...textsOf(source.signatures),
-        ...textsOf(source.hashes),
-        ...isText(source.feeSignature) ? [source.feeSignature] : []
+      ...sources.flatMap((source2) => [
+        ...isText(source2.signature) ? [source2.signature] : [],
+        ...textsOf(source2.signatures),
+        ...textsOf(source2.hashes),
+        ...isText(source2.feeSignature) ? [source2.feeSignature] : []
       ]),
       ...legs.map((leg) => leg.hash).filter(isText)
     ])
@@ -26670,8 +27316,8 @@ async function swapReceipt(args, ctx) {
       });
       if (res.ok)
         return { ok: true, status: res.status, text: JSON.stringify(res.body) };
-      const raw = res.raw !== null && typeof res.raw === "object" ? res.raw : undefined;
-      const text = JSON.stringify(raw ?? { success: false, error: { code: res.code ?? "REQUEST_FAILED", message: res.message } });
+      const raw2 = res.raw !== null && typeof res.raw === "object" ? res.raw : undefined;
+      const text = JSON.stringify(raw2 ?? { success: false, error: { code: res.code ?? "REQUEST_FAILED", message: res.message } });
       return { ok: false, status: res.status, text };
     };
     const answer = await readSwapReceipt(target, get, operationNotFoundNext);
@@ -26722,8 +27368,8 @@ function describeReceipt(ctx, body, job) {
   ctx.deps.stderr.write(`Settlement: ${shown}${words ? ` (${words})` : ""}
 `);
 }
-function bridgeFactsOf(raw) {
-  const parsed = bridgeFactsSchema.safeParse(raw);
+function bridgeFactsOf(raw2) {
+  const parsed = bridgeFactsSchema.safeParse(raw2);
   return parsed.success ? parsed.data : undefined;
 }
 function isBridgeJob(job, facts) {
@@ -27049,14 +27695,7 @@ async function recordTradedToken(ctx, wallet3, token2) {
 }
 function describeHoodLegs(first, hasFee, primary = "trade") {
   const kinds = plannedLegKinds(first.legKind, first.plannedLegCount, hasFee, primary);
-  const names = {
-    approval: "approve",
-    permit2Approval: "Permit2 approve",
-    trade: "trade",
-    feeTransfer: "fee",
-    bridgeDeposit: "bridge deposit"
-  };
-  return kinds ? kinds.map((kind) => names[kind] ?? kind) : [`${first.plannedLegCount} legs, starting with ${names[first.legKind] ?? first.legKind}`];
+  return kinds ? kinds.map((kind) => HOOD_LEG_NAMES[kind] ?? kind) : [`${first.plannedLegCount} legs, starting with ${HOOD_LEG_NAMES[first.legKind] ?? first.legKind}`];
 }
 async function hoodSwap(ctx, args) {
   const { flags, id, from, to } = args;
@@ -27099,20 +27738,19 @@ async function hoodSwap(ctx, args) {
     amountRaw = rawAmount(flags["--amount"], decimals);
   if (payer.kind === "embedded" && kind === "trade")
     await assertDeferredExecuteSupported(ctx, key, id);
-  if (!await claimOperation(ctx, key, id, kind))
-    throw new TradingError("OPERATION_ALREADY_STARTED", "This machine already started this id; no write was resent.");
-  writeFields(ctx.deps, "stderr", [["Operation", id]]);
   const payerBody = payer.kind === "tee" ? { type: "linked", linkedWalletId: payer.wallet.id } : { type: "main" };
   const base2 = from.base ?? to.base;
   const token2 = from.base ? to.asset : from.asset;
-  const built = kind === "swap" ? await requestSwapBuild(ctx, key, {
+  const intent = `Swap ${decimalAmount(amountRaw, decimals)} ${from.asset} to ${to.asset} on Hood`;
+  const swapBody2 = {
     clientTradeId: id,
     from: from.asset,
     to: to.asset,
     amountRaw,
     maxSlippageBps: args.slippage,
     payer: payerBody
-  }) : await request(ctx, key, "/api/v1/trade/agent/build", {
+  };
+  const tradeBody = {
     clientTradeId: id,
     chain: "hood",
     mint: token2,
@@ -27122,131 +27760,409 @@ async function hoodSwap(ctx, args) {
     maxSlippageBps: args.slippage,
     payer: payerBody,
     ...payer.kind === "embedded" ? { deferExecution: true } : {}
-  });
+  };
+  let preview;
+  if (payer.kind === "tee") {
+    preview = await hoodPreview(ctx, key, kind === "swap" ? swapBody2 : tradeBody, kind);
+    if (preview) {
+      if (!sameEvmAddress(preview.walletAddress, payerAddress))
+        throw new TradingError("INVALID_RESPONSE", "The Hood preview does not name the requested payer; nothing was built.");
+      if (kind === "trade" && preview.artifacts.quoteAsset !== base2.toLowerCase())
+        throw new TradingError("PAIR_UNSUPPORTED", `This token settles in ${safeText(preview.artifacts.quoteAsset ?? "an unknown asset")}, not ${base2}. Nothing was built.`);
+      const shown = previewQuote(preview, { intent, wallet: payerAddress, kind, token: token2, from, to, outDecimals });
+      const stop = previewStop(preview);
+      if (stop) {
+        printQuote(ctx, shown);
+        return tradingFailure(ctx, stop);
+      }
+      let confirmed;
+      try {
+        confirmed = await confirmQuote(ctx, shown, args.yes);
+      } catch (error) {
+        if (!(error instanceof TradingError && error.code === "CONFIRMATION_REQUIRED"))
+          throw error;
+        return tradingFailure(ctx, new TradingError(error.code, `${error.message} Nothing was built; the wallet is not held.`, {
+          details: { walletHeld: false, clientTradeId: id }
+        }));
+      }
+      if (!confirmed) {
+        notice(ctx.deps, "stderr", "note", "Nothing was built or signed; the wallet is not held.");
+        return printCancelledResult(ctx, {
+          success: true,
+          status: "cancelled",
+          clientTradeId: id,
+          kind,
+          quote: shown,
+          walletHeld: false
+        });
+      }
+    }
+  }
+  if (!await claimOperation(ctx, key, id, kind))
+    throw new TradingError("OPERATION_ALREADY_STARTED", "This machine already started this id; no write was resent.");
+  writeFields(ctx.deps, "stderr", [["Operation", id]]);
+  const accepted = preview ? { acceptMinOutRaw: preview.minOutRaw, acceptFeeBps: preview.fee.bps } : {};
+  let built;
+  try {
+    built = preview ? await hoodPost(ctx, key, kind === "swap" ? "/api/v1/agent/swap/build" : "/api/v1/trade/agent/build", kind === "swap" ? { ...swapBody2, ...accepted } : { ...tradeBody, ...accepted }) : kind === "swap" ? await requestSwapBuild(ctx, key, swapBody2) : await request(ctx, key, "/api/v1/trade/agent/build", tradeBody);
+  } catch (error) {
+    if (preview && error instanceof TradingError && error.code === "QUOTE_MOVED")
+      return tradingFailure(ctx, quoteMoved(preview, error.details ?? {}, { to: to.asset, outDecimals }));
+    throw error;
+  }
   if (built.job || built.status === "executed")
     return replay({ ...built, clientTradeId: id, kind });
   const body = kind === "swap" ? built.payload : built;
-  const data = swapBuildSchema.parse(body);
-  const echoed = kind === "swap" ? body?.recipient : body?.walletAddress;
-  if (body?.chain !== "hood" || typeof echoed !== "string" || echoed.toLowerCase() !== payerAddress.toLowerCase())
-    throw new TradingError("INVALID_RESPONSE", "The Hood build does not name the requested payer; nothing was signed.");
-  const artifacts = kind === "swap" ? { ...data, quoteAsset: undefined, quoteSource: undefined } : data.artifacts;
-  if (!artifacts)
-    throw new TradingError("INVALID_RESPONSE", "Missing quote artifacts.");
-  if (kind === "trade" && artifacts.quoteAsset !== base2.toLowerCase())
-    throw new TradingError("PAIR_UNSUPPORTED", `This token settles in ${artifacts.quoteAsset ?? "an unknown asset"}, not ${base2}. Nothing was signed.`);
-  let sequenced;
-  if (payer.kind === "tee") {
-    const parsed = sequencedSchema.safeParse(body);
-    if (!parsed.success)
-      throw new TradingError("SEQUENCED_RAIL_REQUIRED", "A Hood TEE wallet trades one leg at a time, and this Candle deployment did not answer with a sequenced leg. Nothing was signed.");
-    sequenced = parsed.data;
+  const holdId = preview && typeof body?.operationId === "string" ? body.operationId : undefined;
+  let signedAny = false;
+  try {
+    const data = swapBuildSchema.parse(body);
+    const echoed = kind === "swap" ? body?.recipient : body?.walletAddress;
+    if (body?.chain !== "hood" || typeof echoed !== "string" || echoed.toLowerCase() !== payerAddress.toLowerCase())
+      throw new TradingError("INVALID_RESPONSE", "The Hood build does not name the requested payer; nothing was signed.");
+    const artifacts = kind === "swap" ? { ...data, quoteAsset: undefined, quoteSource: undefined } : data.artifacts;
+    if (!artifacts)
+      throw new TradingError("INVALID_RESPONSE", "Missing quote artifacts.");
+    if (kind === "trade" && artifacts.quoteAsset !== base2.toLowerCase())
+      throw new TradingError("PAIR_UNSUPPORTED", `This token settles in ${artifacts.quoteAsset ?? "an unknown asset"}, not ${base2}. Nothing was signed.`);
+    let sequenced;
+    if (payer.kind === "tee") {
+      const parsed = sequencedSchema.safeParse(body);
+      if (!parsed.success)
+        throw new TradingError("SEQUENCED_RAIL_REQUIRED", "A Hood TEE wallet trades one leg at a time, and this Candle deployment did not answer with a sequenced leg. Nothing was signed.");
+      sequenced = parsed.data;
+    }
+    if (preview && sequenced && (BigInt(data.minOutRaw) < BigInt(preview.minOutRaw) || data.fee.bps !== preview.fee.bps)) {
+      const release = await cancelHeldOperation(ctx, key, sequenced.operationId);
+      const moved = quoteMoved(preview, { minOutRaw: data.minOutRaw, feeBps: data.fee.bps }, { to: to.asset, outDecimals }, `Candle built a worse quote than the one confirmed; nothing was signed. ${releaseNote(release, sequenced)}`);
+      return tradingFailure(ctx, new TradingError(moved.code, moved.message, {
+        details: { ...moved.details, ...releaseFacts(release, sequenced) }
+      }));
+    }
+    const minimumRaw = !from.base && artifacts.venue === "curve" ? (BigInt(data.minOutRaw) > BigInt(data.fee.feeRaw) ? BigInt(data.minOutRaw) - BigInt(data.fee.feeRaw) : 0n).toString() : data.minOutRaw;
+    const quote = {
+      intent,
+      wallet: payerAddress,
+      venue: artifacts.quoteSource ?? artifacts.venue,
+      priceImpactPct: artifacts.priceImpactPct ?? null,
+      fee: data.fee,
+      minimumReceived: `${decimalAmount(minimumRaw, outDecimals)} ${to.asset}`,
+      minOutRaw: data.minOutRaw,
+      minimumReceivedRaw: minimumRaw,
+      tokenRisks: artifacts.tokenRisks ?? []
+    };
+    if (sequenced) {
+      const leg = sequenced.nextLeg;
+      const maxFee = BigInt(leg.maxFeePerGas);
+      const reserve = sweepReserveFloor(maxFee, kind === "trade" ? [token2] : []);
+      quote.legs = describeHoodLegs(sequenced, BigInt(data.fee.feeRaw) > 0n);
+      quote.gas = `the ${sequenced.legKind} leg up to ${formatUnits(BigInt(leg.gas) * maxFee, 18)} ETH (gas ${leg.gas} at ${formatUnits(maxFee, 9)} gwei); each later leg is priced by Candle when it becomes next`;
+      quote.reserve = `at least ${formatUnits(reserve.wei, 18)} ETH stays in the wallet for a sweep home (${reserve.erc20Transfers} ERC-20 transfers and the final ETH transfer at twice the fee); a trade never spends it`;
+      quote.operationId = sequenced.operationId;
+    }
+    if (!preview) {
+      let confirmed;
+      try {
+        confirmed = await confirmQuote(ctx, quote, args.yes);
+      } catch (error) {
+        if (!(sequenced && error instanceof TradingError && error.code === "CONFIRMATION_REQUIRED"))
+          throw error;
+        const release = await cancelHeldOperation(ctx, key, sequenced.operationId);
+        notice(ctx.deps, "stderr", "note", releaseNote(release, sequenced));
+        throw new TradingError(error.code, error.message, {
+          ...error.suggestion ? { suggestion: error.suggestion } : {},
+          details: { clientTradeId: id, ...releaseFacts(release, sequenced) }
+        });
+      }
+      if (!confirmed) {
+        const release = sequenced ? await cancelHeldOperation(ctx, key, sequenced.operationId) : undefined;
+        if (sequenced && release)
+          notice(ctx.deps, "stderr", "note", releaseNote(release, sequenced));
+        return printCancelledResult(ctx, {
+          success: true,
+          status: "cancelled",
+          clientTradeId: id,
+          kind,
+          quote,
+          ...sequenced && release ? releaseFacts(release, sequenced) : {}
+        });
+      }
+    }
+    if (!Number.isFinite(data.expiresAt) || data.expiresAt <= ctx.deps.now())
+      throw new TradingError("QUOTE_EXPIRED", "The quote expired before signing. Start a new intention with a new id.");
+    if (payer.kind === "embedded") {
+      const executed = kind === "swap" ? await request(ctx, key, "/api/v1/agent/swap/submit", { clientTradeId: id, swapId: data.swapId }) : await request(ctx, key, "/api/v1/trade/agent/execute", { clientTradeId: id });
+      const settled2 = kind === "swap" ? reportSettlement(ctx, executed.payload?.settlement, { asset: to.asset, decimals: outDecimals }, id) : {};
+      return printTradingResult(ctx, {
+        ...executed,
+        ...settled2,
+        clientTradeId: id,
+        kind,
+        quote,
+        wallet: safeText(payerAddress)
+      });
+    }
+    const wallet3 = payer.wallet;
+    if (wallet3.chain !== "evm" || !sequenced)
+      throw chainMismatch(`TEE wallet ${wallet3.id}`, wallet3.chain === "evm" ? "hood" : "solana", "hood");
+    const operationId = sequenced.operationId;
+    const recorded = kind === "trade" ? token2 : HOOD_USDG_ADDRESS;
+    const notices = [];
+    const feeRaw = BigInt(data.fee.feeRaw);
+    const feeAsset = artifacts.quoteAsset === "usdg" ? "usdg" : "eth";
+    const checkLeg = hoodTradeLegCheck({
+      wallet: wallet3.address,
+      inputToken: from.asset === "ETH" ? undefined : from.asset === "USDG" ? HOOD_USDG_ADDRESS : from.asset,
+      amountRaw: BigInt(amountRaw),
+      outputToken: to.asset === "ETH" ? undefined : to.asset === "USDG" ? HOOD_USDG_ADDRESS : to.asset,
+      minOutRaw: BigInt(data.minOutRaw),
+      venue: kind === "trade" && artifacts.venue === "curve" ? "curve" : "dex",
+      ...kind === "trade" && feeRaw > 0n ? { fee: { cap: feeRaw, asset: feeAsset } } : {},
+      treasury: () => hoodFeeTreasury(rpc()),
+      curve: () => registeredCurveFor(rpc(), token2)
+    });
+    const execute = () => runSequencedLegs(ctx, key, {
+      wallet: wallet3,
+      first: sequenced,
+      submitPath: kind === "swap" ? "/api/v1/agent/swap/submit" : "/api/v1/trade/agent/submit",
+      submitFields: kind === "swap" ? { clientTradeId: id, swapId: data.swapId } : { clientTradeId: id },
+      unwrap: (answer) => kind === "swap" ? answer.payload ?? {} : answer,
+      clientId: id,
+      kind,
+      allowedLegs: HOOD_TRADE_LEGS,
+      checkLeg,
+      onSigned: () => {
+        signedAny = true;
+      },
+      onLanded: async (_leg) => {
+        const notice2 = await recordTradedToken(ctx, wallet3.address, toChecksumAddress(recorded));
+        if (notice2)
+          notices.push(notice2);
+      }
+    });
+    let run;
+    try {
+      run = await execute();
+    } catch (error) {
+      if (args.wait && error instanceof TradingError && (error.exitCode === 3 || error.details?.stage === "reverted"))
+        return waitForHoodOperation(ctx, key, operationId, error.details);
+      throw error;
+    }
+    if (args.wait)
+      return waitForHoodOperation(ctx, key, operationId);
+    const settled = kind === "swap" ? reportSettlement(ctx, run.final.settlement, { asset: to.asset, decimals: outDecimals }, id) : {};
+    return printTradingResult(ctx, {
+      ...run.final,
+      ...settled,
+      clientTradeId: id,
+      kind,
+      chain: "hood",
+      quote,
+      wallet: safeText(wallet3.address),
+      operationId,
+      landedLegs: run.landed,
+      evmRecord: { token: toChecksumAddress(recorded), notices }
+    });
+  } catch (error) {
+    throw holdId && !signedAny ? withCancelHint(error, holdId) : error;
   }
-  const minimumRaw = !from.base && artifacts.venue === "curve" ? (BigInt(data.minOutRaw) > BigInt(data.fee.feeRaw) ? BigInt(data.minOutRaw) - BigInt(data.fee.feeRaw) : 0n).toString() : data.minOutRaw;
-  const quote = {
-    intent: `Swap ${decimalAmount(amountRaw, decimals)} ${from.asset} to ${to.asset} on Hood`,
-    wallet: payerAddress,
+}
+async function hoodPost(ctx, key, path, body, optional = false) {
+  const result2 = await apiRequest(path, {
+    apiUrl: ctx.apiUrl,
+    credentials: { apiKey: key },
+    auth: "key",
+    method: "POST",
+    body,
+    fetch: ctx.deps.fetch,
+    env: ctx.deps.env
+  });
+  if (result2.ok) {
+    if (!result2.body || typeof result2.body !== "object")
+      throw new TradingError("INVALID_RESPONSE", "Candle returned an invalid response.");
+    return result2.body;
+  }
+  if (optional && result2.status === 404 && result2.code === undefined)
+    return;
+  const error = result2.raw?.error;
+  const details = {};
+  for (const field of HOOD_ERROR_FACTS) {
+    if (error?.[field] !== undefined)
+      details[field] = error[field];
+  }
+  throw new TradingError(result2.code ?? "REQUEST_FAILED", safeText(result2.message), {
+    ...Object.keys(details).length ? { details } : {}
+  });
+}
+async function hoodPreview(ctx, key, buildBody, kind) {
+  const { clientTradeId: _ignored, deferExecution: _never, ...previewBody } = buildBody;
+  const answer = await hoodPost(ctx, key, kind === "swap" ? "/api/v1/agent/swap/preview" : "/api/v1/trade/agent/preview", previewBody, true);
+  if (!answer)
+    return;
+  const parsed = hoodPreviewSchema.safeParse(answer);
+  if (!parsed.success)
+    throw new TradingError("INVALID_RESPONSE", "Candle did not return a complete Hood preview; nothing was built.");
+  return parsed.data;
+}
+function previewQuote(preview, args) {
+  const { artifacts, fee, firstLeg } = preview;
+  const minimumRaw = !args.from.base && artifacts.venue === "curve" ? (BigInt(preview.minOutRaw) > BigInt(fee.feeRaw) ? BigInt(preview.minOutRaw) - BigInt(fee.feeRaw) : 0n).toString() : preview.minOutRaw;
+  const maxFee = BigInt(firstLeg.maxFeePerGas);
+  const reserve = sweepReserveFloor(maxFee, args.kind === "trade" ? [args.token] : []);
+  return {
+    intent: args.intent,
+    wallet: args.wallet,
     venue: artifacts.quoteSource ?? artifacts.venue,
     priceImpactPct: artifacts.priceImpactPct ?? null,
-    fee: data.fee,
-    minimumReceived: `${decimalAmount(minimumRaw, outDecimals)} ${to.asset}`,
-    minOutRaw: data.minOutRaw,
+    fee,
+    minimumReceived: `${decimalAmount(minimumRaw, args.outDecimals)} ${args.to.asset}`,
+    minOutRaw: preview.minOutRaw,
     minimumReceivedRaw: minimumRaw,
-    tokenRisks: artifacts.tokenRisks ?? []
+    expectedOutRaw: preview.expectedOutRaw,
+    tokenRisks: artifacts.tokenRisks,
+    legs: preview.legs.map((kind) => HOOD_LEG_NAMES[kind] ?? kind),
+    gas: `the ${firstLeg.kind} leg up to ${formatUnits(BigInt(firstLeg.gas) * maxFee, 18)} ETH (gas ${firstLeg.gas} at ${formatUnits(maxFee, 9)} gwei); each later leg is priced by Candle when it becomes next`,
+    reserve: `at least ${formatUnits(reserve.wei, 18)} ETH stays in the wallet for a sweep home (${reserve.erc20Transfers} ERC-20 transfers and the final ETH transfer at twice the fee); a trade never spends it`,
+    ...preview.limitsChecked ? { limitsChecked: preview.limitsChecked } : {}
   };
-  if (sequenced) {
-    const leg = sequenced.nextLeg;
-    const maxFee = BigInt(leg.maxFeePerGas);
-    const reserve = sweepReserveFloor(maxFee, kind === "trade" ? [token2] : []);
-    quote.legs = describeHoodLegs(sequenced, BigInt(data.fee.feeRaw) > 0n);
-    quote.gas = `the ${sequenced.legKind} leg up to ${formatUnits(BigInt(leg.gas) * maxFee, 18)} ETH (gas ${leg.gas} at ${formatUnits(maxFee, 9)} gwei); each later leg is priced by Candle when it becomes next`;
-    quote.reserve = `at least ${formatUnits(reserve.wei, 18)} ETH stays in the wallet for a sweep home (${reserve.erc20Transfers} ERC-20 transfers and the final ETH transfer at twice the fee); a trade never spends it`;
-    quote.operationId = sequenced.operationId;
+}
+function previewStop(preview) {
+  const { gas, wallet: wallet3 } = preview;
+  const gasFacts = {};
+  if (!gas.ok) {
+    for (const field of ["shortfallWei", "requiredWei", "reserveWei", "balanceWei"])
+      if (gas[field] !== undefined)
+        gasFacts[field] = gas[field];
   }
-  if (!await confirmQuote(ctx, quote, args.yes)) {
-    if (sequenced)
-      notice(ctx.deps, "stderr", "note", `Nothing was signed. Operation ${sequenced.operationId} holds this wallet until ${new Date(sequenced.expiresAt).toISOString()}; a new Hood trade from it is refused as WALLET_BUSY until then.
-`.trim());
-    return printCancelledResult(ctx, {
-      success: true,
-      status: "cancelled",
-      clientTradeId: id,
-      kind,
-      quote,
-      ...sequenced ? { operationId: sequenced.operationId, walletHeldUntil: sequenced.expiresAt } : {}
+  const gasText = `The wallet holds ${weiText(gas.balanceWei)} and needs ${weiText(gas.requiredWei)} for gas (including a ${weiText(gas.reserveWei)} reserve), short by ${weiText(gas.shortfallWei)}.`;
+  if (!gas.ok && !wallet3.held)
+    return new TradingError("GAS_INSUFFICIENT", `${gasText} Nothing was built; the wallet is not held.`, {
+      suggestion: "Add ETH to the wallet, then run the swap again.",
+      details: { ...gasFacts, walletHeld: false }
     });
-  }
-  if (!Number.isFinite(data.expiresAt) || data.expiresAt <= ctx.deps.now())
-    throw new TradingError("QUOTE_EXPIRED", "The quote expired before signing. Start a new intention with a new id.");
-  if (payer.kind === "embedded") {
-    const executed = kind === "swap" ? await request(ctx, key, "/api/v1/agent/swap/submit", { clientTradeId: id, swapId: data.swapId }) : await request(ctx, key, "/api/v1/trade/agent/execute", { clientTradeId: id });
-    const settled2 = kind === "swap" ? reportSettlement(ctx, executed.payload?.settlement, { asset: to.asset, decimals: outDecimals }, id) : {};
-    return printTradingResult(ctx, {
-      ...executed,
-      ...settled2,
-      clientTradeId: id,
-      kind,
-      quote,
-      wallet: safeText(payerAddress)
+  if (!wallet3.held)
+    return;
+  const gasNote = gas.ok ? "" : ` ${gasText} Gas is also short; deal with the hold first, then add ETH.`;
+  const operationId = safeText(wallet3.operationId ?? "unknown");
+  const statusCommand = `candle swap status --operation ${operationId}`;
+  if (wallet3.guarded)
+    return new TradingError("WALLET_BUSY", `This wallet has an unresolved operation ${operationId}; it may have been broadcast. Do not repeat the trade. Nothing was built.${gasNote}`, {
+      suggestion: `Read: ${safeText(wallet3.statusCommand ?? statusCommand)}`,
+      details: {
+        walletHeld: true,
+        guarded: true,
+        operationId: wallet3.operationId,
+        statusCommand: wallet3.statusCommand ?? statusCommand,
+        ...gasFacts
+      }
     });
-  }
-  const wallet3 = payer.wallet;
-  if (wallet3.chain !== "evm" || !sequenced)
-    throw chainMismatch(`TEE wallet ${wallet3.id}`, wallet3.chain === "evm" ? "hood" : "solana", "hood");
-  const recorded = kind === "trade" ? token2 : HOOD_USDG_ADDRESS;
-  const notices = [];
-  const feeRaw = BigInt(data.fee.feeRaw);
-  const feeAsset = artifacts.quoteAsset === "usdg" ? "usdg" : "eth";
-  const checkLeg = hoodTradeLegCheck({
-    wallet: wallet3.address,
-    inputToken: from.asset === "ETH" ? undefined : from.asset === "USDG" ? HOOD_USDG_ADDRESS : from.asset,
-    amountRaw: BigInt(amountRaw),
-    outputToken: to.asset === "ETH" ? undefined : to.asset === "USDG" ? HOOD_USDG_ADDRESS : to.asset,
-    minOutRaw: BigInt(data.minOutRaw),
-    venue: kind === "trade" && artifacts.venue === "curve" ? "curve" : "dex",
-    ...kind === "trade" && feeRaw > 0n ? { fee: { cap: feeRaw, asset: feeAsset } } : {},
-    treasury: () => hoodFeeTreasury(rpc()),
-    curve: () => registeredCurveFor(rpc(), token2)
-  });
-  const execute = () => runSequencedLegs(ctx, key, {
-    wallet: wallet3,
-    first: sequenced,
-    submitPath: kind === "swap" ? "/api/v1/agent/swap/submit" : "/api/v1/trade/agent/submit",
-    submitFields: kind === "swap" ? { clientTradeId: id, swapId: data.swapId } : { clientTradeId: id },
-    unwrap: (answer) => kind === "swap" ? answer.payload ?? {} : answer,
-    clientId: id,
-    kind,
-    allowedLegs: HOOD_TRADE_LEGS,
-    checkLeg,
-    onLanded: async (_leg) => {
-      const notice2 = await recordTradedToken(ctx, wallet3.address, toChecksumAddress(recorded));
-      if (notice2)
-        notices.push(notice2);
+  const until = wallet3.expiresAt !== undefined ? ` until ${new Date(wallet3.expiresAt).toISOString()}` : "";
+  return new TradingError("WALLET_BUSY", `Operation ${operationId} holds this wallet${until}. Nothing was built.${gasNote}`, {
+    suggestion: wallet3.cancelCommand ? `If nobody confirmed it, release it with ${safeText(wallet3.cancelCommand)}; it refuses if a leg may have been signed.` : `Another key opened it; it ends when it finishes or its window closes. Read: ${statusCommand}`,
+    details: {
+      walletHeld: true,
+      operationId: wallet3.operationId,
+      ...gasFacts,
+      ...wallet3.expiresAt !== undefined ? { retryAfter: wallet3.expiresAt } : {},
+      ...wallet3.cancelCommand ? { cancelCommand: wallet3.cancelCommand } : {}
     }
   });
-  let run;
-  try {
-    run = await execute();
-  } catch (error) {
-    if (args.wait && error instanceof TradingError && (error.exitCode === 3 || error.details?.stage === "reverted"))
-      return waitForHoodOperation(ctx, key, sequenced.operationId, error.details);
-    throw error;
-  }
-  if (args.wait)
-    return waitForHoodOperation(ctx, key, sequenced.operationId);
-  const settled = kind === "swap" ? reportSettlement(ctx, run.final.settlement, { asset: to.asset, decimals: outDecimals }, id) : {};
-  return printTradingResult(ctx, {
-    ...run.final,
-    ...settled,
-    clientTradeId: id,
-    kind,
-    chain: "hood",
-    quote,
-    wallet: safeText(wallet3.address),
-    operationId: sequenced.operationId,
-    landedLegs: run.landed,
-    evmRecord: { token: toChecksumAddress(recorded), notices }
+}
+function quoteMoved(preview, current, out, lead = "The quote moved after the preview. Nothing was built; the wallet is not held.") {
+  const minOut = typeof current.minOutRaw === "string" && /^\d+$/.test(current.minOutRaw) ? current.minOutRaw : undefined;
+  const feeBps = typeof current.feeBps === "number" ? current.feeBps : undefined;
+  const minimum = (raw2) => raw2 === undefined ? "unknown" : `${decimalAmount(raw2, out.outDecimals)} ${out.to}`;
+  return new TradingError("QUOTE_MOVED", `${lead} Minimum received ${minimum(preview.minOutRaw)} -> ${minimum(minOut)}; tier fee ${preview.fee.bps} -> ${feeBps ?? "unknown"} bps.`, {
+    suggestion: "Run the swap again to see the new quote.",
+    details: {
+      previewed: { minOutRaw: preview.minOutRaw, feeBps: preview.fee.bps, expectedOutRaw: preview.expectedOutRaw },
+      current: {
+        ...minOut !== undefined ? { minOutRaw: minOut } : {},
+        ...feeBps !== undefined ? { feeBps } : {},
+        ...typeof current.expectedOutRaw === "string" ? { expectedOutRaw: current.expectedOutRaw } : {}
+      }
+    }
   });
+}
+async function cancelHeldOperation(ctx, key, operationId) {
+  try {
+    const answer = await hoodPost(ctx, key, hoodCancelPath(operationId), {}, true);
+    if (!answer)
+      return { state: "unavailable" };
+    if (answer.status === "cancelled" && answer.unchanged !== true)
+      return { state: "released" };
+    return { state: "ended", status: safeText(answer.status ?? "unknown") };
+  } catch (error) {
+    return {
+      state: "refused",
+      code: error instanceof TradingError ? error.code : "REQUEST_FAILED",
+      message: safeText(error instanceof Error ? describeRpcFailure(error) : String(error))
+    };
+  }
+}
+function releaseNote(release, held) {
+  const id = held.operationId;
+  const until = new Date(held.expiresAt).toISOString();
+  switch (release.state) {
+    case "released":
+      return `Nothing was signed. Operation ${id} was cancelled; the wallet is not held.`;
+    case "ended":
+      return `Nothing was signed. Operation ${id} already ended (${release.status}); the wallet is not held.`;
+    case "unavailable":
+      return `Nothing was signed. Operation ${id} holds this wallet until ${until}; a new Hood trade from it is refused as WALLET_BUSY until then.`;
+    case "refused":
+      return `Nothing was signed. Operation ${id} holds this wallet until ${until}; cancel answered ${release.code} (${release.message.replace(/\.$/, "")}). A new Hood trade from it is refused as WALLET_BUSY until then.`;
+  }
+}
+function releaseFacts(release, held) {
+  if (release.state === "released" || release.state === "ended")
+    return { operationId: held.operationId, walletHeld: false, released: release.state === "released" };
+  return {
+    operationId: held.operationId,
+    walletHeld: true,
+    walletHeldUntil: held.expiresAt,
+    ...release.state === "refused" ? { cancelRefused: { code: release.code, message: release.message } } : {}
+  };
+}
+function withCancelHint(error, operationId) {
+  if (error instanceof TradingError && error.exitCode !== 1)
+    return error;
+  const refusal3 = error instanceof TradingError ? error : new TradingError("TRADING_FAILED", `The build response could not be used: ${safeText(error instanceof Error ? describeRpcFailure(error) : String(error))}. Nothing was signed.`);
+  const hint = `Operation ${operationId} may still hold this wallet. If no leg was signed, release it with ${hoodCancelCommand(operationId)}; it refuses if a leg may have been signed.`;
+  return new TradingError(refusal3.code, refusal3.message, {
+    suggestion: refusal3.suggestion ? `${refusal3.suggestion} ${hint}` : hint,
+    details: { ...refusal3.details ?? {}, operationId, cancelCommand: hoodCancelCommand(operationId) }
+  });
+}
+async function swapCancel(args, ctx) {
+  const parsed = parseArgs(args, { valueFlags: ["--operation"] });
+  const id = "error" in parsed || parsed.positionals.length ? undefined : parsed.values["--operation"];
+  if (id === undefined || !validClientId(id)) {
+    writeUsageFailure(ctx.deps, SWAP_CANCEL_USAGE, ctx.json);
+    return 2;
+  }
+  const statusCommand = `candle swap status --operation ${id}`;
+  try {
+    const key = await tradingKey(ctx);
+    const answer = await hoodPost(ctx, key, hoodCancelPath(id), {}, true);
+    if (!answer)
+      throw new TradingError("CANCEL_UNAVAILABLE", `This Candle deployment has no swap cancel. Nothing changed; operation ${id} releases the wallet when its 30-minute window closes.`, { suggestion: `Read: ${statusCommand}` });
+    const released = answer.status === "cancelled" && answer.unchanged !== true;
+    const message = released ? `Operation ${id} released; nothing was signed.` : `Operation ${id} already ended (${safeText(answer.status ?? "unknown")}).`;
+    ctx.deps.stdout.write(ctx.json ? `${JSON.stringify({ ...answer, operationId: id, message })}
+` : `${message}
+`);
+    return 0;
+  } catch (error) {
+    if (error instanceof TradingError && error.code === "MAY_BE_SIGNED")
+      return tradingFailure(ctx, new TradingError(error.code, `A leg of ${id} may have been signed. Not released. Do not repeat the trade. Read: ${statusCommand}.`, { exitCode: 3, details: { ...error.details ?? {}, operationId: id } }));
+    if (error instanceof TradingError && error.code === "FEATURE_DISABLED")
+      return tradingFailure(ctx, new TradingError(error.code, error.message, {
+        suggestion: `Wait for the operation's 30-minute window to close. Read: ${statusCommand}`,
+        details: { ...error.details ?? {}, operationId: id }
+      }));
+    return tradingFailure(ctx, error);
+  }
 }
 async function bridgeOriginBalance(ctx, from, address, solana, evm) {
   if (from === "ETH")
@@ -27527,7 +28443,7 @@ async function swapRecover(args, ctx) {
   }
   return hoodOperationRead(ctx, parsed.values["--operation"], parsed.values["--hash"], true);
 }
-var isText = (value) => typeof value === "string" && value.length > 0, textsOf = (value) => Array.isArray(value) ? value.filter(isText) : [], AGENT_MAX_SLIPPAGE_BPS = 5000, SLIPPAGE_RANGE_MESSAGE, settlementSchema, SWAP_RECEIPT_USAGE = "Usage: candle swap receipt <hash> | candle swap receipt --client-swap-id <id>", BRIDGE_STATUS_WORDS, bridgeFactsSchema, HOOD_TRADE_LEGS, bridgeBuildSchema;
+var isText = (value) => typeof value === "string" && value.length > 0, textsOf = (value) => Array.isArray(value) ? value.filter(isText) : [], AGENT_MAX_SLIPPAGE_BPS = 5000, SLIPPAGE_RANGE_MESSAGE, settlementSchema, SWAP_RECEIPT_USAGE = "Usage: candle swap receipt <hash> | candle swap receipt --client-swap-id <id>", BRIDGE_STATUS_WORDS, bridgeFactsSchema, HOOD_TRADE_LEGS, hoodPreviewSchema, HOOD_ERROR_FACTS, HOOD_LEG_NAMES, weiText = (value) => value !== undefined && /^\d+$/.test(value) ? `${formatUnits(BigInt(value), 18)} ETH` : "unknown", hoodCancelPath = (operationId) => `/api/v1/agent/hood-tee/operations/${encodeURIComponent(operationId)}/cancel`, hoodCancelCommand = (operationId) => `candle swap cancel --operation ${operationId}`, SWAP_CANCEL_USAGE = "Usage: candle swap cancel --operation <operationId>", bridgeBuildSchema;
 var init_swap = __esm(() => {
   init_zod();
   init_api_key_file();
@@ -27565,6 +28481,70 @@ var init_swap = __esm(() => {
     statusCheck: exports_external.string().optional()
   });
   HOOD_TRADE_LEGS = ["approval", "permit2Approval", "trade", "feeTransfer"];
+  hoodPreviewSchema = exports_external.object({
+    mode: exports_external.literal("preview"),
+    chain: exports_external.literal("hood"),
+    walletAddress: exports_external.string().min(1),
+    artifacts: exports_external.object({
+      venue: exports_external.string(),
+      quoteSource: exports_external.string().optional(),
+      priceImpactPct: exports_external.string().nullable().optional(),
+      quoteAsset: exports_external.string().optional(),
+      tokenRisks: exports_external.array(exports_external.object({ mint: exports_external.string(), message: exports_external.string() }).passthrough()).default([])
+    }).passthrough(),
+    fee: exports_external.object({ bps: exports_external.number().int().nonnegative(), feeRaw: exports_external.string().regex(/^\d+$/) }).passthrough(),
+    expectedOutRaw: exports_external.string().regex(/^\d+$/),
+    minOutRaw: exports_external.string().regex(/^\d+$/),
+    legs: exports_external.array(exports_external.string()).min(1),
+    firstLeg: exports_external.object({
+      kind: exports_external.string(),
+      gas: exports_external.string().regex(/^\d+$/),
+      maxFeePerGas: exports_external.string().regex(/^\d+$/),
+      maxPriorityFeePerGas: exports_external.string().regex(/^\d+$/)
+    }),
+    gas: exports_external.object({
+      ok: exports_external.boolean(),
+      shortfallWei: exports_external.string().optional(),
+      requiredWei: exports_external.string().optional(),
+      reserveWei: exports_external.string().optional(),
+      balanceWei: exports_external.string().optional()
+    }).passthrough(),
+    wallet: exports_external.object({
+      held: exports_external.boolean(),
+      guarded: exports_external.boolean().optional(),
+      operationId: exports_external.string().optional(),
+      expiresAt: exports_external.number().finite().optional(),
+      cancelCommand: exports_external.string().optional(),
+      statusCommand: exports_external.string().optional()
+    }).passthrough(),
+    limitsChecked: exports_external.string().optional(),
+    quotedAt: exports_external.number().finite().optional()
+  }).passthrough();
+  HOOD_ERROR_FACTS = [
+    "field",
+    "operationId",
+    "cancelCommand",
+    "statusCommand",
+    "statusPath",
+    "retryAfter",
+    "reason",
+    "stage",
+    "safeAction",
+    "expectedOutRaw",
+    "minOutRaw",
+    "feeBps",
+    "shortfallWei",
+    "requiredWei",
+    "reserveWei",
+    "balanceWei"
+  ];
+  HOOD_LEG_NAMES = {
+    approval: "approve",
+    permit2Approval: "Permit2 approve",
+    trade: "trade",
+    feeTransfer: "fee",
+    bridgeDeposit: "bridge deposit"
+  };
   bridgeBuildSchema = exports_external.object({
     status: exports_external.literal("built"),
     swapId: exports_external.string().min(1),
@@ -28432,7 +29412,7 @@ async function readKeyLabel(ctx, keyPrefix) {
 }
 function renderControlledBy(controlledBy, n) {
   const subject = n === 1 ? "This key" : `These ${n} keys`;
-  const source = controlledBy.keySource === "file" ? "CANDLE_API_KEY_FILE" : controlledBy.keySource === "env" ? "CANDLE_API_KEY" : controlledBy.keySource === "profile" ? `profile ${controlledBy.profileName ?? ""}`.trimEnd() : "default credentials";
+  const source2 = controlledBy.keySource === "file" ? "CANDLE_API_KEY_FILE" : controlledBy.keySource === "env" ? "CANDLE_API_KEY" : controlledBy.keySource === "profile" ? `profile ${controlledBy.profileName ?? ""}`.trimEnd() : "default credentials";
   const cleaned = controlledBy.keyLabel !== null ? labelCell(controlledBy.keyLabel) : "";
   const label = cleaned.length > 0 ? `(${cleaned})  ` : "";
   const environment = controlledBy.environment ?? "not a Candle host";
@@ -28442,7 +29422,7 @@ function renderControlledBy(controlledBy, n) {
     return [
       `${subject} will be controlled by:`,
       `  Candle account  ${controlledBy.username ?? "(no username)"}  (${shortAddress2(controlledBy.account)})`,
-      `  API key         ${controlledBy.keyPrefix}…  ${label}${source}`,
+      `  API key         ${controlledBy.keyPrefix}…  ${label}${source2}`,
       `  API             ${controlledBy.apiUrl}  (${environment}${from})`
     ].join(`
 `);
@@ -28452,7 +29432,7 @@ function renderControlledBy(controlledBy, n) {
     `${subject} will be controlled by:`,
     `  Candle account  ${controlledBy.username ?? "(no username)"}  (${shortAddress2(controlledBy.account)})`,
     toKey.signer !== undefined ? `  API key         ${toKey.keyPrefix}…  ${toLabel}--to-key, owned by its signer ${toKey.signer} from the import` : `  API key         ${toKey.keyPrefix}…  ${toLabel}--to-key, bound by a rebind after the import`,
-    `  imported under  ${controlledBy.keyPrefix}…  ${label}${source}`,
+    `  imported under  ${controlledBy.keyPrefix}…  ${label}${source2}`,
     `  API             ${controlledBy.apiUrl}  (${environment}${from})`,
     ...toKey.warnings
   ].join(`
@@ -29503,8 +30483,8 @@ function x963Kdf(secret, sharedInfo, length) {
   wipe(block2);
   return out;
 }
-async function aesGcmKey(raw) {
-  return crypto.subtle.importKey("raw", raw, { name: "AES-GCM", length: 128 }, false, [
+async function aesGcmKey(raw2) {
+  return crypto.subtle.importKey("raw", raw2, { name: "AES-GCM", length: 128 }, false, [
     "encrypt",
     "decrypt"
   ]);
@@ -38821,10 +39801,10 @@ This vault is at ${resolved.path}, not the default location. Every vault command
 `;
 }
 async function requireVaultRaw(ctx, resolved) {
-  const raw = await readVaultRaw(resolved.path);
-  if (raw === null)
+  const raw2 = await readVaultRaw(resolved.path);
+  if (raw2 === null)
     throw missingVault(ctx, resolved);
-  return raw;
+  return raw2;
 }
 function factorAddAmong(envelopes) {
   return {
@@ -38856,13 +39836,13 @@ function assertVaultHelperIdentities(deps, envelopes) {
     }
   }
 }
-async function unlockInteractively(ctx, path, raw, opts = {}) {
-  await assertNotOlderCopy(ctx, path, raw, opts.acceptOlderCopy ?? false);
+async function unlockInteractively(ctx, path, raw2, opts = {}) {
+  await assertNotOlderCopy(ctx, path, raw2, opts.acceptOlderCopy ?? false);
   const held = ctx.heldUnlock;
   if (held !== undefined && resolvePath(held.path) === resolvePath(path))
-    return held.open(raw);
+    return held.open(raw2);
   const { deps } = ctx;
-  const file = parseVaultFile(raw);
+  const file = parseVaultFile(raw2);
   assertVaultHelperIdentities(deps, file.envelopes);
   const facts = await currentPlatformFacts(deps);
   const choice = await chooseFactor(ctx, file.vaultId, file.envelopes, facts, opts.factor ?? ctx.vaultFactor, opts);
@@ -38877,7 +39857,7 @@ async function unlockInteractively(ctx, path, raw, opts = {}) {
 `.trim());
     const typed = await deps.promptSecret(opts.promptText ?? "Vault passphrase (input hidden): ");
     const openWith = (p, r, candidate, purpose) => choice.envelopeId === undefined ? unlockWithPassphrase(p, r, candidate, { notice: noticeFor(purpose) }) : unlockVault(p, r, { factor: "passphrase", passphrase: candidate, envelopeId: choice.envelopeId }, { notice: noticeFor(purpose) });
-    const { vault: vault2, passphrase } = await openWithTypedPassphrase(typed, (candidate) => openWith(path, raw, candidate, opts.purpose));
+    const { vault: vault2, passphrase } = await openWithTypedPassphrase(typed, (candidate) => openWith(path, raw2, candidate, opts.purpose));
     const open7 = (p, r, purpose) => openWith(p, r, passphrase, purpose);
     return {
       vault: vault2,
@@ -38911,13 +39891,13 @@ async function unlockInteractively(ctx, path, raw, opts = {}) {
       }
     };
     const reason = opts.reason ?? "unlock the Candle vault";
-    const vault2 = await open7(path, raw, reason);
+    const vault2 = await open7(path, raw2, reason);
     return {
       vault: vault2,
       factor: { kind: "touch-id", envelopeId: envelope2.id, session: session2 },
       reopen: (p, r) => open7(p, r, reason),
       confirm: async (what) => {
-        closeVault(await open7(path, raw, what));
+        closeVault(await open7(path, raw2, what));
       }
     };
   }
@@ -38941,13 +39921,13 @@ async function unlockInteractively(ctx, path, raw, opts = {}) {
       }
     };
     const reason = opts.reason ?? "unlock the Candle vault";
-    const vault2 = await open7(path, raw, reason);
+    const vault2 = await open7(path, raw2, reason);
     return {
       vault: vault2,
       factor: { kind: "passkey", envelopeId: envelope2.id, session: session2 },
       reopen: (p, r) => open7(p, r, reason),
       confirm: async (what) => {
-        closeVault(await open7(path, raw, what));
+        closeVault(await open7(path, raw2, what));
       }
     };
   }
@@ -38975,7 +39955,7 @@ async function unlockInteractively(ctx, path, raw, opts = {}) {
       wipe(prfOutput);
     }
   };
-  const vault = await open6(path, raw);
+  const vault = await open6(path, raw2);
   return {
     vault,
     factor: { kind: "security-key", envelopeId: envelope.id, session },
@@ -38983,7 +39963,7 @@ async function unlockInteractively(ctx, path, raw, opts = {}) {
     confirm: async (what) => {
       notice(deps, "stderr", "note", `Present the security key again to ${what}.
 `.trim());
-      closeVault(await open6(path, raw));
+      closeVault(await open6(path, raw2));
     }
   };
 }
@@ -39232,7 +40212,7 @@ function assertDrivable(envelope, facts) {
     return envelope;
   throw new VaultError(refusalCodeFor(availability), `The ${wordFor(envelope)} envelope ${envelope.id} cannot open the vault here: ${availability.reason}.`, { suggestion: "No other envelope was tried. Run `candle vault status` to see which factors can open it here." });
 }
-async function assertNotOlderCopy(ctx, path, raw, accept) {
+async function assertNotOlderCopy(ctx, path, raw2, accept) {
   const sidecar = await readSidecar(sidecarPath(path));
   if (sidecar === null) {
     notice(ctx.deps, "stderr", "warning", `No vault.state.json beside this vault, so an older copy of it cannot be recognized here.
@@ -39243,7 +40223,7 @@ async function assertNotOlderCopy(ctx, path, raw, accept) {
   let vaultId;
   let envelopeIds = [];
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = JSON.parse(raw2);
     generation = parsed.generation;
     vaultId = parsed.vaultId;
     envelopeIds = (parsed.envelopes ?? []).map((envelope) => String(envelope.id));
@@ -39717,10 +40697,10 @@ async function findTeeInVault(ctx, address, opts = {}) {
       throw new UsageError(resolved.error);
     path = resolved.path;
   }
-  const raw = await readVaultRaw(path);
-  if (raw === null)
+  const raw2 = await readVaultRaw(path);
+  if (raw2 === null)
     return { hit: false };
-  const opened = await unlockInteractively(ctx, path, raw, { acceptOlderCopy: true });
+  const opened = await unlockInteractively(ctx, path, raw2, { acceptOlderCopy: true });
   const vault = opened.vault;
   try {
     assertNotEvmEntry(vault.index, address, "this command");
@@ -43236,9 +44216,9 @@ async function awaitReceipt(rpc, ctx, hash, chainId) {
     line: `Submitted ${hash}; no receipt after ${EVM_RECEIPT_WAIT_MS / 1000} s. It may still land: do not resend blindly; check the hash on an explorer first.`
   };
 }
-async function broadcast(rpc, ctx, raw, hash, chainId) {
+async function broadcast(rpc, ctx, raw2, hash, chainId) {
   try {
-    await rpc.sendRawTransaction(raw);
+    await rpc.sendRawTransaction(raw2);
   } catch (error) {
     if (!(error instanceof EvmRpcError))
       throw error;
@@ -43955,8 +44935,8 @@ async function teeSweepEvm(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const emergency = parsed.booleans.has("--emergency");
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, resolvedVault.path, raw, { acceptOlderCopy: true });
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, resolvedVault.path, raw2, { acceptOlderCopy: true });
     const vault = hold(opened.vault);
     const entry2 = findEvmTee(vault, address);
     if (entry2 === undefined)
@@ -43966,10 +44946,10 @@ async function teeSweepEvm(args, ctx) {
 }
 function sweepOptions(ctx, parsed, tokenFlags) {
   const tokens = [];
-  for (const raw of tokenFlags) {
-    const checked = checkEvmAddress(raw);
+  for (const raw2 of tokenFlags) {
+    const checked = checkEvmAddress(raw2);
     if (!checked.ok)
-      return usage2(ctx, `--token must be an ERC-20 contract address: ${raw || "(empty)"} is ${checked.reason}.`);
+      return usage2(ctx, `--token must be an ERC-20 contract address: ${raw2 || "(empty)"} is ${checked.reason}.`);
     tokens.push(checked.address);
   }
   let fromBlock;
@@ -44572,8 +45552,8 @@ async function teeDisableEvm(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   await printIdentity(ctx);
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, resolvedVault.path, raw, { acceptOlderCopy: true });
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, resolvedVault.path, raw2, { acceptOlderCopy: true });
     const vault = hold(opened.vault);
     const entry2 = findEvmTee(vault, address);
     if (entry2 === undefined)
@@ -44674,8 +45654,8 @@ async function vaultDemoteEvm(args, ctx) {
   const sweepTo = parsed.values["--sweep-to"];
   let emergency = parsed.booleans.has("--emergency");
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, resolvedVault.path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, resolvedVault.path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     let vault = hold(opened.vault);
@@ -44775,10 +45755,10 @@ async function readVaultEntry(ctx, address) {
   const resolved = vaultPathFor(ctx, { values: {}, booleans: new Set, positionals: [] });
   if ("error" in resolved)
     throw new TradingError("USAGE", resolved.error);
-  const raw = await readVaultRaw(resolved.path);
-  if (raw === null)
+  const raw2 = await readVaultRaw(resolved.path);
+  if (raw2 === null)
     return null;
-  const opened = await unlockInteractively(ctx, resolved.path, raw, { acceptOlderCopy: true });
+  const opened = await unlockInteractively(ctx, resolved.path, raw2, { acceptOlderCopy: true });
   try {
     const entry2 = opened.vault.index.entries.find((candidate) => candidate.chain === "evm" && sameEvmAddress(candidate.address, address));
     if (entry2 === undefined)
@@ -45199,8 +46179,8 @@ async function openExistingTeeStore(ctx, parsed) {
     }, json);
     return { ok: false, code: 1 };
   }
-  const { raw } = found;
-  if (raw === null) {
+  const { raw: raw2 } = found;
+  if (raw2 === null) {
     writeLocalFailure(deps, {
       code: "TEE_STORE_MISSING",
       message: `No TEE wallet store at ${path} ${teePathSourceNote(ctx, parsed)}.`,
@@ -45214,8 +46194,8 @@ async function openExistingTeeStore(ctx, parsed) {
     return { ok: false, code: 1 };
   }
   try {
-    const store = await readKeystore(raw, passphrase.passphrase, { expectPurpose: TEE_KEYSTORE_PURPOSE });
-    return { ok: true, store, path, passphrase: passphrase.passphrase, raw };
+    const store = await readKeystore(raw2, passphrase.passphrase, { expectPurpose: TEE_KEYSTORE_PURPOSE });
+    return { ok: true, store, path, passphrase: passphrase.passphrase, raw: raw2 };
   } catch (error) {
     writeLocalFailure(deps, { code: "TEE_STORE_UNREADABLE", message: error instanceof Error ? error.message : String(error) }, json);
     return { ok: false, code: 1 };
@@ -45291,8 +46271,8 @@ async function teeNew(args, ctx) {
     }, json);
     return 1;
   }
-  const { raw } = found;
-  if (raw === null) {
+  const { raw: raw2 } = found;
+  if (raw2 === null) {
     writeLocalFailure(deps, {
       code: "TEE_STORE_ABSENT",
       message: "No TEE wallet store on this machine. New wallets are derived in the vault.",
@@ -45308,7 +46288,7 @@ Then: candle vault promote --from <label> --to-key <prefix>`
   }
   let store;
   try {
-    store = await readKeystore(raw, passphrase.passphrase, { expectPurpose: TEE_KEYSTORE_PURPOSE });
+    store = await readKeystore(raw2, passphrase.passphrase, { expectPurpose: TEE_KEYSTORE_PURPOSE });
   } catch (error) {
     writeLocalFailure(deps, { code: "TEE_STORE_UNREADABLE", message: error instanceof Error ? error.message : String(error) }, json);
     return 1;
@@ -45316,7 +46296,7 @@ Then: candle vault promote --from <label> --to-key <prefix>`
   const wallet3 = generateWallet("solana");
   let index = -1;
   let label = "";
-  const committed = await commitTee(deps, { store, path, passphrase: passphrase.passphrase, raw }, (entries3) => {
+  const committed = await commitTee(deps, { store, path, passphrase: passphrase.passphrase, raw: raw2 }, (entries3) => {
     index = entries3.length;
     label = parsed.values["--label"] ?? `tee-${index}`;
     entries3.push({
@@ -45387,14 +46367,14 @@ async function teeEnable(args, ctx) {
     if ("error" in resolvedVault)
       return usage3(ctx, resolvedVault.error);
     const vaultPath = resolvedVault.path;
-    const raw = await readVaultRaw2(vaultPath);
-    if (raw === null) {
+    const raw2 = await readVaultRaw2(vaultPath);
+    if (raw2 === null) {
       writeLocalFailure(deps, { code: "VAULT_MISSING", message: `No vault at ${vaultPath}.`, suggestion: "Create one: candle vault init" }, json);
       return 1;
     }
     let opened2;
     try {
-      opened2 = (await unlockInteractively2(ctx, vaultPath, raw, { acceptOlderCopy: true })).vault;
+      opened2 = (await unlockInteractively2(ctx, vaultPath, raw2, { acceptOlderCopy: true })).vault;
     } catch (error) {
       if (isVaultError2(error)) {
         writeLocalFailure(deps, { code: error.code, message: error.message, ...error.suggestion ? { suggestion: error.suggestion } : {} }, json);
@@ -45573,8 +46553,8 @@ async function teeFund(args, ctx) {
   if (!amount)
     return usage3(ctx, "--amount <n> is required.");
   const decimals = asset === "SOL" ? 9 : 6;
-  const raw = decimalToRaw2(amount, decimals);
-  if (raw === null || raw === 0n)
+  const raw2 = decimalToRaw2(amount, decimals);
+  if (raw2 === null || raw2 === 0n)
     return usage3(ctx, `--amount must be a positive decimal with at most ${decimals} decimal places.`);
   const resolved = await resolveTeeAddress(ctx, parsed, address, () => openExistingTeeStore(ctx, parsed));
   if (!resolved.ok)
@@ -45599,7 +46579,7 @@ async function teeFund(args, ctx) {
       asset,
       ...asset === "USDC" ? { mint: USDC_MINT } : {},
       amount,
-      amountRaw: raw.toString(),
+      amountRaw: raw2.toString(),
       destination: address,
       from: "your vault wallet (sign it there; this CLI signs nothing)",
       note: "Every funded unit adds to the TEE wallet exposure. The initial float is not a maximum loss."
@@ -45612,7 +46592,7 @@ async function teeFund(args, ctx) {
     writeHeading(deps, "stdout", "Funding instruction (sign from your vault; this CLI signs nothing)");
     writeFields(deps, "stdout", [
       ["Send", `${amount} ${asset}`],
-      ["Raw units", raw.toString()],
+      ["Raw units", raw2.toString()],
       ["Mint", asset === "USDC" ? USDC_MINT : undefined],
       ["To", address],
       ["Network", "solana-mainnet"]
@@ -45907,10 +46887,10 @@ async function nothingLeftToSweep(solana, entry2) {
     return false;
   }
 }
-function refusalState(raw) {
-  if (!raw || typeof raw !== "object")
+function refusalState(raw2) {
+  if (!raw2 || typeof raw2 !== "object")
     return null;
-  const error = raw.error;
+  const error = raw2.error;
   if (!error || typeof error !== "object")
     return null;
   const state = error.state;
@@ -46527,7 +47507,7 @@ Stop the agent from your Candle session if you have not, and re-run candle tee d
       try {
         const tokenProgram = decodePubkey(acct.programId);
         const mint = decodePubkey(acct.mint);
-        const source = decodePubkey(acct.pubkey);
+        const source2 = decodePubkey(acct.pubkey);
         const destination = associatedTokenAddress(vaultKey, mint, tokenProgram);
         const instructions = [];
         const amount = BigInt(acct.amountRaw);
@@ -46540,7 +47520,7 @@ Stop the agent from your Candle session if you have not, and re-run candle tee d
             profile = await readMintProfile(rpc, acct.mint);
             const hook = await resolveTransferHookAccounts(rpc, {
               profile,
-              source,
+              source: source2,
               destination,
               owner: teePubkey,
               amount
@@ -46579,7 +47559,7 @@ Stop the agent from your Candle session if you have not, and re-run candle tee d
             destinationFrozen = existing.data[TOKEN_ACCOUNT_STATE_OFFSET] === TOKEN_ACCOUNT_STATE_FROZEN;
           }
           instructions.push(tokenTransferChecked({
-            source,
+            source: source2,
             mint,
             destination,
             owner: teePubkey,
@@ -46589,7 +47569,7 @@ Stop the agent from your Candle session if you have not, and re-run candle tee d
             extraAccounts
           }));
         }
-        instructions.push(tokenCloseAccount({ account: source, destination: teePubkey, owner: teePubkey, tokenProgram }));
+        instructions.push(tokenCloseAccount({ account: source2, destination: teePubkey, owner: teePubkey, tokenProgram }));
         const pending = {
           kind: amount > 0n ? "token" : "close",
           mint: acct.mint,
@@ -47100,16 +48080,16 @@ async function postRebind(ctx, deviceToken, body) {
     env: deps.env
   });
 }
-async function resolveTargetKey(ctx, deviceToken, raw, opts = {}) {
+async function resolveTargetKey(ctx, deviceToken, raw2, opts = {}) {
   const { deps, json } = ctx;
   const codePrefix = opts.codePrefix ?? "REBIND";
-  const prefixShaped = KEY_PREFIX_RE2.test(raw);
+  const prefixShaped = KEY_PREFIX_RE2.test(raw2);
   let listed = opts.keys;
   if (listed === undefined) {
     const result2 = await listAccountKeys(ctx, deviceToken);
     if (!result2.ok) {
       if (prefixShaped)
-        return { ok: true, keyPrefix: raw };
+        return { ok: true, keyPrefix: raw2 };
       return {
         ok: false,
         code: opts.writeListFailure ? opts.writeListFailure(result2) : writeRebindFailure(ctx, result2, {})
@@ -47119,13 +48099,13 @@ async function resolveTargetKey(ctx, deviceToken, raw, opts = {}) {
   }
   const keys = listed.filter((key) => !key.revokedAt);
   if (prefixShaped) {
-    const byPrefix = keys.find((key) => key.keyPrefix === raw);
-    const byLabel = keys.filter((key) => key.label === raw && key.keyPrefix !== byPrefix?.keyPrefix);
+    const byPrefix = keys.find((key) => key.keyPrefix === raw2);
+    const byLabel = keys.filter((key) => key.label === raw2 && key.keyPrefix !== byPrefix?.keyPrefix);
     if (byPrefix && byLabel.length > 0) {
       const matches2 = [byPrefix, ...byLabel];
       writeLocalFailure(deps, {
         code: `${codePrefix}_KEY_AMBIGUOUS`,
-        message: `${JSON.stringify(raw)} is a key prefix and also the name of another key; pass the prefix you mean.`,
+        message: `${JSON.stringify(raw2)} is a key prefix and also the name of another key; pass the prefix you mean.`,
         suggestion: `Matching prefixes: ${matches2.map((key) => key.keyPrefix).join(", ")}`
       }, json);
       return { ok: false, code: 1 };
@@ -47139,14 +48119,14 @@ async function resolveTargetKey(ctx, deviceToken, raw, opts = {}) {
     if (byLabel.length > 1) {
       writeLocalFailure(deps, {
         code: `${codePrefix}_KEY_AMBIGUOUS`,
-        message: `${byLabel.length} active keys are named ${JSON.stringify(raw)}; pass a prefix instead.`,
+        message: `${byLabel.length} active keys are named ${JSON.stringify(raw2)}; pass a prefix instead.`,
         suggestion: `Matching prefixes: ${byLabel.map((key) => key.keyPrefix).join(", ")}`
       }, json);
       return { ok: false, code: 1 };
     }
-    return { ok: true, keyPrefix: raw };
+    return { ok: true, keyPrefix: raw2 };
   }
-  const matches = keys.filter((key) => key.label === raw);
+  const matches = keys.filter((key) => key.label === raw2);
   if (matches.length === 1) {
     const only = matches[0];
     return { ok: true, keyPrefix: only.keyPrefix, embeddedWallet: only.embeddedWallet };
@@ -47155,7 +48135,7 @@ async function resolveTargetKey(ctx, deviceToken, raw, opts = {}) {
     const labelled = keys.filter((key) => key.label).map((key) => `${key.keyPrefix} ${labelCell(key.label)}`);
     writeLocalFailure(deps, {
       code: `${codePrefix}_KEY_NOT_FOUND`,
-      message: `No active key on this account is named ${JSON.stringify(raw)}.`,
+      message: `No active key on this account is named ${JSON.stringify(raw2)}.`,
       suggestion: labelled.length > 0 ? `Named keys on this account:
 ${labelled.map((line) => `  ${line}`).join(`
 `)}` : "No key on this account has a name; pass the key's 8-character prefix from: candle keys list"
@@ -47164,7 +48144,7 @@ ${labelled.map((line) => `  ${line}`).join(`
   }
   writeLocalFailure(deps, {
     code: `${codePrefix}_KEY_AMBIGUOUS`,
-    message: `${matches.length} active keys are named ${JSON.stringify(raw)}; pass a prefix instead.`,
+    message: `${matches.length} active keys are named ${JSON.stringify(raw2)}; pass a prefix instead.`,
     suggestion: `Matching prefixes: ${matches.map((key) => key.keyPrefix).join(", ")}`
   }, json);
   return { ok: false, code: 1 };
@@ -53570,12 +54550,12 @@ var require_ref = __commonJS((exports) => {
     function callSyncRef() {
       cxt.result((0, code_1.callValidateCode)(cxt, v, passCxt), () => addEvaluatedFrom(v), () => addErrorsFrom(v));
     }
-    function addErrorsFrom(source) {
-      const errs = (0, codegen_1._)`${source}.errors`;
+    function addErrorsFrom(source2) {
+      const errs = (0, codegen_1._)`${source2}.errors`;
       gen2.assign(names_1.default.vErrors, (0, codegen_1._)`${names_1.default.vErrors} === null ? ${errs} : ${names_1.default.vErrors}.concat(${errs})`);
       gen2.assign(names_1.default.errors, (0, codegen_1._)`${names_1.default.vErrors}.length`);
     }
-    function addEvaluatedFrom(source) {
+    function addEvaluatedFrom(source2) {
       var _a;
       if (!it.opts.unevaluated)
         return;
@@ -53586,7 +54566,7 @@ var require_ref = __commonJS((exports) => {
             it.props = util_1.mergeEvaluated.props(gen2, schEvaluated.props, it.props);
           }
         } else {
-          const props = gen2.var("props", (0, codegen_1._)`${source}.evaluated.props`);
+          const props = gen2.var("props", (0, codegen_1._)`${source2}.evaluated.props`);
           it.props = util_1.mergeEvaluated.props(gen2, props, it.props, codegen_1.Name);
         }
       }
@@ -53596,7 +54576,7 @@ var require_ref = __commonJS((exports) => {
             it.items = util_1.mergeEvaluated.items(gen2, schEvaluated.items, it.items);
           }
         } else {
-          const items = gen2.var("items", (0, codegen_1._)`${source}.evaluated.items`);
+          const items = gen2.var("items", (0, codegen_1._)`${source2}.evaluated.items`);
           it.items = util_1.mergeEvaluated.items(gen2, items, it.items, codegen_1.Name);
         }
       }
@@ -56391,13 +57371,13 @@ function parseStringDef(def, refs) {
 function escapeLiteralCheckValue(literal, refs) {
   return refs.patternStrategy === "escape" ? escapeNonAlphaNumeric(literal) : literal;
 }
-function escapeNonAlphaNumeric(source) {
+function escapeNonAlphaNumeric(source2) {
   let result2 = "";
-  for (let i = 0;i < source.length; i++) {
-    if (!ALPHA_NUMERIC.has(source[i])) {
+  for (let i = 0;i < source2.length; i++) {
+    if (!ALPHA_NUMERIC.has(source2[i])) {
       result2 += "\\";
     }
-    result2 += source[i];
+    result2 += source2[i];
   }
   return result2;
 }
@@ -56466,60 +57446,60 @@ function stringifyRegExpWithFlags(regex, refs) {
     m: regex.flags.includes("m"),
     s: regex.flags.includes("s")
   };
-  const source = flags.i ? regex.source.toLowerCase() : regex.source;
+  const source2 = flags.i ? regex.source.toLowerCase() : regex.source;
   let pattern = "";
   let isEscaped = false;
   let inCharGroup = false;
   let inCharRange = false;
-  for (let i = 0;i < source.length; i++) {
+  for (let i = 0;i < source2.length; i++) {
     if (isEscaped) {
-      pattern += source[i];
+      pattern += source2[i];
       isEscaped = false;
       continue;
     }
     if (flags.i) {
       if (inCharGroup) {
-        if (source[i].match(/[a-z]/)) {
+        if (source2[i].match(/[a-z]/)) {
           if (inCharRange) {
-            pattern += source[i];
-            pattern += `${source[i - 2]}-${source[i]}`.toUpperCase();
+            pattern += source2[i];
+            pattern += `${source2[i - 2]}-${source2[i]}`.toUpperCase();
             inCharRange = false;
-          } else if (source[i + 1] === "-" && source[i + 2]?.match(/[a-z]/)) {
-            pattern += source[i];
+          } else if (source2[i + 1] === "-" && source2[i + 2]?.match(/[a-z]/)) {
+            pattern += source2[i];
             inCharRange = true;
           } else {
-            pattern += `${source[i]}${source[i].toUpperCase()}`;
+            pattern += `${source2[i]}${source2[i].toUpperCase()}`;
           }
           continue;
         }
-      } else if (source[i].match(/[a-z]/)) {
-        pattern += `[${source[i]}${source[i].toUpperCase()}]`;
+      } else if (source2[i].match(/[a-z]/)) {
+        pattern += `[${source2[i]}${source2[i].toUpperCase()}]`;
         continue;
       }
     }
     if (flags.m) {
-      if (source[i] === "^") {
+      if (source2[i] === "^") {
         pattern += `(^|(?<=[\r
 ]))`;
         continue;
-      } else if (source[i] === "$") {
+      } else if (source2[i] === "$") {
         pattern += `($|(?=[\r
 ]))`;
         continue;
       }
     }
-    if (flags.s && source[i] === ".") {
-      pattern += inCharGroup ? `${source[i]}\r
-` : `[${source[i]}\r
+    if (flags.s && source2[i] === ".") {
+      pattern += inCharGroup ? `${source2[i]}\r
+` : `[${source2[i]}\r
 ]`;
       continue;
     }
-    pattern += source[i];
-    if (source[i] === "\\") {
+    pattern += source2[i];
+    if (source2[i] === "\\") {
       isEscaped = true;
-    } else if (inCharGroup && source[i] === "]") {
+    } else if (inCharGroup && source2[i] === "]") {
       inCharGroup = false;
-    } else if (!inCharGroup && source[i] === "[") {
+    } else if (!inCharGroup && source2[i] === "[") {
       inCharGroup = true;
     }
   }
@@ -56648,11 +57628,11 @@ var init_map = __esm(() => {
 
 // ../../node_modules/zod-to-json-schema/dist/esm/parsers/nativeEnum.js
 function parseNativeEnumDef(def) {
-  const object2 = def.values;
+  const object3 = def.values;
   const actualKeys = Object.keys(def.values).filter((key) => {
-    return typeof object2[object2[key]] !== "number";
+    return typeof object3[object3[key]] !== "number";
   });
-  const actualValues = actualKeys.map((key) => object2[key]);
+  const actualValues = actualKeys.map((key) => object3[key]);
   const parsedTypes = Array.from(new Set(actualValues.map((values) => typeof values)));
   return {
     type: parsedTypes.length === 1 ? parsedTypes[0] === "string" ? "string" : "number" : ["string", "number"],
@@ -58362,11 +59342,11 @@ var require_envelope = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   exports.Signature = exports.Envelope = undefined;
   exports.Envelope = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        payload: isSet(object5.payload) ? Buffer.from(bytesFromBase64(object5.payload)) : Buffer.alloc(0),
-        payloadType: isSet(object5.payloadType) ? globalThis.String(object5.payloadType) : "",
-        signatures: globalThis.Array.isArray(object5?.signatures) ? object5.signatures.map((e) => exports.Signature.fromJSON(e)) : []
+        payload: isSet(object7.payload) ? Buffer.from(bytesFromBase64(object7.payload)) : Buffer.alloc(0),
+        payloadType: isSet(object7.payloadType) ? globalThis.String(object7.payloadType) : "",
+        signatures: globalThis.Array.isArray(object7?.signatures) ? object7.signatures.map((e) => exports.Signature.fromJSON(e)) : []
       };
     },
     toJSON(message) {
@@ -58384,10 +59364,10 @@ var require_envelope = __commonJS((exports) => {
     }
   };
   exports.Signature = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        sig: isSet(object5.sig) ? Buffer.from(bytesFromBase64(object5.sig)) : Buffer.alloc(0),
-        keyid: isSet(object5.keyid) ? globalThis.String(object5.keyid) : ""
+        sig: isSet(object7.sig) ? Buffer.from(bytesFromBase64(object7.sig)) : Buffer.alloc(0),
+        keyid: isSet(object7.keyid) ? globalThis.String(object7.keyid) : ""
       };
     },
     toJSON(message) {
@@ -58417,10 +59397,10 @@ var require_timestamp = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   exports.Timestamp = undefined;
   exports.Timestamp = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        seconds: isSet(object5.seconds) ? globalThis.String(object5.seconds) : "0",
-        nanos: isSet(object5.nanos) ? globalThis.Number(object5.nanos) : 0
+        seconds: isSet(object7.seconds) ? globalThis.String(object7.seconds) : "0",
+        nanos: isSet(object7.nanos) ? globalThis.Number(object7.nanos) : 0
       };
     },
     toJSON(message) {
@@ -58459,8 +59439,8 @@ var require_sigstore_common = __commonJS((exports) => {
     HashAlgorithm2[HashAlgorithm2["SHA3_256"] = 4] = "SHA3_256";
     HashAlgorithm2[HashAlgorithm2["SHA3_384"] = 5] = "SHA3_384";
   })(HashAlgorithm || (exports.HashAlgorithm = HashAlgorithm = {}));
-  function hashAlgorithmFromJSON(object5) {
-    switch (object5) {
+  function hashAlgorithmFromJSON(object7) {
+    switch (object7) {
       case 0:
       case "HASH_ALGORITHM_UNSPECIFIED":
         return HashAlgorithm.HASH_ALGORITHM_UNSPECIFIED;
@@ -58480,11 +59460,11 @@ var require_sigstore_common = __commonJS((exports) => {
       case "SHA3_384":
         return HashAlgorithm.SHA3_384;
       default:
-        throw new globalThis.Error("Unrecognized enum value " + object5 + " for enum HashAlgorithm");
+        throw new globalThis.Error("Unrecognized enum value " + object7 + " for enum HashAlgorithm");
     }
   }
-  function hashAlgorithmToJSON(object5) {
-    switch (object5) {
+  function hashAlgorithmToJSON(object7) {
+    switch (object7) {
       case HashAlgorithm.HASH_ALGORITHM_UNSPECIFIED:
         return "HASH_ALGORITHM_UNSPECIFIED";
       case HashAlgorithm.SHA2_256:
@@ -58498,7 +59478,7 @@ var require_sigstore_common = __commonJS((exports) => {
       case HashAlgorithm.SHA3_384:
         return "SHA3_384";
       default:
-        throw new globalThis.Error("Unrecognized enum value " + object5 + " for enum HashAlgorithm");
+        throw new globalThis.Error("Unrecognized enum value " + object7 + " for enum HashAlgorithm");
     }
   }
   var PublicKeyDetails;
@@ -58528,8 +59508,8 @@ var require_sigstore_common = __commonJS((exports) => {
     PublicKeyDetails2[PublicKeyDetails2["ML_DSA_65"] = 21] = "ML_DSA_65";
     PublicKeyDetails2[PublicKeyDetails2["ML_DSA_87"] = 22] = "ML_DSA_87";
   })(PublicKeyDetails || (exports.PublicKeyDetails = PublicKeyDetails = {}));
-  function publicKeyDetailsFromJSON(object5) {
-    switch (object5) {
+  function publicKeyDetailsFromJSON(object7) {
+    switch (object7) {
       case 0:
       case "PUBLIC_KEY_DETAILS_UNSPECIFIED":
         return PublicKeyDetails.PUBLIC_KEY_DETAILS_UNSPECIFIED;
@@ -58603,11 +59583,11 @@ var require_sigstore_common = __commonJS((exports) => {
       case "ML_DSA_87":
         return PublicKeyDetails.ML_DSA_87;
       default:
-        throw new globalThis.Error("Unrecognized enum value " + object5 + " for enum PublicKeyDetails");
+        throw new globalThis.Error("Unrecognized enum value " + object7 + " for enum PublicKeyDetails");
     }
   }
-  function publicKeyDetailsToJSON(object5) {
-    switch (object5) {
+  function publicKeyDetailsToJSON(object7) {
+    switch (object7) {
       case PublicKeyDetails.PUBLIC_KEY_DETAILS_UNSPECIFIED:
         return "PUBLIC_KEY_DETAILS_UNSPECIFIED";
       case PublicKeyDetails.PKCS1_RSA_PKCS1V5:
@@ -58657,7 +59637,7 @@ var require_sigstore_common = __commonJS((exports) => {
       case PublicKeyDetails.ML_DSA_87:
         return "ML_DSA_87";
       default:
-        throw new globalThis.Error("Unrecognized enum value " + object5 + " for enum PublicKeyDetails");
+        throw new globalThis.Error("Unrecognized enum value " + object7 + " for enum PublicKeyDetails");
     }
   }
   var SubjectAlternativeNameType;
@@ -58667,8 +59647,8 @@ var require_sigstore_common = __commonJS((exports) => {
     SubjectAlternativeNameType2[SubjectAlternativeNameType2["URI"] = 2] = "URI";
     SubjectAlternativeNameType2[SubjectAlternativeNameType2["OTHER_NAME"] = 3] = "OTHER_NAME";
   })(SubjectAlternativeNameType || (exports.SubjectAlternativeNameType = SubjectAlternativeNameType = {}));
-  function subjectAlternativeNameTypeFromJSON(object5) {
-    switch (object5) {
+  function subjectAlternativeNameTypeFromJSON(object7) {
+    switch (object7) {
       case 0:
       case "SUBJECT_ALTERNATIVE_NAME_TYPE_UNSPECIFIED":
         return SubjectAlternativeNameType.SUBJECT_ALTERNATIVE_NAME_TYPE_UNSPECIFIED;
@@ -58682,11 +59662,11 @@ var require_sigstore_common = __commonJS((exports) => {
       case "OTHER_NAME":
         return SubjectAlternativeNameType.OTHER_NAME;
       default:
-        throw new globalThis.Error("Unrecognized enum value " + object5 + " for enum SubjectAlternativeNameType");
+        throw new globalThis.Error("Unrecognized enum value " + object7 + " for enum SubjectAlternativeNameType");
     }
   }
-  function subjectAlternativeNameTypeToJSON(object5) {
-    switch (object5) {
+  function subjectAlternativeNameTypeToJSON(object7) {
+    switch (object7) {
       case SubjectAlternativeNameType.SUBJECT_ALTERNATIVE_NAME_TYPE_UNSPECIFIED:
         return "SUBJECT_ALTERNATIVE_NAME_TYPE_UNSPECIFIED";
       case SubjectAlternativeNameType.EMAIL:
@@ -58696,14 +59676,14 @@ var require_sigstore_common = __commonJS((exports) => {
       case SubjectAlternativeNameType.OTHER_NAME:
         return "OTHER_NAME";
       default:
-        throw new globalThis.Error("Unrecognized enum value " + object5 + " for enum SubjectAlternativeNameType");
+        throw new globalThis.Error("Unrecognized enum value " + object7 + " for enum SubjectAlternativeNameType");
     }
   }
   exports.HashOutput = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        algorithm: isSet(object5.algorithm) ? hashAlgorithmFromJSON(object5.algorithm) : 0,
-        digest: isSet(object5.digest) ? Buffer.from(bytesFromBase64(object5.digest)) : Buffer.alloc(0)
+        algorithm: isSet(object7.algorithm) ? hashAlgorithmFromJSON(object7.algorithm) : 0,
+        digest: isSet(object7.digest) ? Buffer.from(bytesFromBase64(object7.digest)) : Buffer.alloc(0)
       };
     },
     toJSON(message) {
@@ -58718,10 +59698,10 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.MessageSignature = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        messageDigest: isSet(object5.messageDigest) ? exports.HashOutput.fromJSON(object5.messageDigest) : undefined,
-        signature: isSet(object5.signature) ? Buffer.from(bytesFromBase64(object5.signature)) : Buffer.alloc(0)
+        messageDigest: isSet(object7.messageDigest) ? exports.HashOutput.fromJSON(object7.messageDigest) : undefined,
+        signature: isSet(object7.signature) ? Buffer.from(bytesFromBase64(object7.signature)) : Buffer.alloc(0)
       };
     },
     toJSON(message) {
@@ -58736,8 +59716,8 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.LogId = {
-    fromJSON(object5) {
-      return { keyId: isSet(object5.keyId) ? Buffer.from(bytesFromBase64(object5.keyId)) : Buffer.alloc(0) };
+    fromJSON(object7) {
+      return { keyId: isSet(object7.keyId) ? Buffer.from(bytesFromBase64(object7.keyId)) : Buffer.alloc(0) };
     },
     toJSON(message) {
       const obj = {};
@@ -58748,9 +59728,9 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.RFC3161SignedTimestamp = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        signedTimestamp: isSet(object5.signedTimestamp) ? Buffer.from(bytesFromBase64(object5.signedTimestamp)) : Buffer.alloc(0)
+        signedTimestamp: isSet(object7.signedTimestamp) ? Buffer.from(bytesFromBase64(object7.signedTimestamp)) : Buffer.alloc(0)
       };
     },
     toJSON(message) {
@@ -58762,11 +59742,11 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.PublicKey = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        rawBytes: isSet(object5.rawBytes) ? Buffer.from(bytesFromBase64(object5.rawBytes)) : undefined,
-        keyDetails: isSet(object5.keyDetails) ? publicKeyDetailsFromJSON(object5.keyDetails) : 0,
-        validFor: isSet(object5.validFor) ? exports.TimeRange.fromJSON(object5.validFor) : undefined
+        rawBytes: isSet(object7.rawBytes) ? Buffer.from(bytesFromBase64(object7.rawBytes)) : undefined,
+        keyDetails: isSet(object7.keyDetails) ? publicKeyDetailsFromJSON(object7.keyDetails) : 0,
+        validFor: isSet(object7.validFor) ? exports.TimeRange.fromJSON(object7.validFor) : undefined
       };
     },
     toJSON(message) {
@@ -58784,8 +59764,8 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.PublicKeyIdentifier = {
-    fromJSON(object5) {
-      return { hint: isSet(object5.hint) ? globalThis.String(object5.hint) : "" };
+    fromJSON(object7) {
+      return { hint: isSet(object7.hint) ? globalThis.String(object7.hint) : "" };
     },
     toJSON(message) {
       const obj = {};
@@ -58796,8 +59776,8 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.ObjectIdentifier = {
-    fromJSON(object5) {
-      return { id: globalThis.Array.isArray(object5?.id) ? object5.id.map((e) => globalThis.Number(e)) : [] };
+    fromJSON(object7) {
+      return { id: globalThis.Array.isArray(object7?.id) ? object7.id.map((e) => globalThis.Number(e)) : [] };
     },
     toJSON(message) {
       const obj = {};
@@ -58808,10 +59788,10 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.ObjectIdentifierValuePair = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        oid: isSet(object5.oid) ? exports.ObjectIdentifier.fromJSON(object5.oid) : undefined,
-        value: isSet(object5.value) ? Buffer.from(bytesFromBase64(object5.value)) : Buffer.alloc(0)
+        oid: isSet(object7.oid) ? exports.ObjectIdentifier.fromJSON(object7.oid) : undefined,
+        value: isSet(object7.value) ? Buffer.from(bytesFromBase64(object7.value)) : Buffer.alloc(0)
       };
     },
     toJSON(message) {
@@ -58826,10 +59806,10 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.DistinguishedName = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        organization: isSet(object5.organization) ? globalThis.String(object5.organization) : "",
-        commonName: isSet(object5.commonName) ? globalThis.String(object5.commonName) : ""
+        organization: isSet(object7.organization) ? globalThis.String(object7.organization) : "",
+        commonName: isSet(object7.commonName) ? globalThis.String(object7.commonName) : ""
       };
     },
     toJSON(message) {
@@ -58844,8 +59824,8 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.X509Certificate = {
-    fromJSON(object5) {
-      return { rawBytes: isSet(object5.rawBytes) ? Buffer.from(bytesFromBase64(object5.rawBytes)) : Buffer.alloc(0) };
+    fromJSON(object7) {
+      return { rawBytes: isSet(object7.rawBytes) ? Buffer.from(bytesFromBase64(object7.rawBytes)) : Buffer.alloc(0) };
     },
     toJSON(message) {
       const obj = {};
@@ -58856,10 +59836,10 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.SubjectAlternativeName = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        type: isSet(object5.type) ? subjectAlternativeNameTypeFromJSON(object5.type) : 0,
-        identity: isSet(object5.regexp) ? { $case: "regexp", regexp: globalThis.String(object5.regexp) } : isSet(object5.value) ? { $case: "value", value: globalThis.String(object5.value) } : undefined
+        type: isSet(object7.type) ? subjectAlternativeNameTypeFromJSON(object7.type) : 0,
+        identity: isSet(object7.regexp) ? { $case: "regexp", regexp: globalThis.String(object7.regexp) } : isSet(object7.value) ? { $case: "value", value: globalThis.String(object7.value) } : undefined
       };
     },
     toJSON(message) {
@@ -58876,9 +59856,9 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.X509CertificateChain = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        certificates: globalThis.Array.isArray(object5?.certificates) ? object5.certificates.map((e) => exports.X509Certificate.fromJSON(e)) : []
+        certificates: globalThis.Array.isArray(object7?.certificates) ? object7.certificates.map((e) => exports.X509Certificate.fromJSON(e)) : []
       };
     },
     toJSON(message) {
@@ -58890,10 +59870,10 @@ var require_sigstore_common = __commonJS((exports) => {
     }
   };
   exports.TimeRange = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        start: isSet(object5.start) ? fromJsonTimestamp(object5.start) : undefined,
-        end: isSet(object5.end) ? fromJsonTimestamp(object5.end) : undefined
+        start: isSet(object7.start) ? fromJsonTimestamp(object7.start) : undefined,
+        end: isSet(object7.end) ? fromJsonTimestamp(object7.end) : undefined
       };
     },
     toJSON(message) {
@@ -58938,10 +59918,10 @@ var require_sigstore_rekor = __commonJS((exports) => {
   exports.TransparencyLogEntry = exports.InclusionPromise = exports.InclusionProof = exports.Checkpoint = exports.KindVersion = undefined;
   var sigstore_common_1 = require_sigstore_common();
   exports.KindVersion = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        kind: isSet(object5.kind) ? globalThis.String(object5.kind) : "",
-        version: isSet(object5.version) ? globalThis.String(object5.version) : ""
+        kind: isSet(object7.kind) ? globalThis.String(object7.kind) : "",
+        version: isSet(object7.version) ? globalThis.String(object7.version) : ""
       };
     },
     toJSON(message) {
@@ -58956,8 +59936,8 @@ var require_sigstore_rekor = __commonJS((exports) => {
     }
   };
   exports.Checkpoint = {
-    fromJSON(object5) {
-      return { envelope: isSet(object5.envelope) ? globalThis.String(object5.envelope) : "" };
+    fromJSON(object7) {
+      return { envelope: isSet(object7.envelope) ? globalThis.String(object7.envelope) : "" };
     },
     toJSON(message) {
       const obj = {};
@@ -58968,13 +59948,13 @@ var require_sigstore_rekor = __commonJS((exports) => {
     }
   };
   exports.InclusionProof = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        logIndex: isSet(object5.logIndex) ? globalThis.String(object5.logIndex) : "0",
-        rootHash: isSet(object5.rootHash) ? Buffer.from(bytesFromBase64(object5.rootHash)) : Buffer.alloc(0),
-        treeSize: isSet(object5.treeSize) ? globalThis.String(object5.treeSize) : "0",
-        hashes: globalThis.Array.isArray(object5?.hashes) ? object5.hashes.map((e) => Buffer.from(bytesFromBase64(e))) : [],
-        checkpoint: isSet(object5.checkpoint) ? exports.Checkpoint.fromJSON(object5.checkpoint) : undefined
+        logIndex: isSet(object7.logIndex) ? globalThis.String(object7.logIndex) : "0",
+        rootHash: isSet(object7.rootHash) ? Buffer.from(bytesFromBase64(object7.rootHash)) : Buffer.alloc(0),
+        treeSize: isSet(object7.treeSize) ? globalThis.String(object7.treeSize) : "0",
+        hashes: globalThis.Array.isArray(object7?.hashes) ? object7.hashes.map((e) => Buffer.from(bytesFromBase64(e))) : [],
+        checkpoint: isSet(object7.checkpoint) ? exports.Checkpoint.fromJSON(object7.checkpoint) : undefined
       };
     },
     toJSON(message) {
@@ -58998,9 +59978,9 @@ var require_sigstore_rekor = __commonJS((exports) => {
     }
   };
   exports.InclusionPromise = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        signedEntryTimestamp: isSet(object5.signedEntryTimestamp) ? Buffer.from(bytesFromBase64(object5.signedEntryTimestamp)) : Buffer.alloc(0)
+        signedEntryTimestamp: isSet(object7.signedEntryTimestamp) ? Buffer.from(bytesFromBase64(object7.signedEntryTimestamp)) : Buffer.alloc(0)
       };
     },
     toJSON(message) {
@@ -59012,15 +59992,15 @@ var require_sigstore_rekor = __commonJS((exports) => {
     }
   };
   exports.TransparencyLogEntry = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        logIndex: isSet(object5.logIndex) ? globalThis.String(object5.logIndex) : "0",
-        logId: isSet(object5.logId) ? sigstore_common_1.LogId.fromJSON(object5.logId) : undefined,
-        kindVersion: isSet(object5.kindVersion) ? exports.KindVersion.fromJSON(object5.kindVersion) : undefined,
-        integratedTime: isSet(object5.integratedTime) ? globalThis.String(object5.integratedTime) : "0",
-        inclusionPromise: isSet(object5.inclusionPromise) ? exports.InclusionPromise.fromJSON(object5.inclusionPromise) : undefined,
-        inclusionProof: isSet(object5.inclusionProof) ? exports.InclusionProof.fromJSON(object5.inclusionProof) : undefined,
-        canonicalizedBody: isSet(object5.canonicalizedBody) ? Buffer.from(bytesFromBase64(object5.canonicalizedBody)) : Buffer.alloc(0)
+        logIndex: isSet(object7.logIndex) ? globalThis.String(object7.logIndex) : "0",
+        logId: isSet(object7.logId) ? sigstore_common_1.LogId.fromJSON(object7.logId) : undefined,
+        kindVersion: isSet(object7.kindVersion) ? exports.KindVersion.fromJSON(object7.kindVersion) : undefined,
+        integratedTime: isSet(object7.integratedTime) ? globalThis.String(object7.integratedTime) : "0",
+        inclusionPromise: isSet(object7.inclusionPromise) ? exports.InclusionPromise.fromJSON(object7.inclusionPromise) : undefined,
+        inclusionProof: isSet(object7.inclusionProof) ? exports.InclusionProof.fromJSON(object7.inclusionProof) : undefined,
+        canonicalizedBody: isSet(object7.canonicalizedBody) ? Buffer.from(bytesFromBase64(object7.canonicalizedBody)) : Buffer.alloc(0)
       };
     },
     toJSON(message) {
@@ -59068,9 +60048,9 @@ var require_sigstore_bundle = __commonJS((exports) => {
   var sigstore_common_1 = require_sigstore_common();
   var sigstore_rekor_1 = require_sigstore_rekor();
   exports.TimestampVerificationData = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        rfc3161Timestamps: globalThis.Array.isArray(object5?.rfc3161Timestamps) ? object5.rfc3161Timestamps.map((e) => sigstore_common_1.RFC3161SignedTimestamp.fromJSON(e)) : []
+        rfc3161Timestamps: globalThis.Array.isArray(object7?.rfc3161Timestamps) ? object7.rfc3161Timestamps.map((e) => sigstore_common_1.RFC3161SignedTimestamp.fromJSON(e)) : []
       };
     },
     toJSON(message) {
@@ -59082,14 +60062,14 @@ var require_sigstore_bundle = __commonJS((exports) => {
     }
   };
   exports.VerificationMaterial = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        content: isSet(object5.publicKey) ? { $case: "publicKey", publicKey: sigstore_common_1.PublicKeyIdentifier.fromJSON(object5.publicKey) } : isSet(object5.x509CertificateChain) ? {
+        content: isSet(object7.publicKey) ? { $case: "publicKey", publicKey: sigstore_common_1.PublicKeyIdentifier.fromJSON(object7.publicKey) } : isSet(object7.x509CertificateChain) ? {
           $case: "x509CertificateChain",
-          x509CertificateChain: sigstore_common_1.X509CertificateChain.fromJSON(object5.x509CertificateChain)
-        } : isSet(object5.certificate) ? { $case: "certificate", certificate: sigstore_common_1.X509Certificate.fromJSON(object5.certificate) } : undefined,
-        tlogEntries: globalThis.Array.isArray(object5?.tlogEntries) ? object5.tlogEntries.map((e) => sigstore_rekor_1.TransparencyLogEntry.fromJSON(e)) : [],
-        timestampVerificationData: isSet(object5.timestampVerificationData) ? exports.TimestampVerificationData.fromJSON(object5.timestampVerificationData) : undefined
+          x509CertificateChain: sigstore_common_1.X509CertificateChain.fromJSON(object7.x509CertificateChain)
+        } : isSet(object7.certificate) ? { $case: "certificate", certificate: sigstore_common_1.X509Certificate.fromJSON(object7.certificate) } : undefined,
+        tlogEntries: globalThis.Array.isArray(object7?.tlogEntries) ? object7.tlogEntries.map((e) => sigstore_rekor_1.TransparencyLogEntry.fromJSON(e)) : [],
+        timestampVerificationData: isSet(object7.timestampVerificationData) ? exports.TimestampVerificationData.fromJSON(object7.timestampVerificationData) : undefined
       };
     },
     toJSON(message) {
@@ -59111,11 +60091,11 @@ var require_sigstore_bundle = __commonJS((exports) => {
     }
   };
   exports.Bundle = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        mediaType: isSet(object5.mediaType) ? globalThis.String(object5.mediaType) : "",
-        verificationMaterial: isSet(object5.verificationMaterial) ? exports.VerificationMaterial.fromJSON(object5.verificationMaterial) : undefined,
-        content: isSet(object5.messageSignature) ? { $case: "messageSignature", messageSignature: sigstore_common_1.MessageSignature.fromJSON(object5.messageSignature) } : isSet(object5.dsseEnvelope) ? { $case: "dsseEnvelope", dsseEnvelope: envelope_1.Envelope.fromJSON(object5.dsseEnvelope) } : undefined
+        mediaType: isSet(object7.mediaType) ? globalThis.String(object7.mediaType) : "",
+        verificationMaterial: isSet(object7.verificationMaterial) ? exports.VerificationMaterial.fromJSON(object7.verificationMaterial) : undefined,
+        content: isSet(object7.messageSignature) ? { $case: "messageSignature", messageSignature: sigstore_common_1.MessageSignature.fromJSON(object7.messageSignature) } : isSet(object7.dsseEnvelope) ? { $case: "dsseEnvelope", dsseEnvelope: envelope_1.Envelope.fromJSON(object7.dsseEnvelope) } : undefined
       };
     },
     toJSON(message) {
@@ -59153,8 +60133,8 @@ var require_sigstore_trustroot = __commonJS((exports) => {
     ServiceSelector2[ServiceSelector2["ANY"] = 2] = "ANY";
     ServiceSelector2[ServiceSelector2["EXACT"] = 3] = "EXACT";
   })(ServiceSelector || (exports.ServiceSelector = ServiceSelector = {}));
-  function serviceSelectorFromJSON(object5) {
-    switch (object5) {
+  function serviceSelectorFromJSON(object7) {
+    switch (object7) {
       case 0:
       case "SERVICE_SELECTOR_UNDEFINED":
         return ServiceSelector.SERVICE_SELECTOR_UNDEFINED;
@@ -59168,11 +60148,11 @@ var require_sigstore_trustroot = __commonJS((exports) => {
       case "EXACT":
         return ServiceSelector.EXACT;
       default:
-        throw new globalThis.Error("Unrecognized enum value " + object5 + " for enum ServiceSelector");
+        throw new globalThis.Error("Unrecognized enum value " + object7 + " for enum ServiceSelector");
     }
   }
-  function serviceSelectorToJSON(object5) {
-    switch (object5) {
+  function serviceSelectorToJSON(object7) {
+    switch (object7) {
       case ServiceSelector.SERVICE_SELECTOR_UNDEFINED:
         return "SERVICE_SELECTOR_UNDEFINED";
       case ServiceSelector.ALL:
@@ -59182,18 +60162,18 @@ var require_sigstore_trustroot = __commonJS((exports) => {
       case ServiceSelector.EXACT:
         return "EXACT";
       default:
-        throw new globalThis.Error("Unrecognized enum value " + object5 + " for enum ServiceSelector");
+        throw new globalThis.Error("Unrecognized enum value " + object7 + " for enum ServiceSelector");
     }
   }
   exports.TransparencyLogInstance = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        baseUrl: isSet(object5.baseUrl) ? globalThis.String(object5.baseUrl) : "",
-        hashAlgorithm: isSet(object5.hashAlgorithm) ? (0, sigstore_common_1.hashAlgorithmFromJSON)(object5.hashAlgorithm) : 0,
-        publicKey: isSet(object5.publicKey) ? sigstore_common_1.PublicKey.fromJSON(object5.publicKey) : undefined,
-        logId: isSet(object5.logId) ? sigstore_common_1.LogId.fromJSON(object5.logId) : undefined,
-        checkpointKeyId: isSet(object5.checkpointKeyId) ? sigstore_common_1.LogId.fromJSON(object5.checkpointKeyId) : undefined,
-        operator: isSet(object5.operator) ? globalThis.String(object5.operator) : ""
+        baseUrl: isSet(object7.baseUrl) ? globalThis.String(object7.baseUrl) : "",
+        hashAlgorithm: isSet(object7.hashAlgorithm) ? (0, sigstore_common_1.hashAlgorithmFromJSON)(object7.hashAlgorithm) : 0,
+        publicKey: isSet(object7.publicKey) ? sigstore_common_1.PublicKey.fromJSON(object7.publicKey) : undefined,
+        logId: isSet(object7.logId) ? sigstore_common_1.LogId.fromJSON(object7.logId) : undefined,
+        checkpointKeyId: isSet(object7.checkpointKeyId) ? sigstore_common_1.LogId.fromJSON(object7.checkpointKeyId) : undefined,
+        operator: isSet(object7.operator) ? globalThis.String(object7.operator) : ""
       };
     },
     toJSON(message) {
@@ -59220,13 +60200,13 @@ var require_sigstore_trustroot = __commonJS((exports) => {
     }
   };
   exports.CertificateAuthority = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        subject: isSet(object5.subject) ? sigstore_common_1.DistinguishedName.fromJSON(object5.subject) : undefined,
-        uri: isSet(object5.uri) ? globalThis.String(object5.uri) : "",
-        certChain: isSet(object5.certChain) ? sigstore_common_1.X509CertificateChain.fromJSON(object5.certChain) : undefined,
-        validFor: isSet(object5.validFor) ? sigstore_common_1.TimeRange.fromJSON(object5.validFor) : undefined,
-        operator: isSet(object5.operator) ? globalThis.String(object5.operator) : ""
+        subject: isSet(object7.subject) ? sigstore_common_1.DistinguishedName.fromJSON(object7.subject) : undefined,
+        uri: isSet(object7.uri) ? globalThis.String(object7.uri) : "",
+        certChain: isSet(object7.certChain) ? sigstore_common_1.X509CertificateChain.fromJSON(object7.certChain) : undefined,
+        validFor: isSet(object7.validFor) ? sigstore_common_1.TimeRange.fromJSON(object7.validFor) : undefined,
+        operator: isSet(object7.operator) ? globalThis.String(object7.operator) : ""
       };
     },
     toJSON(message) {
@@ -59250,13 +60230,13 @@ var require_sigstore_trustroot = __commonJS((exports) => {
     }
   };
   exports.TrustedRoot = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        mediaType: isSet(object5.mediaType) ? globalThis.String(object5.mediaType) : "",
-        tlogs: globalThis.Array.isArray(object5?.tlogs) ? object5.tlogs.map((e) => exports.TransparencyLogInstance.fromJSON(e)) : [],
-        certificateAuthorities: globalThis.Array.isArray(object5?.certificateAuthorities) ? object5.certificateAuthorities.map((e) => exports.CertificateAuthority.fromJSON(e)) : [],
-        ctlogs: globalThis.Array.isArray(object5?.ctlogs) ? object5.ctlogs.map((e) => exports.TransparencyLogInstance.fromJSON(e)) : [],
-        timestampAuthorities: globalThis.Array.isArray(object5?.timestampAuthorities) ? object5.timestampAuthorities.map((e) => exports.CertificateAuthority.fromJSON(e)) : []
+        mediaType: isSet(object7.mediaType) ? globalThis.String(object7.mediaType) : "",
+        tlogs: globalThis.Array.isArray(object7?.tlogs) ? object7.tlogs.map((e) => exports.TransparencyLogInstance.fromJSON(e)) : [],
+        certificateAuthorities: globalThis.Array.isArray(object7?.certificateAuthorities) ? object7.certificateAuthorities.map((e) => exports.CertificateAuthority.fromJSON(e)) : [],
+        ctlogs: globalThis.Array.isArray(object7?.ctlogs) ? object7.ctlogs.map((e) => exports.TransparencyLogInstance.fromJSON(e)) : [],
+        timestampAuthorities: globalThis.Array.isArray(object7?.timestampAuthorities) ? object7.timestampAuthorities.map((e) => exports.CertificateAuthority.fromJSON(e)) : []
       };
     },
     toJSON(message) {
@@ -59280,15 +60260,15 @@ var require_sigstore_trustroot = __commonJS((exports) => {
     }
   };
   exports.SigningConfig = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        mediaType: isSet(object5.mediaType) ? globalThis.String(object5.mediaType) : "",
-        caUrls: globalThis.Array.isArray(object5?.caUrls) ? object5.caUrls.map((e) => exports.Service.fromJSON(e)) : [],
-        oidcUrls: globalThis.Array.isArray(object5?.oidcUrls) ? object5.oidcUrls.map((e) => exports.Service.fromJSON(e)) : [],
-        rekorTlogUrls: globalThis.Array.isArray(object5?.rekorTlogUrls) ? object5.rekorTlogUrls.map((e) => exports.Service.fromJSON(e)) : [],
-        rekorTlogConfig: isSet(object5.rekorTlogConfig) ? exports.ServiceConfiguration.fromJSON(object5.rekorTlogConfig) : undefined,
-        tsaUrls: globalThis.Array.isArray(object5?.tsaUrls) ? object5.tsaUrls.map((e) => exports.Service.fromJSON(e)) : [],
-        tsaConfig: isSet(object5.tsaConfig) ? exports.ServiceConfiguration.fromJSON(object5.tsaConfig) : undefined
+        mediaType: isSet(object7.mediaType) ? globalThis.String(object7.mediaType) : "",
+        caUrls: globalThis.Array.isArray(object7?.caUrls) ? object7.caUrls.map((e) => exports.Service.fromJSON(e)) : [],
+        oidcUrls: globalThis.Array.isArray(object7?.oidcUrls) ? object7.oidcUrls.map((e) => exports.Service.fromJSON(e)) : [],
+        rekorTlogUrls: globalThis.Array.isArray(object7?.rekorTlogUrls) ? object7.rekorTlogUrls.map((e) => exports.Service.fromJSON(e)) : [],
+        rekorTlogConfig: isSet(object7.rekorTlogConfig) ? exports.ServiceConfiguration.fromJSON(object7.rekorTlogConfig) : undefined,
+        tsaUrls: globalThis.Array.isArray(object7?.tsaUrls) ? object7.tsaUrls.map((e) => exports.Service.fromJSON(e)) : [],
+        tsaConfig: isSet(object7.tsaConfig) ? exports.ServiceConfiguration.fromJSON(object7.tsaConfig) : undefined
       };
     },
     toJSON(message) {
@@ -59318,12 +60298,12 @@ var require_sigstore_trustroot = __commonJS((exports) => {
     }
   };
   exports.Service = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        url: isSet(object5.url) ? globalThis.String(object5.url) : "",
-        majorApiVersion: isSet(object5.majorApiVersion) ? globalThis.Number(object5.majorApiVersion) : 0,
-        validFor: isSet(object5.validFor) ? sigstore_common_1.TimeRange.fromJSON(object5.validFor) : undefined,
-        operator: isSet(object5.operator) ? globalThis.String(object5.operator) : ""
+        url: isSet(object7.url) ? globalThis.String(object7.url) : "",
+        majorApiVersion: isSet(object7.majorApiVersion) ? globalThis.Number(object7.majorApiVersion) : 0,
+        validFor: isSet(object7.validFor) ? sigstore_common_1.TimeRange.fromJSON(object7.validFor) : undefined,
+        operator: isSet(object7.operator) ? globalThis.String(object7.operator) : ""
       };
     },
     toJSON(message) {
@@ -59344,10 +60324,10 @@ var require_sigstore_trustroot = __commonJS((exports) => {
     }
   };
   exports.ServiceConfiguration = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        selector: isSet(object5.selector) ? serviceSelectorFromJSON(object5.selector) : 0,
-        count: isSet(object5.count) ? globalThis.Number(object5.count) : 0
+        selector: isSet(object7.selector) ? serviceSelectorFromJSON(object7.selector) : 0,
+        count: isSet(object7.count) ? globalThis.Number(object7.count) : 0
       };
     },
     toJSON(message) {
@@ -59362,11 +60342,11 @@ var require_sigstore_trustroot = __commonJS((exports) => {
     }
   };
   exports.ClientTrustConfig = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        mediaType: isSet(object5.mediaType) ? globalThis.String(object5.mediaType) : "",
-        trustedRoot: isSet(object5.trustedRoot) ? exports.TrustedRoot.fromJSON(object5.trustedRoot) : undefined,
-        signingConfig: isSet(object5.signingConfig) ? exports.SigningConfig.fromJSON(object5.signingConfig) : undefined
+        mediaType: isSet(object7.mediaType) ? globalThis.String(object7.mediaType) : "",
+        trustedRoot: isSet(object7.trustedRoot) ? exports.TrustedRoot.fromJSON(object7.trustedRoot) : undefined,
+        signingConfig: isSet(object7.signingConfig) ? exports.SigningConfig.fromJSON(object7.signingConfig) : undefined
       };
     },
     toJSON(message) {
@@ -59396,11 +60376,11 @@ var require_sigstore_verification = __commonJS((exports) => {
   var sigstore_common_1 = require_sigstore_common();
   var sigstore_trustroot_1 = require_sigstore_trustroot();
   exports.CertificateIdentity = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        issuer: isSet(object5.issuer) ? globalThis.String(object5.issuer) : "",
-        san: isSet(object5.san) ? sigstore_common_1.SubjectAlternativeName.fromJSON(object5.san) : undefined,
-        oids: globalThis.Array.isArray(object5?.oids) ? object5.oids.map((e) => sigstore_common_1.ObjectIdentifierValuePair.fromJSON(e)) : []
+        issuer: isSet(object7.issuer) ? globalThis.String(object7.issuer) : "",
+        san: isSet(object7.san) ? sigstore_common_1.SubjectAlternativeName.fromJSON(object7.san) : undefined,
+        oids: globalThis.Array.isArray(object7?.oids) ? object7.oids.map((e) => sigstore_common_1.ObjectIdentifierValuePair.fromJSON(e)) : []
       };
     },
     toJSON(message) {
@@ -59418,9 +60398,9 @@ var require_sigstore_verification = __commonJS((exports) => {
     }
   };
   exports.CertificateIdentities = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        identities: globalThis.Array.isArray(object5?.identities) ? object5.identities.map((e) => exports.CertificateIdentity.fromJSON(e)) : []
+        identities: globalThis.Array.isArray(object7?.identities) ? object7.identities.map((e) => exports.CertificateIdentity.fromJSON(e)) : []
       };
     },
     toJSON(message) {
@@ -59432,9 +60412,9 @@ var require_sigstore_verification = __commonJS((exports) => {
     }
   };
   exports.PublicKeyIdentities = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        publicKeys: globalThis.Array.isArray(object5?.publicKeys) ? object5.publicKeys.map((e) => sigstore_common_1.PublicKey.fromJSON(e)) : []
+        publicKeys: globalThis.Array.isArray(object7?.publicKeys) ? object7.publicKeys.map((e) => sigstore_common_1.PublicKey.fromJSON(e)) : []
       };
     },
     toJSON(message) {
@@ -59446,17 +60426,17 @@ var require_sigstore_verification = __commonJS((exports) => {
     }
   };
   exports.ArtifactVerificationOptions = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        signers: isSet(object5.certificateIdentities) ? {
+        signers: isSet(object7.certificateIdentities) ? {
           $case: "certificateIdentities",
-          certificateIdentities: exports.CertificateIdentities.fromJSON(object5.certificateIdentities)
-        } : isSet(object5.publicKeys) ? { $case: "publicKeys", publicKeys: exports.PublicKeyIdentities.fromJSON(object5.publicKeys) } : undefined,
-        tlogOptions: isSet(object5.tlogOptions) ? exports.ArtifactVerificationOptions_TlogOptions.fromJSON(object5.tlogOptions) : undefined,
-        ctlogOptions: isSet(object5.ctlogOptions) ? exports.ArtifactVerificationOptions_CtlogOptions.fromJSON(object5.ctlogOptions) : undefined,
-        tsaOptions: isSet(object5.tsaOptions) ? exports.ArtifactVerificationOptions_TimestampAuthorityOptions.fromJSON(object5.tsaOptions) : undefined,
-        integratedTsOptions: isSet(object5.integratedTsOptions) ? exports.ArtifactVerificationOptions_TlogIntegratedTimestampOptions.fromJSON(object5.integratedTsOptions) : undefined,
-        observerOptions: isSet(object5.observerOptions) ? exports.ArtifactVerificationOptions_ObserverTimestampOptions.fromJSON(object5.observerOptions) : undefined
+          certificateIdentities: exports.CertificateIdentities.fromJSON(object7.certificateIdentities)
+        } : isSet(object7.publicKeys) ? { $case: "publicKeys", publicKeys: exports.PublicKeyIdentities.fromJSON(object7.publicKeys) } : undefined,
+        tlogOptions: isSet(object7.tlogOptions) ? exports.ArtifactVerificationOptions_TlogOptions.fromJSON(object7.tlogOptions) : undefined,
+        ctlogOptions: isSet(object7.ctlogOptions) ? exports.ArtifactVerificationOptions_CtlogOptions.fromJSON(object7.ctlogOptions) : undefined,
+        tsaOptions: isSet(object7.tsaOptions) ? exports.ArtifactVerificationOptions_TimestampAuthorityOptions.fromJSON(object7.tsaOptions) : undefined,
+        integratedTsOptions: isSet(object7.integratedTsOptions) ? exports.ArtifactVerificationOptions_TlogIntegratedTimestampOptions.fromJSON(object7.integratedTsOptions) : undefined,
+        observerOptions: isSet(object7.observerOptions) ? exports.ArtifactVerificationOptions_ObserverTimestampOptions.fromJSON(object7.observerOptions) : undefined
       };
     },
     toJSON(message) {
@@ -59485,11 +60465,11 @@ var require_sigstore_verification = __commonJS((exports) => {
     }
   };
   exports.ArtifactVerificationOptions_TlogOptions = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        threshold: isSet(object5.threshold) ? globalThis.Number(object5.threshold) : 0,
-        performOnlineVerification: isSet(object5.performOnlineVerification) ? globalThis.Boolean(object5.performOnlineVerification) : false,
-        disable: isSet(object5.disable) ? globalThis.Boolean(object5.disable) : false
+        threshold: isSet(object7.threshold) ? globalThis.Number(object7.threshold) : 0,
+        performOnlineVerification: isSet(object7.performOnlineVerification) ? globalThis.Boolean(object7.performOnlineVerification) : false,
+        disable: isSet(object7.disable) ? globalThis.Boolean(object7.disable) : false
       };
     },
     toJSON(message) {
@@ -59507,10 +60487,10 @@ var require_sigstore_verification = __commonJS((exports) => {
     }
   };
   exports.ArtifactVerificationOptions_CtlogOptions = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        threshold: isSet(object5.threshold) ? globalThis.Number(object5.threshold) : 0,
-        disable: isSet(object5.disable) ? globalThis.Boolean(object5.disable) : false
+        threshold: isSet(object7.threshold) ? globalThis.Number(object7.threshold) : 0,
+        disable: isSet(object7.disable) ? globalThis.Boolean(object7.disable) : false
       };
     },
     toJSON(message) {
@@ -59525,10 +60505,10 @@ var require_sigstore_verification = __commonJS((exports) => {
     }
   };
   exports.ArtifactVerificationOptions_TimestampAuthorityOptions = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        threshold: isSet(object5.threshold) ? globalThis.Number(object5.threshold) : 0,
-        disable: isSet(object5.disable) ? globalThis.Boolean(object5.disable) : false
+        threshold: isSet(object7.threshold) ? globalThis.Number(object7.threshold) : 0,
+        disable: isSet(object7.disable) ? globalThis.Boolean(object7.disable) : false
       };
     },
     toJSON(message) {
@@ -59543,10 +60523,10 @@ var require_sigstore_verification = __commonJS((exports) => {
     }
   };
   exports.ArtifactVerificationOptions_TlogIntegratedTimestampOptions = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        threshold: isSet(object5.threshold) ? globalThis.Number(object5.threshold) : 0,
-        disable: isSet(object5.disable) ? globalThis.Boolean(object5.disable) : false
+        threshold: isSet(object7.threshold) ? globalThis.Number(object7.threshold) : 0,
+        disable: isSet(object7.disable) ? globalThis.Boolean(object7.disable) : false
       };
     },
     toJSON(message) {
@@ -59561,10 +60541,10 @@ var require_sigstore_verification = __commonJS((exports) => {
     }
   };
   exports.ArtifactVerificationOptions_ObserverTimestampOptions = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        threshold: isSet(object5.threshold) ? globalThis.Number(object5.threshold) : 0,
-        disable: isSet(object5.disable) ? globalThis.Boolean(object5.disable) : false
+        threshold: isSet(object7.threshold) ? globalThis.Number(object7.threshold) : 0,
+        disable: isSet(object7.disable) ? globalThis.Boolean(object7.disable) : false
       };
     },
     toJSON(message) {
@@ -59579,9 +60559,9 @@ var require_sigstore_verification = __commonJS((exports) => {
     }
   };
   exports.Artifact = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        data: isSet(object5.artifactUri) ? { $case: "artifactUri", artifactUri: globalThis.String(object5.artifactUri) } : isSet(object5.artifact) ? { $case: "artifact", artifact: Buffer.from(bytesFromBase64(object5.artifact)) } : isSet(object5.artifactDigest) ? { $case: "artifactDigest", artifactDigest: sigstore_common_1.HashOutput.fromJSON(object5.artifactDigest) } : undefined
+        data: isSet(object7.artifactUri) ? { $case: "artifactUri", artifactUri: globalThis.String(object7.artifactUri) } : isSet(object7.artifact) ? { $case: "artifact", artifact: Buffer.from(bytesFromBase64(object7.artifact)) } : isSet(object7.artifactDigest) ? { $case: "artifactDigest", artifactDigest: sigstore_common_1.HashOutput.fromJSON(object7.artifactDigest) } : undefined
       };
     },
     toJSON(message) {
@@ -59597,12 +60577,12 @@ var require_sigstore_verification = __commonJS((exports) => {
     }
   };
   exports.Input = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        artifactTrustRoot: isSet(object5.artifactTrustRoot) ? sigstore_trustroot_1.TrustedRoot.fromJSON(object5.artifactTrustRoot) : undefined,
-        artifactVerificationOptions: isSet(object5.artifactVerificationOptions) ? exports.ArtifactVerificationOptions.fromJSON(object5.artifactVerificationOptions) : undefined,
-        bundle: isSet(object5.bundle) ? sigstore_bundle_1.Bundle.fromJSON(object5.bundle) : undefined,
-        artifact: isSet(object5.artifact) ? exports.Artifact.fromJSON(object5.artifact) : undefined
+        artifactTrustRoot: isSet(object7.artifactTrustRoot) ? sigstore_trustroot_1.TrustedRoot.fromJSON(object7.artifactTrustRoot) : undefined,
+        artifactVerificationOptions: isSet(object7.artifactVerificationOptions) ? exports.ArtifactVerificationOptions.fromJSON(object7.artifactVerificationOptions) : undefined,
+        bundle: isSet(object7.bundle) ? sigstore_bundle_1.Bundle.fromJSON(object7.bundle) : undefined,
+        artifact: isSet(object7.artifact) ? exports.Artifact.fromJSON(object7.artifact) : undefined
       };
     },
     toJSON(message) {
@@ -60595,14 +61575,14 @@ var require_encoding = __commonJS((exports) => {
 var require_json = __commonJS((exports) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   exports.canonicalize = canonicalize;
-  function canonicalize(object5) {
+  function canonicalize(object7) {
     let buffer = "";
-    if (object5 === null || typeof object5 !== "object" || object5.toJSON != null) {
-      buffer += JSON.stringify(object5);
-    } else if (Array.isArray(object5)) {
+    if (object7 === null || typeof object7 !== "object" || object7.toJSON != null) {
+      buffer += JSON.stringify(object7);
+    } else if (Array.isArray(object7)) {
       buffer += "[";
       let first = true;
-      object5.forEach((element) => {
+      object7.forEach((element) => {
         if (!first) {
           buffer += ",";
         }
@@ -60613,14 +61593,14 @@ var require_json = __commonJS((exports) => {
     } else {
       buffer += "{";
       let first = true;
-      Object.keys(object5).sort().forEach((property) => {
+      Object.keys(object7).sort().forEach((property) => {
         if (!first) {
           buffer += ",";
         }
         first = false;
         buffer += JSON.stringify(property);
         buffer += ":";
-        buffer += canonicalize(object5[property]);
+        buffer += canonicalize(object7[property]);
       });
       buffer += "}";
     }
@@ -62184,8 +63164,8 @@ var require_verifier = __commonJS((exports) => {
   exports.Signature = exports.Verifier = exports.PublicKey = undefined;
   var sigstore_common_1 = require_sigstore_common();
   exports.PublicKey = {
-    fromJSON(object5) {
-      return { rawBytes: isSet(object5.rawBytes) ? Buffer.from(bytesFromBase64(object5.rawBytes)) : Buffer.alloc(0) };
+    fromJSON(object7) {
+      return { rawBytes: isSet(object7.rawBytes) ? Buffer.from(bytesFromBase64(object7.rawBytes)) : Buffer.alloc(0) };
     },
     toJSON(message) {
       const obj = {};
@@ -62196,10 +63176,10 @@ var require_verifier = __commonJS((exports) => {
     }
   };
   exports.Verifier = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        verifier: isSet(object5.publicKey) ? { $case: "publicKey", publicKey: exports.PublicKey.fromJSON(object5.publicKey) } : isSet(object5.x509Certificate) ? { $case: "x509Certificate", x509Certificate: sigstore_common_1.X509Certificate.fromJSON(object5.x509Certificate) } : undefined,
-        keyDetails: isSet(object5.keyDetails) ? (0, sigstore_common_1.publicKeyDetailsFromJSON)(object5.keyDetails) : 0
+        verifier: isSet(object7.publicKey) ? { $case: "publicKey", publicKey: exports.PublicKey.fromJSON(object7.publicKey) } : isSet(object7.x509Certificate) ? { $case: "x509Certificate", x509Certificate: sigstore_common_1.X509Certificate.fromJSON(object7.x509Certificate) } : undefined,
+        keyDetails: isSet(object7.keyDetails) ? (0, sigstore_common_1.publicKeyDetailsFromJSON)(object7.keyDetails) : 0
       };
     },
     toJSON(message) {
@@ -62216,10 +63196,10 @@ var require_verifier = __commonJS((exports) => {
     }
   };
   exports.Signature = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        content: isSet(object5.content) ? Buffer.from(bytesFromBase64(object5.content)) : Buffer.alloc(0),
-        verifier: isSet(object5.verifier) ? exports.Verifier.fromJSON(object5.verifier) : undefined
+        content: isSet(object7.content) ? Buffer.from(bytesFromBase64(object7.content)) : Buffer.alloc(0),
+        verifier: isSet(object7.verifier) ? exports.Verifier.fromJSON(object7.verifier) : undefined
       };
     },
     toJSON(message) {
@@ -62252,10 +63232,10 @@ var require_dsse3 = __commonJS((exports) => {
   var sigstore_common_1 = require_sigstore_common();
   var verifier_1 = require_verifier();
   exports.DSSERequestV002 = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        envelope: isSet(object5.envelope) ? envelope_1.Envelope.fromJSON(object5.envelope) : undefined,
-        verifiers: globalThis.Array.isArray(object5?.verifiers) ? object5.verifiers.map((e) => verifier_1.Verifier.fromJSON(e)) : []
+        envelope: isSet(object7.envelope) ? envelope_1.Envelope.fromJSON(object7.envelope) : undefined,
+        verifiers: globalThis.Array.isArray(object7?.verifiers) ? object7.verifiers.map((e) => verifier_1.Verifier.fromJSON(e)) : []
       };
     },
     toJSON(message) {
@@ -62270,10 +63250,10 @@ var require_dsse3 = __commonJS((exports) => {
     }
   };
   exports.DSSELogEntryV002 = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        payloadHash: isSet(object5.payloadHash) ? sigstore_common_1.HashOutput.fromJSON(object5.payloadHash) : undefined,
-        signatures: globalThis.Array.isArray(object5?.signatures) ? object5.signatures.map((e) => verifier_1.Signature.fromJSON(e)) : []
+        payloadHash: isSet(object7.payloadHash) ? sigstore_common_1.HashOutput.fromJSON(object7.payloadHash) : undefined,
+        signatures: globalThis.Array.isArray(object7?.signatures) ? object7.signatures.map((e) => verifier_1.Signature.fromJSON(e)) : []
       };
     },
     toJSON(message) {
@@ -62299,10 +63279,10 @@ var require_hashedrekord = __commonJS((exports) => {
   var sigstore_common_1 = require_sigstore_common();
   var verifier_1 = require_verifier();
   exports.HashedRekordRequestV002 = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        digest: isSet(object5.digest) ? Buffer.from(bytesFromBase64(object5.digest)) : Buffer.alloc(0),
-        signature: isSet(object5.signature) ? verifier_1.Signature.fromJSON(object5.signature) : undefined
+        digest: isSet(object7.digest) ? Buffer.from(bytesFromBase64(object7.digest)) : Buffer.alloc(0),
+        signature: isSet(object7.signature) ? verifier_1.Signature.fromJSON(object7.signature) : undefined
       };
     },
     toJSON(message) {
@@ -62317,10 +63297,10 @@ var require_hashedrekord = __commonJS((exports) => {
     }
   };
   exports.HashedRekordLogEntryV002 = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        data: isSet(object5.data) ? sigstore_common_1.HashOutput.fromJSON(object5.data) : undefined,
-        signature: isSet(object5.signature) ? verifier_1.Signature.fromJSON(object5.signature) : undefined
+        data: isSet(object7.data) ? sigstore_common_1.HashOutput.fromJSON(object7.data) : undefined,
+        signature: isSet(object7.signature) ? verifier_1.Signature.fromJSON(object7.signature) : undefined
       };
     },
     toJSON(message) {
@@ -62352,11 +63332,11 @@ var require_entry = __commonJS((exports) => {
   var dsse_1 = require_dsse3();
   var hashedrekord_1 = require_hashedrekord();
   exports.Entry = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        kind: isSet(object5.kind) ? globalThis.String(object5.kind) : "",
-        apiVersion: isSet(object5.apiVersion) ? globalThis.String(object5.apiVersion) : "",
-        spec: isSet(object5.spec) ? exports.Spec.fromJSON(object5.spec) : undefined
+        kind: isSet(object7.kind) ? globalThis.String(object7.kind) : "",
+        apiVersion: isSet(object7.apiVersion) ? globalThis.String(object7.apiVersion) : "",
+        spec: isSet(object7.spec) ? exports.Spec.fromJSON(object7.spec) : undefined
       };
     },
     toJSON(message) {
@@ -62374,9 +63354,9 @@ var require_entry = __commonJS((exports) => {
     }
   };
   exports.Spec = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        spec: isSet(object5.hashedRekordV002) ? { $case: "hashedRekordV002", hashedRekordV002: hashedrekord_1.HashedRekordLogEntryV002.fromJSON(object5.hashedRekordV002) } : isSet(object5.dsseV002) ? { $case: "dsseV002", dsseV002: dsse_1.DSSELogEntryV002.fromJSON(object5.dsseV002) } : undefined
+        spec: isSet(object7.hashedRekordV002) ? { $case: "hashedRekordV002", hashedRekordV002: hashedrekord_1.HashedRekordLogEntryV002.fromJSON(object7.hashedRekordV002) } : isSet(object7.dsseV002) ? { $case: "dsseV002", dsseV002: dsse_1.DSSELogEntryV002.fromJSON(object7.dsseV002) } : undefined
       };
     },
     toJSON(message) {
@@ -62390,12 +63370,12 @@ var require_entry = __commonJS((exports) => {
     }
   };
   exports.CreateEntryRequest = {
-    fromJSON(object5) {
+    fromJSON(object7) {
       return {
-        spec: isSet(object5.hashedRekordRequestV002) ? {
+        spec: isSet(object7.hashedRekordRequestV002) ? {
           $case: "hashedRekordRequestV002",
-          hashedRekordRequestV002: hashedrekord_1.HashedRekordRequestV002.fromJSON(object5.hashedRekordRequestV002)
-        } : isSet(object5.dsseRequestV002) ? { $case: "dsseRequestV002", dsseRequestV002: dsse_1.DSSERequestV002.fromJSON(object5.dsseRequestV002) } : undefined
+          hashedRekordRequestV002: hashedrekord_1.HashedRekordRequestV002.fromJSON(object7.hashedRekordRequestV002)
+        } : isSet(object7.dsseRequestV002) ? { $case: "dsseRequestV002", dsseRequestV002: dsse_1.DSSERequestV002.fromJSON(object7.dsseRequestV002) } : undefined
       };
     },
     toJSON(message) {
@@ -63185,10 +64165,10 @@ var init_util2 = __esm(() => {
         return obj[e];
       });
     };
-    util4.objectKeys = typeof Object.keys === "function" ? (obj) => Object.keys(obj) : (object5) => {
+    util4.objectKeys = typeof Object.keys === "function" ? (obj) => Object.keys(obj) : (object7) => {
       const keys = [];
-      for (const key in object5) {
-        if (Object.prototype.hasOwnProperty.call(object5, key)) {
+      for (const key in object7) {
+        if (Object.prototype.hasOwnProperty.call(object7, key)) {
           keys.push(key);
         }
       }
@@ -63762,7 +64742,7 @@ class ZodType2 {
     const result2 = await (isAsync2(maybeAsyncResult) ? maybeAsyncResult : Promise.resolve(maybeAsyncResult));
     return handleResult2(ctx, result2);
   }
-  refine(check, message) {
+  refine(check2, message) {
     const getIssueProperties = (val) => {
       if (typeof message === "string" || typeof message === "undefined") {
         return { message };
@@ -63773,7 +64753,7 @@ class ZodType2 {
       }
     };
     return this._refinement((val, ctx) => {
-      const result2 = check(val);
+      const result2 = check2(val);
       const setError = () => ctx.addIssue({
         code: ZodIssueCode2.custom,
         ...getIssueProperties(val)
@@ -63796,9 +64776,9 @@ class ZodType2 {
       }
     });
   }
-  refinement(check, refinementData) {
+  refinement(check2, refinementData) {
     return this._refinement((val, ctx) => {
-      if (!check(val)) {
+      if (!check2(val)) {
         ctx.addIssue(typeof refinementData === "function" ? refinementData(val, ctx) : refinementData);
         return false;
       } else {
@@ -64151,70 +65131,70 @@ var init_types3 = __esm(() => {
       }
       const status = new ParseStatus2;
       let ctx = undefined;
-      for (const check of this._def.checks) {
-        if (check.kind === "min") {
-          if (input.data.length < check.value) {
+      for (const check2 of this._def.checks) {
+        if (check2.kind === "min") {
+          if (input.data.length < check2.value) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.too_small,
-              minimum: check.value,
+              minimum: check2.value,
               type: "string",
               inclusive: true,
               exact: false,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "max") {
-          if (input.data.length > check.value) {
+        } else if (check2.kind === "max") {
+          if (input.data.length > check2.value) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.too_big,
-              maximum: check.value,
+              maximum: check2.value,
               type: "string",
               inclusive: true,
               exact: false,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "length") {
-          const tooBig = input.data.length > check.value;
-          const tooSmall = input.data.length < check.value;
+        } else if (check2.kind === "length") {
+          const tooBig = input.data.length > check2.value;
+          const tooSmall = input.data.length < check2.value;
           if (tooBig || tooSmall) {
             ctx = this._getOrReturnCtx(input, ctx);
             if (tooBig) {
               addIssueToContext2(ctx, {
                 code: ZodIssueCode2.too_big,
-                maximum: check.value,
+                maximum: check2.value,
                 type: "string",
                 inclusive: true,
                 exact: true,
-                message: check.message
+                message: check2.message
               });
             } else if (tooSmall) {
               addIssueToContext2(ctx, {
                 code: ZodIssueCode2.too_small,
-                minimum: check.value,
+                minimum: check2.value,
                 type: "string",
                 inclusive: true,
                 exact: true,
-                message: check.message
+                message: check2.message
               });
             }
             status.dirty();
           }
-        } else if (check.kind === "email") {
+        } else if (check2.kind === "email") {
           if (!emailRegex2.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "email",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "emoji") {
+        } else if (check2.kind === "emoji") {
           if (!emojiRegex3) {
             emojiRegex3 = new RegExp(_emojiRegex2, "u");
           }
@@ -64223,61 +65203,61 @@ var init_types3 = __esm(() => {
             addIssueToContext2(ctx, {
               validation: "emoji",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "uuid") {
+        } else if (check2.kind === "uuid") {
           if (!uuidRegex2.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "uuid",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "nanoid") {
+        } else if (check2.kind === "nanoid") {
           if (!nanoidRegex2.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "nanoid",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "cuid") {
+        } else if (check2.kind === "cuid") {
           if (!cuidRegex2.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "cuid",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "cuid2") {
+        } else if (check2.kind === "cuid2") {
           if (!cuid2Regex2.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "cuid2",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "ulid") {
+        } else if (check2.kind === "ulid") {
           if (!ulidRegex2.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "ulid",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "url") {
+        } else if (check2.kind === "url") {
           try {
             new URL(input.data);
           } catch {
@@ -64285,153 +65265,153 @@ var init_types3 = __esm(() => {
             addIssueToContext2(ctx, {
               validation: "url",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "regex") {
-          check.regex.lastIndex = 0;
-          const testResult = check.regex.test(input.data);
+        } else if (check2.kind === "regex") {
+          check2.regex.lastIndex = 0;
+          const testResult = check2.regex.test(input.data);
           if (!testResult) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "regex",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "trim") {
+        } else if (check2.kind === "trim") {
           input.data = input.data.trim();
-        } else if (check.kind === "includes") {
-          if (!input.data.includes(check.value, check.position)) {
+        } else if (check2.kind === "includes") {
+          if (!input.data.includes(check2.value, check2.position)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.invalid_string,
-              validation: { includes: check.value, position: check.position },
-              message: check.message
+              validation: { includes: check2.value, position: check2.position },
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "toLowerCase") {
+        } else if (check2.kind === "toLowerCase") {
           input.data = input.data.toLowerCase();
-        } else if (check.kind === "toUpperCase") {
+        } else if (check2.kind === "toUpperCase") {
           input.data = input.data.toUpperCase();
-        } else if (check.kind === "startsWith") {
-          if (!input.data.startsWith(check.value)) {
+        } else if (check2.kind === "startsWith") {
+          if (!input.data.startsWith(check2.value)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.invalid_string,
-              validation: { startsWith: check.value },
-              message: check.message
+              validation: { startsWith: check2.value },
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "endsWith") {
-          if (!input.data.endsWith(check.value)) {
+        } else if (check2.kind === "endsWith") {
+          if (!input.data.endsWith(check2.value)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.invalid_string,
-              validation: { endsWith: check.value },
-              message: check.message
+              validation: { endsWith: check2.value },
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "datetime") {
-          const regex = datetimeRegex2(check);
+        } else if (check2.kind === "datetime") {
+          const regex = datetimeRegex2(check2);
           if (!regex.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.invalid_string,
               validation: "datetime",
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "date") {
+        } else if (check2.kind === "date") {
           const regex = dateRegex2;
           if (!regex.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.invalid_string,
               validation: "date",
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "time") {
-          const regex = timeRegex2(check);
+        } else if (check2.kind === "time") {
+          const regex = timeRegex2(check2);
           if (!regex.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.invalid_string,
               validation: "time",
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "duration") {
+        } else if (check2.kind === "duration") {
           if (!durationRegex2.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "duration",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "ip") {
-          if (!isValidIP2(input.data, check.version)) {
+        } else if (check2.kind === "ip") {
+          if (!isValidIP2(input.data, check2.version)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "ip",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "jwt") {
-          if (!isValidJWT2(input.data, check.alg)) {
+        } else if (check2.kind === "jwt") {
+          if (!isValidJWT2(input.data, check2.alg)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "jwt",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "cidr") {
-          if (!isValidCidr2(input.data, check.version)) {
+        } else if (check2.kind === "cidr") {
+          if (!isValidCidr2(input.data, check2.version)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "cidr",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "base64") {
+        } else if (check2.kind === "base64") {
           if (!base64Regex2.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "base64",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "base64url") {
+        } else if (check2.kind === "base64url") {
           if (!base64urlRegex2.test(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               validation: "base64url",
               code: ZodIssueCode2.invalid_string,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
         } else {
-          util3.assertNever(check);
+          util3.assertNever(check2);
         }
       }
       return { status: status.value, value: input.data };
@@ -64443,10 +65423,10 @@ var init_types3 = __esm(() => {
         ...errorUtil2.errToObj(message)
       });
     }
-    _addCheck(check) {
+    _addCheck(check2) {
       return new ZodString2({
         ...this._def,
-        checks: [...this._def.checks, check]
+        checks: [...this._def.checks, check2]
       });
     }
     email(message) {
@@ -64700,67 +65680,67 @@ var init_types3 = __esm(() => {
       }
       let ctx = undefined;
       const status = new ParseStatus2;
-      for (const check of this._def.checks) {
-        if (check.kind === "int") {
+      for (const check2 of this._def.checks) {
+        if (check2.kind === "int") {
           if (!util3.isInteger(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.invalid_type,
               expected: "integer",
               received: "float",
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "min") {
-          const tooSmall = check.inclusive ? input.data < check.value : input.data <= check.value;
+        } else if (check2.kind === "min") {
+          const tooSmall = check2.inclusive ? input.data < check2.value : input.data <= check2.value;
           if (tooSmall) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.too_small,
-              minimum: check.value,
+              minimum: check2.value,
               type: "number",
-              inclusive: check.inclusive,
+              inclusive: check2.inclusive,
               exact: false,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "max") {
-          const tooBig = check.inclusive ? input.data > check.value : input.data >= check.value;
+        } else if (check2.kind === "max") {
+          const tooBig = check2.inclusive ? input.data > check2.value : input.data >= check2.value;
           if (tooBig) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.too_big,
-              maximum: check.value,
+              maximum: check2.value,
               type: "number",
-              inclusive: check.inclusive,
+              inclusive: check2.inclusive,
               exact: false,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "multipleOf") {
-          if (floatSafeRemainder2(input.data, check.value) !== 0) {
+        } else if (check2.kind === "multipleOf") {
+          if (floatSafeRemainder2(input.data, check2.value) !== 0) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.not_multiple_of,
-              multipleOf: check.value,
-              message: check.message
+              multipleOf: check2.value,
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "finite") {
+        } else if (check2.kind === "finite") {
           if (!Number.isFinite(input.data)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.not_finite,
-              message: check.message
+              message: check2.message
             });
             status.dirty();
           }
         } else {
-          util3.assertNever(check);
+          util3.assertNever(check2);
         }
       }
       return { status: status.value, value: input.data };
@@ -64791,10 +65771,10 @@ var init_types3 = __esm(() => {
         ]
       });
     }
-    _addCheck(check) {
+    _addCheck(check2) {
       return new ZodNumber2({
         ...this._def,
-        checks: [...this._def.checks, check]
+        checks: [...this._def.checks, check2]
       });
     }
     int(message) {
@@ -64929,45 +65909,45 @@ var init_types3 = __esm(() => {
       }
       let ctx = undefined;
       const status = new ParseStatus2;
-      for (const check of this._def.checks) {
-        if (check.kind === "min") {
-          const tooSmall = check.inclusive ? input.data < check.value : input.data <= check.value;
+      for (const check2 of this._def.checks) {
+        if (check2.kind === "min") {
+          const tooSmall = check2.inclusive ? input.data < check2.value : input.data <= check2.value;
           if (tooSmall) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.too_small,
               type: "bigint",
-              minimum: check.value,
-              inclusive: check.inclusive,
-              message: check.message
+              minimum: check2.value,
+              inclusive: check2.inclusive,
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "max") {
-          const tooBig = check.inclusive ? input.data > check.value : input.data >= check.value;
+        } else if (check2.kind === "max") {
+          const tooBig = check2.inclusive ? input.data > check2.value : input.data >= check2.value;
           if (tooBig) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.too_big,
               type: "bigint",
-              maximum: check.value,
-              inclusive: check.inclusive,
-              message: check.message
+              maximum: check2.value,
+              inclusive: check2.inclusive,
+              message: check2.message
             });
             status.dirty();
           }
-        } else if (check.kind === "multipleOf") {
-          if (input.data % check.value !== BigInt(0)) {
+        } else if (check2.kind === "multipleOf") {
+          if (input.data % check2.value !== BigInt(0)) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.not_multiple_of,
-              multipleOf: check.value,
-              message: check.message
+              multipleOf: check2.value,
+              message: check2.message
             });
             status.dirty();
           }
         } else {
-          util3.assertNever(check);
+          util3.assertNever(check2);
         }
       }
       return { status: status.value, value: input.data };
@@ -65007,10 +65987,10 @@ var init_types3 = __esm(() => {
         ]
       });
     }
-    _addCheck(check) {
+    _addCheck(check2) {
       return new ZodBigInt2({
         ...this._def,
-        checks: [...this._def.checks, check]
+        checks: [...this._def.checks, check2]
       });
     }
     positive(message) {
@@ -65130,35 +66110,35 @@ var init_types3 = __esm(() => {
       }
       const status = new ParseStatus2;
       let ctx = undefined;
-      for (const check of this._def.checks) {
-        if (check.kind === "min") {
-          if (input.data.getTime() < check.value) {
+      for (const check2 of this._def.checks) {
+        if (check2.kind === "min") {
+          if (input.data.getTime() < check2.value) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.too_small,
-              message: check.message,
+              message: check2.message,
               inclusive: true,
               exact: false,
-              minimum: check.value,
+              minimum: check2.value,
               type: "date"
             });
             status.dirty();
           }
-        } else if (check.kind === "max") {
-          if (input.data.getTime() > check.value) {
+        } else if (check2.kind === "max") {
+          if (input.data.getTime() > check2.value) {
             ctx = this._getOrReturnCtx(input, ctx);
             addIssueToContext2(ctx, {
               code: ZodIssueCode2.too_big,
-              message: check.message,
+              message: check2.message,
               inclusive: true,
               exact: false,
-              maximum: check.value,
+              maximum: check2.value,
               type: "date"
             });
             status.dirty();
           }
         } else {
-          util3.assertNever(check);
+          util3.assertNever(check2);
         }
       }
       return {
@@ -65166,10 +66146,10 @@ var init_types3 = __esm(() => {
         value: new Date(input.data.getTime())
       };
     }
-    _addCheck(check) {
+    _addCheck(check2) {
       return new ZodDate2({
         ...this._def,
-        checks: [...this._def.checks, check]
+        checks: [...this._def.checks, check2]
       });
     }
     min(minDate, message) {
@@ -67032,7 +68012,7 @@ __export(exports_util, {
   joinValues: () => joinValues,
   issue: () => issue,
   isPlainObject: () => isPlainObject2,
-  isObject: () => isObject9,
+  isObject: () => isObject11,
   hexToUint8Array: () => hexToUint8Array,
   getSizableOrigin: () => getSizableOrigin,
   getParsedType: () => getParsedType3,
@@ -67106,10 +68086,10 @@ function cached(getter) {
 function nullish(input) {
   return input === null || input === undefined;
 }
-function cleanRegex(source) {
-  const start = source.startsWith("^") ? 1 : 0;
-  const end = source.endsWith("$") ? source.length - 1 : source.length;
-  return source.slice(start, end);
+function cleanRegex(source2) {
+  const start = source2.startsWith("^") ? 1 : 0;
+  const end = source2.endsWith("$") ? source2.length - 1 : source2.length;
+  return source2.slice(start, end);
 }
 function floatSafeRemainder3(val, step) {
   const valDecCount = (val.toString().split(".")[1] || "").length;
@@ -67126,9 +68106,9 @@ function floatSafeRemainder3(val, step) {
   const stepInt = Number.parseInt(step.toFixed(decCount).replace(".", ""));
   return valInt % stepInt / 10 ** decCount;
 }
-function defineLazy(object5, key, getter) {
+function defineLazy(object7, key, getter) {
   let value = undefined;
-  Object.defineProperty(object5, key, {
+  Object.defineProperty(object7, key, {
     get() {
       if (value === EVALUATING) {
         return;
@@ -67140,7 +68120,7 @@ function defineLazy(object5, key, getter) {
       return value;
     },
     set(v) {
-      Object.defineProperty(object5, key, {
+      Object.defineProperty(object7, key, {
         value: v
       });
     },
@@ -67199,11 +68179,11 @@ function esc(str2) {
 function slugify(input) {
   return input.toLowerCase().trim().replace(/[^\w\s-]/g, "").replace(/[\s_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
-function isObject9(data) {
+function isObject11(data) {
   return typeof data === "object" && data !== null && !Array.isArray(data);
 }
 function isPlainObject2(o) {
-  if (isObject9(o) === false)
+  if (isObject11(o) === false)
     return false;
   const ctor = o.constructor;
   if (ctor === undefined)
@@ -67211,7 +68191,7 @@ function isPlainObject2(o) {
   if (typeof ctor !== "function")
     return true;
   const prot = ctor.prototype;
-  if (isObject9(prot) === false)
+  if (isObject11(prot) === false)
     return false;
   if (Object.prototype.hasOwnProperty.call(prot, "isPrototypeOf") === false) {
     return false;
@@ -69092,13 +70072,13 @@ var init_schemas = __esm(() => {
       }
       return propValues;
     });
-    const isObject10 = isObject9;
+    const isObject12 = isObject11;
     const catchall = def.catchall;
     let value;
     inst._zod.parse = (payload, ctx) => {
       value ?? (value = _normalized.value);
       const input = payload.value;
-      if (!isObject10(input)) {
+      if (!isObject12(input)) {
         payload.issues.push({
           expected: "object",
           code: "invalid_type",
@@ -69196,7 +70176,7 @@ var init_schemas = __esm(() => {
       return (payload, ctx) => fn(shape, payload, ctx);
     };
     let fastpass;
-    const isObject10 = isObject9;
+    const isObject12 = isObject11;
     const jit = !globalConfig.jitless;
     const allowsEval2 = allowsEval;
     const fastEnabled = jit && allowsEval2.value;
@@ -69205,7 +70185,7 @@ var init_schemas = __esm(() => {
     inst._zod.parse = (payload, ctx) => {
       value ?? (value = _normalized.value);
       const input = payload.value;
-      if (!isObject10(input)) {
+      if (!isObject12(input)) {
         payload.issues.push({
           expected: "object",
           code: "invalid_type",
@@ -69309,7 +70289,7 @@ var init_schemas = __esm(() => {
     });
     inst._zod.parse = (payload, ctx) => {
       const input = payload.value;
-      if (!isObject9(input)) {
+      if (!isObject11(input)) {
         payload.issues.push({
           code: "invalid_type",
           expected: "object",
@@ -71237,7 +72217,7 @@ var init_parse2 = __esm(() => {
 });
 
 // ../../node_modules/@modelcontextprotocol/sdk/node_modules/zod/v4/mini/schemas.js
-function object5(shape, params) {
+function object7(shape, params) {
   const def = {
     type: "object",
     shape: shape ?? {},
@@ -71319,11 +72299,11 @@ function isZ4Schema(s) {
 function objectFromShape(shape) {
   const values = Object.values(shape);
   if (values.length === 0)
-    return object5({});
+    return object7({});
   const allV4 = values.every(isZ4Schema);
   const allV3 = values.every((s) => !isZ4Schema(s));
   if (allV4)
-    return object5(shape);
+    return object7(shape);
   if (allV3)
     return objectType2(shape);
   throw new Error("Mixed Zod versions detected in object shape.");
@@ -71594,7 +72574,7 @@ function never2(params) {
 function array2(element, params) {
   return _array(ZodArray3, element, params);
 }
-function object6(shape, params) {
+function object8(shape, params) {
   const def = {
     type: "object",
     shape: shape ?? {},
@@ -71787,7 +72767,7 @@ var init_schemas3 = __esm(() => {
     inst.safeDecode = (data, params) => safeDecode2(inst, data, params);
     inst.safeEncodeAsync = async (data, params) => safeEncodeAsync2(inst, data, params);
     inst.safeDecodeAsync = async (data, params) => safeDecodeAsync2(inst, data, params);
-    inst.refine = (check, params) => inst.check(refine(check, params));
+    inst.refine = (check2, params) => inst.check(refine(check2, params));
     inst.superRefine = (refinement) => inst.check(superRefine(refinement));
     inst.overwrite = (fn) => inst.check(_overwrite(fn));
     inst.optional = () => optional2(inst);
@@ -72276,30 +73256,30 @@ var init_types4 = __esm(() => {
     ttl: union2([number3(), _null3()]).optional(),
     pollInterval: number3().optional()
   });
-  TaskMetadataSchema = object6({
+  TaskMetadataSchema = object8({
     ttl: number3().optional()
   });
-  RelatedTaskMetadataSchema = object6({
+  RelatedTaskMetadataSchema = object8({
     taskId: string3()
   });
   RequestMetaSchema2 = looseObject({
     progressToken: ProgressTokenSchema2.optional(),
     [RELATED_TASK_META_KEY]: RelatedTaskMetadataSchema.optional()
   });
-  BaseRequestParamsSchema2 = object6({
+  BaseRequestParamsSchema2 = object8({
     _meta: RequestMetaSchema2.optional()
   });
   TaskAugmentedRequestParamsSchema = BaseRequestParamsSchema2.extend({
     task: TaskMetadataSchema.optional()
   });
-  RequestSchema2 = object6({
+  RequestSchema2 = object8({
     method: string3(),
     params: BaseRequestParamsSchema2.loose().optional()
   });
-  NotificationsParamsSchema2 = object6({
+  NotificationsParamsSchema2 = object8({
     _meta: RequestMetaSchema2.optional()
   });
-  NotificationSchema2 = object6({
+  NotificationSchema2 = object8({
     method: string3(),
     params: NotificationsParamsSchema2.loose().optional()
   });
@@ -72307,16 +73287,16 @@ var init_types4 = __esm(() => {
     _meta: RequestMetaSchema2.optional()
   });
   RequestIdSchema2 = union2([string3(), number3().int()]);
-  JSONRPCRequestSchema2 = object6({
+  JSONRPCRequestSchema2 = object8({
     jsonrpc: literal2(JSONRPC_VERSION2),
     id: RequestIdSchema2,
     ...RequestSchema2.shape
   }).strict();
-  JSONRPCNotificationSchema2 = object6({
+  JSONRPCNotificationSchema2 = object8({
     jsonrpc: literal2(JSONRPC_VERSION2),
     ...NotificationSchema2.shape
   }).strict();
-  JSONRPCResultResponseSchema = object6({
+  JSONRPCResultResponseSchema = object8({
     jsonrpc: literal2(JSONRPC_VERSION2),
     id: RequestIdSchema2,
     result: ResultSchema2
@@ -72331,10 +73311,10 @@ var init_types4 = __esm(() => {
     ErrorCode3[ErrorCode3["InternalError"] = -32603] = "InternalError";
     ErrorCode3[ErrorCode3["UrlElicitationRequired"] = -32042] = "UrlElicitationRequired";
   })(ErrorCode2 || (ErrorCode2 = {}));
-  JSONRPCErrorResponseSchema = object6({
+  JSONRPCErrorResponseSchema = object8({
     jsonrpc: literal2(JSONRPC_VERSION2),
     id: RequestIdSchema2.optional(),
-    error: object6({
+    error: object8({
       code: number3().int(),
       message: string3(),
       data: unknown2().optional()
@@ -72356,16 +73336,16 @@ var init_types4 = __esm(() => {
     method: literal2("notifications/cancelled"),
     params: CancelledNotificationParamsSchema2
   });
-  IconSchema2 = object6({
+  IconSchema2 = object8({
     src: string3(),
     mimeType: string3().optional(),
     sizes: array2(string3()).optional(),
     theme: _enum(["light", "dark"]).optional()
   });
-  IconsSchema2 = object6({
+  IconsSchema2 = object8({
     icons: array2(IconSchema2).optional()
   });
-  BaseMetadataSchema2 = object6({
+  BaseMetadataSchema2 = object8({
     name: string3(),
     title: string3().optional()
   });
@@ -72376,7 +73356,7 @@ var init_types4 = __esm(() => {
     websiteUrl: string3().optional(),
     description: string3().optional()
   });
-  FormElicitationCapabilitySchema = intersection2(object6({
+  FormElicitationCapabilitySchema = intersection2(object8({
     applyDefaults: boolean3().optional()
   }), record6(string3(), unknown2()));
   ElicitationCapabilitySchema = preprocess((value) => {
@@ -72386,7 +73366,7 @@ var init_types4 = __esm(() => {
       }
     }
     return value;
-  }, intersection2(object6({
+  }, intersection2(object8({
     form: FormElicitationCapabilitySchema.optional(),
     url: AssertObjectSchema2.optional()
   }), record6(string3(), unknown2()).optional()));
@@ -72411,14 +73391,14 @@ var init_types4 = __esm(() => {
       }).optional()
     }).optional()
   });
-  ClientCapabilitiesSchema2 = object6({
+  ClientCapabilitiesSchema2 = object8({
     experimental: record6(string3(), AssertObjectSchema2).optional(),
-    sampling: object6({
+    sampling: object8({
       context: AssertObjectSchema2.optional(),
       tools: AssertObjectSchema2.optional()
     }).optional(),
     elicitation: ElicitationCapabilitySchema.optional(),
-    roots: object6({
+    roots: object8({
       listChanged: boolean3().optional()
     }).optional(),
     tasks: ClientTasksCapabilitySchema.optional()
@@ -72432,18 +73412,18 @@ var init_types4 = __esm(() => {
     method: literal2("initialize"),
     params: InitializeRequestParamsSchema2
   });
-  ServerCapabilitiesSchema2 = object6({
+  ServerCapabilitiesSchema2 = object8({
     experimental: record6(string3(), AssertObjectSchema2).optional(),
     logging: AssertObjectSchema2.optional(),
     completions: AssertObjectSchema2.optional(),
-    prompts: object6({
+    prompts: object8({
       listChanged: boolean3().optional()
     }).optional(),
-    resources: object6({
+    resources: object8({
       subscribe: boolean3().optional(),
       listChanged: boolean3().optional()
     }).optional(),
-    tools: object6({
+    tools: object8({
       listChanged: boolean3().optional()
     }).optional(),
     tasks: ServerTasksCapabilitySchema.optional()
@@ -72462,12 +73442,12 @@ var init_types4 = __esm(() => {
     method: literal2("ping"),
     params: BaseRequestParamsSchema2.optional()
   });
-  ProgressSchema2 = object6({
+  ProgressSchema2 = object8({
     progress: number3(),
     total: optional2(number3()),
     message: optional2(string3())
   });
-  ProgressNotificationParamsSchema2 = object6({
+  ProgressNotificationParamsSchema2 = object8({
     ...NotificationsParamsSchema2.shape,
     ...ProgressSchema2.shape,
     progressToken: ProgressTokenSchema2
@@ -72486,7 +73466,7 @@ var init_types4 = __esm(() => {
     nextCursor: CursorSchema2.optional()
   });
   TaskStatusSchema = _enum(["working", "input_required", "completed", "failed", "cancelled"]);
-  TaskSchema = object6({
+  TaskSchema = object8({
     taskId: string3(),
     status: TaskStatusSchema,
     ttl: union2([number3(), _null3()]),
@@ -72530,7 +73510,7 @@ var init_types4 = __esm(() => {
     })
   });
   CancelTaskResultSchema = ResultSchema2.merge(TaskSchema);
-  ResourceContentsSchema2 = object6({
+  ResourceContentsSchema2 = object8({
     uri: string3(),
     mimeType: optional2(string3()),
     _meta: record6(string3(), unknown2()).optional()
@@ -72550,12 +73530,12 @@ var init_types4 = __esm(() => {
     blob: Base64Schema2
   });
   RoleSchema = _enum(["user", "assistant"]);
-  AnnotationsSchema = object6({
+  AnnotationsSchema = object8({
     audience: array2(RoleSchema).optional(),
     priority: number3().min(0).max(1).optional(),
     lastModified: exports_iso2.datetime({ offset: true }).optional()
   });
-  ResourceSchema2 = object6({
+  ResourceSchema2 = object8({
     ...BaseMetadataSchema2.shape,
     ...IconsSchema2.shape,
     uri: string3(),
@@ -72564,7 +73544,7 @@ var init_types4 = __esm(() => {
     annotations: AnnotationsSchema.optional(),
     _meta: optional2(looseObject({}))
   });
-  ResourceTemplateSchema2 = object6({
+  ResourceTemplateSchema2 = object8({
     ...BaseMetadataSchema2.shape,
     ...IconsSchema2.shape,
     uriTemplate: string3(),
@@ -72617,12 +73597,12 @@ var init_types4 = __esm(() => {
     method: literal2("notifications/resources/updated"),
     params: ResourceUpdatedNotificationParamsSchema2
   });
-  PromptArgumentSchema2 = object6({
+  PromptArgumentSchema2 = object8({
     name: string3(),
     description: optional2(string3()),
     required: optional2(boolean3())
   });
-  PromptSchema2 = object6({
+  PromptSchema2 = object8({
     ...BaseMetadataSchema2.shape,
     ...IconsSchema2.shape,
     description: optional2(string3()),
@@ -72643,34 +73623,34 @@ var init_types4 = __esm(() => {
     method: literal2("prompts/get"),
     params: GetPromptRequestParamsSchema2
   });
-  TextContentSchema2 = object6({
+  TextContentSchema2 = object8({
     type: literal2("text"),
     text: string3(),
     annotations: AnnotationsSchema.optional(),
     _meta: record6(string3(), unknown2()).optional()
   });
-  ImageContentSchema2 = object6({
+  ImageContentSchema2 = object8({
     type: literal2("image"),
     data: Base64Schema2,
     mimeType: string3(),
     annotations: AnnotationsSchema.optional(),
     _meta: record6(string3(), unknown2()).optional()
   });
-  AudioContentSchema2 = object6({
+  AudioContentSchema2 = object8({
     type: literal2("audio"),
     data: Base64Schema2,
     mimeType: string3(),
     annotations: AnnotationsSchema.optional(),
     _meta: record6(string3(), unknown2()).optional()
   });
-  ToolUseContentSchema = object6({
+  ToolUseContentSchema = object8({
     type: literal2("tool_use"),
     name: string3(),
     id: string3(),
     input: record6(string3(), unknown2()),
     _meta: record6(string3(), unknown2()).optional()
   });
-  EmbeddedResourceSchema2 = object6({
+  EmbeddedResourceSchema2 = object8({
     type: literal2("resource"),
     resource: union2([TextResourceContentsSchema2, BlobResourceContentsSchema2]),
     annotations: AnnotationsSchema.optional(),
@@ -72686,7 +73666,7 @@ var init_types4 = __esm(() => {
     ResourceLinkSchema2,
     EmbeddedResourceSchema2
   ]);
-  PromptMessageSchema2 = object6({
+  PromptMessageSchema2 = object8({
     role: RoleSchema,
     content: ContentBlockSchema2
   });
@@ -72698,26 +73678,26 @@ var init_types4 = __esm(() => {
     method: literal2("notifications/prompts/list_changed"),
     params: NotificationsParamsSchema2.optional()
   });
-  ToolAnnotationsSchema2 = object6({
+  ToolAnnotationsSchema2 = object8({
     title: string3().optional(),
     readOnlyHint: boolean3().optional(),
     destructiveHint: boolean3().optional(),
     idempotentHint: boolean3().optional(),
     openWorldHint: boolean3().optional()
   });
-  ToolExecutionSchema = object6({
+  ToolExecutionSchema = object8({
     taskSupport: _enum(["required", "optional", "forbidden"]).optional()
   });
-  ToolSchema2 = object6({
+  ToolSchema2 = object8({
     ...BaseMetadataSchema2.shape,
     ...IconsSchema2.shape,
     description: string3().optional(),
-    inputSchema: object6({
+    inputSchema: object8({
       type: literal2("object"),
       properties: record6(string3(), AssertObjectSchema2).optional(),
       required: array2(string3()).optional()
     }).catchall(unknown2()),
-    outputSchema: object6({
+    outputSchema: object8({
       type: literal2("object"),
       properties: record6(string3(), AssertObjectSchema2).optional(),
       required: array2(string3()).optional()
@@ -72752,7 +73732,7 @@ var init_types4 = __esm(() => {
     method: literal2("notifications/tools/list_changed"),
     params: NotificationsParamsSchema2.optional()
   });
-  ListChangedOptionsBaseSchema = object6({
+  ListChangedOptionsBaseSchema = object8({
     autoRefresh: boolean3().default(true),
     debounceMs: number3().int().nonnegative().default(300)
   });
@@ -72773,23 +73753,23 @@ var init_types4 = __esm(() => {
     method: literal2("notifications/message"),
     params: LoggingMessageNotificationParamsSchema2
   });
-  ModelHintSchema2 = object6({
+  ModelHintSchema2 = object8({
     name: string3().optional()
   });
-  ModelPreferencesSchema2 = object6({
+  ModelPreferencesSchema2 = object8({
     hints: array2(ModelHintSchema2).optional(),
     costPriority: number3().min(0).max(1).optional(),
     speedPriority: number3().min(0).max(1).optional(),
     intelligencePriority: number3().min(0).max(1).optional()
   });
-  ToolChoiceSchema = object6({
+  ToolChoiceSchema = object8({
     mode: _enum(["auto", "required", "none"]).optional()
   });
-  ToolResultContentSchema = object6({
+  ToolResultContentSchema = object8({
     type: literal2("tool_result"),
     toolUseId: string3().describe("The unique identifier for the corresponding tool call."),
     content: array2(ContentBlockSchema2).default([]),
-    structuredContent: object6({}).loose().optional(),
+    structuredContent: object8({}).loose().optional(),
     isError: boolean3().optional(),
     _meta: record6(string3(), unknown2()).optional()
   });
@@ -72801,7 +73781,7 @@ var init_types4 = __esm(() => {
     ToolUseContentSchema,
     ToolResultContentSchema
   ]);
-  SamplingMessageSchema2 = object6({
+  SamplingMessageSchema2 = object8({
     role: RoleSchema,
     content: union2([SamplingMessageContentBlockSchema, array2(SamplingMessageContentBlockSchema)]),
     _meta: record6(string3(), unknown2()).optional()
@@ -72834,13 +73814,13 @@ var init_types4 = __esm(() => {
     role: RoleSchema,
     content: union2([SamplingMessageContentBlockSchema, array2(SamplingMessageContentBlockSchema)])
   });
-  BooleanSchemaSchema2 = object6({
+  BooleanSchemaSchema2 = object8({
     type: literal2("boolean"),
     title: string3().optional(),
     description: string3().optional(),
     default: boolean3().optional()
   });
-  StringSchemaSchema2 = object6({
+  StringSchemaSchema2 = object8({
     type: literal2("string"),
     title: string3().optional(),
     description: string3().optional(),
@@ -72849,7 +73829,7 @@ var init_types4 = __esm(() => {
     format: _enum(["email", "uri", "date", "date-time"]).optional(),
     default: string3().optional()
   });
-  NumberSchemaSchema2 = object6({
+  NumberSchemaSchema2 = object8({
     type: _enum(["number", "integer"]),
     title: string3().optional(),
     description: string3().optional(),
@@ -72857,24 +73837,24 @@ var init_types4 = __esm(() => {
     maximum: number3().optional(),
     default: number3().optional()
   });
-  UntitledSingleSelectEnumSchemaSchema2 = object6({
+  UntitledSingleSelectEnumSchemaSchema2 = object8({
     type: literal2("string"),
     title: string3().optional(),
     description: string3().optional(),
     enum: array2(string3()),
     default: string3().optional()
   });
-  TitledSingleSelectEnumSchemaSchema2 = object6({
+  TitledSingleSelectEnumSchemaSchema2 = object8({
     type: literal2("string"),
     title: string3().optional(),
     description: string3().optional(),
-    oneOf: array2(object6({
+    oneOf: array2(object8({
       const: string3(),
       title: string3()
     })),
     default: string3().optional()
   });
-  LegacyTitledEnumSchemaSchema2 = object6({
+  LegacyTitledEnumSchemaSchema2 = object8({
     type: literal2("string"),
     title: string3().optional(),
     description: string3().optional(),
@@ -72883,26 +73863,26 @@ var init_types4 = __esm(() => {
     default: string3().optional()
   });
   SingleSelectEnumSchemaSchema2 = union2([UntitledSingleSelectEnumSchemaSchema2, TitledSingleSelectEnumSchemaSchema2]);
-  UntitledMultiSelectEnumSchemaSchema2 = object6({
+  UntitledMultiSelectEnumSchemaSchema2 = object8({
     type: literal2("array"),
     title: string3().optional(),
     description: string3().optional(),
     minItems: number3().optional(),
     maxItems: number3().optional(),
-    items: object6({
+    items: object8({
       type: literal2("string"),
       enum: array2(string3())
     }),
     default: array2(string3()).optional()
   });
-  TitledMultiSelectEnumSchemaSchema2 = object6({
+  TitledMultiSelectEnumSchemaSchema2 = object8({
     type: literal2("array"),
     title: string3().optional(),
     description: string3().optional(),
     minItems: number3().optional(),
     maxItems: number3().optional(),
-    items: object6({
-      anyOf: array2(object6({
+    items: object8({
+      anyOf: array2(object8({
         const: string3(),
         title: string3()
       }))
@@ -72915,7 +73895,7 @@ var init_types4 = __esm(() => {
   ElicitRequestFormParamsSchema = TaskAugmentedRequestParamsSchema.extend({
     mode: literal2("form").optional(),
     message: string3(),
-    requestedSchema: object6({
+    requestedSchema: object8({
       type: literal2("object"),
       properties: record6(string3(), PrimitiveSchemaDefinitionSchema2),
       required: array2(string3()).optional()
@@ -72943,21 +73923,21 @@ var init_types4 = __esm(() => {
     action: _enum(["accept", "decline", "cancel"]),
     content: preprocess((val) => val === null ? undefined : val, record6(string3(), union2([string3(), number3(), boolean3(), array2(string3())])).optional())
   });
-  ResourceTemplateReferenceSchema2 = object6({
+  ResourceTemplateReferenceSchema2 = object8({
     type: literal2("ref/resource"),
     uri: string3()
   });
-  PromptReferenceSchema2 = object6({
+  PromptReferenceSchema2 = object8({
     type: literal2("ref/prompt"),
     name: string3()
   });
   CompleteRequestParamsSchema2 = BaseRequestParamsSchema2.extend({
     ref: union2([PromptReferenceSchema2, ResourceTemplateReferenceSchema2]),
-    argument: object6({
+    argument: object8({
       name: string3(),
       value: string3()
     }),
-    context: object6({
+    context: object8({
       arguments: record6(string3(), string3()).optional()
     }).optional()
   });
@@ -72972,7 +73952,7 @@ var init_types4 = __esm(() => {
       hasMore: optional2(boolean3())
     })
   });
-  RootSchema2 = object6({
+  RootSchema2 = object8({
     uri: string3().startsWith("file://"),
     name: string3().optional(),
     _meta: record6(string3(), unknown2()).optional()
@@ -75443,6 +76423,8 @@ LAUNCHING A COPY: candle_vamp_candidates (a key with account:read) lists Solana 
 
 STRATEGY LAB (a production key, cndl_live_): candle_lab_status first, then candle_lab_replay returns a job_id at once and candle_lab_replay_result reads it (no more often than every 5 seconds; a replay runs up to ten minutes); candle_lab_runners and candle_lab_edges read its tables. The key's plan decides access and hacc refuses with code lab_plan, lab_quota, lab_active or lab_busy. Backtests are a model of the past; the lab never trades.
 
+SIGNAL RECORDS (a production key, cndl_live_; read-only): candle_signal_scorecard reads hacc's daily scorecard, candle_signal_records a page of per-signal measured records (page with before = next_before), candle_signal_record one signal's record. Every result carries measure: "Measured record, not a forecast." Quote that line with any figure from it; never say a signal will win.
+
 WRITING (trade, launch, transfer, sweep, swap) needs a key. If a call returns an auth error, the fix is on the human's side: they run \`candle auth login\`, which authorizes a device in the browser and stores the credentials. Do not ask them to paste a key into a config file, and do not retry the call until they confirm.
 
 Two chains: solana and hood. Most tools take an explicit chain — resolve it with candle_resolve_token rather than guessing.
@@ -75706,7 +76688,7 @@ class ChainRegistryError2 extends Error {
 }
 var EVM_ADDRESS2 = /^0x[0-9a-fA-F]{40}$/;
 var SOLANA_ADDRESS2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-var isObject2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+var isObject3 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 function fail4(path, why) {
   throw new Error(`chain registry: ${path} ${why}`);
 }
@@ -75724,7 +76706,7 @@ function needNumber2(o, key, path) {
 }
 function needObject2(o, key, path) {
   const v = o[key];
-  if (!isObject2(v))
+  if (!isObject3(v))
     fail4(`${path}.${key}`, "must be an object");
   return v;
 }
@@ -75741,7 +76723,7 @@ function needNullableAddress2(o, key, path) {
     needAddress2(o[key], `${path}.${key}`);
 }
 function checkToken2(v, path) {
-  if (!isObject2(v))
+  if (!isObject3(v))
     fail4(path, "must be an object");
   needString2(v, "symbol", path);
   needAddress2(v.address, `${path}.address`);
@@ -75750,7 +76732,7 @@ function checkToken2(v, path) {
 function checkAddressSet2(v, path, keys) {
   if (v === null)
     return;
-  if (!isObject2(v))
+  if (!isObject3(v))
     fail4(path, "must be an object or null");
   for (const k of keys)
     needAddress2(v[k], `${path}.${k}`);
@@ -75775,14 +76757,14 @@ function checkEvm2(evm, path) {
   needNullableAddress2(evm, "multicall3", path);
   const dex = needObject2(evm, "dex", path);
   checkAddressSet2(dex.uniswapV3, `${path}.dex.uniswapV3`, ["factory", "router", "quoter"]);
-  if (isObject2(dex.uniswapV3) && !/^0x[0-9a-fA-F]{64}$/.test(String(dex.uniswapV3.initCodeHash)))
+  if (isObject3(dex.uniswapV3) && !/^0x[0-9a-fA-F]{64}$/.test(String(dex.uniswapV3.initCodeHash)))
     fail4(`${path}.dex.uniswapV3.initCodeHash`, "must be 0x plus 64 hex digits");
   checkAddressSet2(dex.uniswapV4, `${path}.dex.uniswapV4`, ["poolManager", "universalRouter", "quoter", "stateView"]);
   needNullableAddress2(dex, "permit2", `${path}.dex`);
   if (!Array.isArray(evm.aggregators))
     fail4(`${path}.aggregators`, "must be an array");
   evm.aggregators.forEach((a, i) => {
-    if (!isObject2(a))
+    if (!isObject3(a))
       fail4(`${path}.aggregators[${i}]`, "must be an object");
     needString2(a, "id", `${path}.aggregators[${i}]`);
     needString2(a, "vendorChainSlug", `${path}.aggregators[${i}]`);
@@ -75803,14 +76785,14 @@ function checkEvm2(evm, path) {
     needObject2(launch, "contractEnv", `${path}.launch`);
   }
 }
-function validateChainEntries2(raw) {
-  if (!Array.isArray(raw))
+function validateChainEntries2(raw2) {
+  if (!Array.isArray(raw2))
     fail4("registry", "must be an array");
   const slugs = new Set;
   const chainIds = new Set;
-  raw.forEach((item, i) => {
+  raw2.forEach((item, i) => {
     const path = `entry[${i}]`;
-    if (!isObject2(item))
+    if (!isObject3(item))
       fail4(path, "must be an object");
     needString2(item, "slug", path);
     needString2(item, "family", path);
@@ -75838,7 +76820,7 @@ function validateChainEntries2(raw) {
     if (item.family === "evm") {
       if (item.addressFormat !== "evm-hex20")
         fail4(`${path}.addressFormat`, "must be evm-hex20 for an evm entry");
-      if (!isObject2(item.evm))
+      if (!isObject3(item.evm))
         fail4(`${path}.evm`, "is required on an evm entry");
       checkEvm2(item.evm, `${path}.evm`);
       const id = item.evm.chainId;
@@ -75854,7 +76836,7 @@ function validateChainEntries2(raw) {
       fail4(`${path}.family`, `"${String(item.family)}" is not a known family`);
     }
   });
-  return raw;
+  return raw2;
 }
 var BUILT_IN2 = validateChainEntries2(registry_default2);
 var entries2 = BUILT_IN2;
@@ -76229,7 +77211,6 @@ ${USAGE3}` : USAGE3, ctx.json);
 
 // src/commands/auth.ts
 init_account();
-init_agent_key_access();
 init_args();
 import { homedir as homedir3 } from "node:os";
 import { join as join9 } from "node:path";
@@ -76263,6 +77244,7 @@ init_keys();
 init_keys_embedded_wallet();
 var DEVICE_CODE_PATH = "/api/v1/agent/device/code";
 var DEVICE_TOKEN_PATH = "/api/v1/agent/device/token";
+var DEVICE_LOGIN_DEFAULT_SCOPES = ["launch:write", "launch:read", "account:read", "activity:write"];
 var MAX_CLIENT_NAME_LENGTH = 64;
 function expiresInWords(seconds) {
   return seconds % 60 === 0 ? `${seconds / 60}m` : `${seconds}s`;
@@ -76637,7 +77619,7 @@ Run: candle keys update ${body.apiKey.keyPrefix} --embedded-wallet ${requested.e
 Name it in the key manager: ${portalOrigin}/dev/agent` : ""}`);
     }
   } else if (body.apiKeyError) {
-    const authorizedScopes = requested.scopes ?? scopesForPreset("readwrite");
+    const authorizedScopes = requested.scopes ?? DEVICE_LOGIN_DEFAULT_SCOPES;
     deps.stdout.write(scopeSummary(authorizedScopes, style, "Authorized scopes (no key issued yet)"));
     notice(deps, "stdout", "warning", `${body.apiKeyError}
 Run: candle keys create`);
@@ -76854,6 +77836,41 @@ var LAUNCH_DEFINITION2 = {
     cndl: 6,
     eth: 18,
     usdg: 6
+  },
+  quoteSelection: {
+    flag: "--quote",
+    key: "quote",
+    checkKey: "check",
+    checkHelp: "Read launch paths and quote admission without uploading, building, signing or sending. No name, image or launch id is needed. Pass check or dryRun, never both. Admission is separate from executionEnabled; a successful check does not enable a new quote.",
+    value: "<symbol|address>",
+    help: "Select a quote by featured symbol or token address. With --check, show admission checks, curve figures, graduation raise and issuer disclosure. New quotes require server launch support; --quote-asset remains supported for fixed pairs.",
+    fixedPairs: [
+      {
+        id: "sol",
+        address: "So11111111111111111111111111111111111111112",
+        chain: "solana"
+      },
+      {
+        id: "usdc",
+        address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        chain: "solana"
+      },
+      {
+        id: "cndl",
+        address: "9dXSV8VWuYvGfTzqvkBeoFwH9ihVTybDuWo5VaJPCNDL",
+        chain: "solana"
+      },
+      {
+        id: "eth",
+        address: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+        chain: "hood"
+      },
+      {
+        id: "usdg",
+        address: "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        chain: "hood"
+      }
+    ]
   },
   quoteChains: {
     sol: "solana",
@@ -77898,8 +78915,8 @@ function launchRulesRequest(flags, launch) {
   if (problem)
     throw new Error(problem);
   const symbol = launch.quote.toUpperCase();
-  const whole = (raw2) => `${shortAmount(raw2.toString(), launch.decimals)} ${symbol}`;
-  const raw = (flag, value) => {
+  const whole = (raw3) => `${shortAmount(raw3.toString(), launch.decimals)} ${symbol}`;
+  const raw2 = (flag, value) => {
     if (value === undefined)
       return;
     let amount;
@@ -77916,7 +78933,7 @@ function launchRulesRequest(flags, launch) {
   const delay = openDelay(flags);
   if (delay > 0)
     body.openDelaySecs = delay;
-  const cap = raw("--max-buy-per-wallet", flags["--max-buy-per-wallet"]);
+  const cap = raw2("--max-buy-per-wallet", flags["--max-buy-per-wallet"]);
   if (cap !== undefined) {
     body.maxBuyPerWalletRaw = cap.toString();
     body.capWindowSecs = parseDuration(flags["--cap-window"] ?? "");
@@ -77925,7 +78942,7 @@ function launchRulesRequest(flags, launch) {
     body.allowlist = launch.allowlist;
     body.allowlistWindowSecs = parseDuration(flags["--allowlist-window"] ?? "");
   }
-  const devBuyMax = raw("--dev-buy-max", flags["--dev-buy-max"]);
+  const devBuyMax = raw2("--dev-buy-max", flags["--dev-buy-max"]);
   if (devBuyMax !== undefined) {
     if (devBuyMax < launch.buyRaw)
       throw new Error(`--dev-buy-max (${whole(devBuyMax)}) is below this launch's own dev buy, --buy (${whole(launch.buyRaw)}).`);
@@ -77937,8 +78954,8 @@ function launchRulesRequest(flags, launch) {
     throw new Error(`This launch's dev buy (--buy ${whole(launch.buyRaw)}) is over --max-buy-per-wallet (${whole(cap)}); with no open delay the dev buy is held to the cap.`);
   return Object.keys(body).length ? body : undefined;
 }
-function shortAmount(raw, decimals) {
-  const full = decimalAmount(raw, decimals);
+function shortAmount(raw2, decimals) {
+  const full = decimalAmount(raw2, decimals);
   return full.includes(".") ? full.replace(/0+$/, "").replace(/\.$/, "") : full;
 }
 var summarySchema = exports_external.object({
@@ -78020,7 +79037,7 @@ var LAUNCH_USAGE = `candle launch ${launchFlagFields.map((field) => {
   if (field.key === "imageUrl")
     return `--image <path>|${invocation}`;
   return "required" in field && field.required ? invocation : `[${invocation}]`;
-}).join(" ")} [--check] [--yes] [--require-fee-wallet] [--rpc-url <url>] [--json]`;
+}).join(" ")} [--quote <symbol|address>] [--check] [--yes] [--require-fee-wallet] [--rpc-url <url>] [--json]`;
 function launchFieldProblem(flags) {
   for (const field of launchFlagFields) {
     const value = flags[field.cli.flag];
@@ -78081,7 +79098,10 @@ var ENVIRONMENT = [
   },
   { name: "CANDLE_PROFILE", description: "The profile to act as, when --profile is not given" },
   { name: "CANDLE_API_URL", description: "API base URL, when --api-url is not given" },
-  { name: "CANDLE_HACC_URL", description: "Strategy lab base URL (default https://api.hacc.fun); HTTPS only" },
+  {
+    name: "CANDLE_HACC_URL",
+    description: "hacc base URL for the strategy lab and signal records (default https://api.hacc.fun); HTTPS only"
+  },
   {
     name: "CANDLE_X402_NETWORK",
     description: "The network per-use x402 payments are made on: mainnet (default) or devnet, for tests"
@@ -78224,12 +79244,13 @@ var HELP = {
     group: "Trade",
     intro: "Quote, swap and bridge on Solana or Hood; read an operation",
     summary: "Quote, confirm and swap on Solana or Hood, bridge between them; read an operation by id",
-    description: "Swaps run through a TEE wallet's bound key: the quote is shown and confirmed before anything is sent. The first buy after a launch is this command, unless the launch carried it with candle launch --buy. The assets decide the chain (ETH, USDG or a 0x token is Hood; SOL, USDC, CNDL or a mint is Solana) and a named wallet must be on it. A Hood TEE wallet signs one leg at a time: approve, Permit2, trade, then the fee, each only after the one before it landed. SOL or USDC to ETH or USDG, or back, is a bridge through Relay from a TEE wallet into this key's own TEE wallet on the other chain (--to names it when there are several); Candle charges no fee, only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and this machine checks Relay's deposit before it is signed. The bridge prints its deposit and returns while Relay fills; --wait follows it for up to ten minutes. While it is open, a sweep of either wallet refuses BRIDGE_IN_FLIGHT for two hours. On a Hood TEE swap, --wait follows the trade and fee legs for up to ten minutes and prints the same operation response as candle swap status --operation <id>; exit 0 means completed, 1 failed, and 3 partial execution, unresolved settlement or timeout. Embedded and Solana same-chain swaps use candle swap status <client-trade-id>. Vault to vault: fund the Solana TEE wallet from the vault, bridge, then disable and sweep the Hood TEE wallet into its vault. Every plan can trade Candle-launched tokens and base assets, and buy or sell a token that was not launched on Candle. Each trade pays the plan's agent fee on top; a base-pair swap or a bridge between this key's own wallets pays none. candle plans shows the fees in force. With --dry-run, stdout reports per-check results and the quote; nothing is signed or sent. Otherwise with --json, stdout is one JSON value: swaps, trades, replays and job status reads carry kind, status, clientTradeId, signature (the primary transaction, or null), signatures (a list) and raw (the original response); Hood --wait and explicit --operation reads return the operation response. Every human line is on stderr. The keys older versions printed stay beside them.",
+    description: "Swaps run through a TEE wallet's bound key: the quote is shown and confirmed before anything is sent. The first buy after a launch is this command, unless the launch carried it with candle launch --buy. The assets decide the chain (ETH, USDG or a 0x token is Hood; SOL, USDC, CNDL or a mint is Solana) and a named wallet must be on it. A Hood TEE wallet signs one leg at a time: approve, Permit2, trade, then the fee, each only after the one before it landed. A Hood TEE swap previews first and builds only after you confirm, so a run that stops at the quote (no --yes, a decline, a held wallet, too little gas) holds nothing; a quote that moves before the build answers QUOTE_MOVED and nothing is held. swap cancel --operation <id> releases a Hood TEE trade or swap operation from this key that never had a leg signed, and refuses (exit 3) when a leg may have been signed. SOL or USDC to ETH or USDG, or back, is a bridge through Relay from a TEE wallet into this key's own TEE wallet on the other chain (--to names it when there are several); Candle charges no fee, only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and this machine checks Relay's deposit before it is signed. The bridge prints its deposit and returns while Relay fills; --wait follows it for up to ten minutes. While it is open, a sweep of either wallet refuses BRIDGE_IN_FLIGHT for two hours. On a Hood TEE swap, --wait follows the trade and fee legs for up to ten minutes and prints the same operation response as candle swap status --operation <id>; exit 0 means completed, 1 failed, and 3 partial execution, unresolved settlement or timeout. Embedded and Solana same-chain swaps use candle swap status <client-trade-id>. Vault to vault: fund the Solana TEE wallet from the vault, bridge, then disable and sweep the Hood TEE wallet into its vault. Every plan can trade Candle-launched tokens and base assets, and buy or sell a token that was not launched on Candle. Each trade pays the plan's agent fee on top; a base-pair swap or a bridge between this key's own wallets pays none. candle plans shows the fees in force. With --dry-run, stdout reports per-check results and the quote; nothing is signed or sent. Otherwise with --json, stdout is one JSON value: swaps, trades, replays and job status reads carry kind, status, clientTradeId, signature (the primary transaction, or null), signatures (a list) and raw (the original response); Hood --wait and explicit --operation reads return the operation response. Every human line is on stderr. The keys older versions printed stay beside them.",
     usage: [
       "candle swap <from> <to> [flags]",
       "candle swap status <id>",
       "candle swap status --operation <operationId>",
       "candle swap recover --operation <operationId> [--hash <0x…>]",
+      "candle swap cancel --operation <operationId>",
       "candle swap receipt <hash>",
       "candle swap receipt --client-swap-id <id>"
     ],
@@ -78240,11 +79261,15 @@ var HELP = {
       },
       {
         invocation: "status <id> [--kind trade|swap|launch] [--wait] | status --operation <operationId> [--wait]",
-        description: "Read without resending; --wait follows a bridge. --operation reads a Hood TEE guard; add --wait to follow all legs for up to ten minutes (0 completed, 1 failed, 3 partial or unresolved)"
+        description: "Read without resending; --wait follows a bridge. --operation reads a Hood TEE guard; add --wait to follow all legs for up to ten minutes (0 completed, 1 failed, 3 partial or unresolved). held is the wallet-hold field; a leg's legacyHeld is history, not a lock"
       },
       {
         invocation: "recover --operation <operationId> [--hash <0x…>]",
         description: "Recover a legacy leg by verified transaction proof; a hash is only a locator"
+      },
+      {
+        invocation: "cancel --operation <operationId>",
+        description: "Release a Hood TEE trade or swap operation this key opened and never signed a leg of (0 released or already ended, 3 a leg may have been signed: do not repeat the trade, 1 any other refusal)"
       },
       {
         invocation: "receipt <hash> | receipt --client-swap-id <id>",
@@ -78254,7 +79279,7 @@ var HELP = {
     flags: [
       {
         invocation: "--dry-run",
-        description: "Check a Solana TEE payer, build the quote and check spend, then stop. Never signs, sends, prompts or saves an operation. Refuses --yes, --percent and --client-trade-id; embedded, Hood and bridge payers are unsupported"
+        description: "Check a TEE payer and quote. Hood swaps and bridges preview fees, legs, gas, route and destination without builds or locks; Solana same-chain checks the built payload. Never signs, sends, prompts or saves a local operation. Refuses --yes, --percent, --wait and --client-trade-id; embedded payers are unsupported"
       }
     ],
     examples: [
@@ -78317,8 +79342,8 @@ var HELP = {
   lp: {
     group: "Trade",
     intro: "Meteora DAMM v2 liquidity from a TEE wallet",
-    summary: "Meteora DAMM v2 liquidity from a TEE wallet: pools, add, positions, remove, claim",
-    description: "Provide liquidity on any Meteora DAMM v2 pool from a TEE wallet, through its bound key (scope lp:write, opt-in). Every write is quoted, shown with the pool's Token-2022 warnings, confirmed, signed by Candle's relay and broadcast over your RPC; no Candle fee. Only configured raw caps and USD limits apply to deposits; unset means unlimited and zero still binds. A sweep closes open positions itself (tee sweep).",
+    summary: "Meteora DAMM v2 liquidity from a TEE or the embedded wallet: pools, add, positions, remove, claim, status",
+    description: "Provide liquidity on any Meteora DAMM v2 pool from a TEE wallet, through its bound key (scope lp:write, opt-in). Every write is quoted, shown with the pool's Token-2022 warnings, confirmed, signed by Candle's relay and broadcast over your RPC; no Candle fee. Only configured raw caps and USD limits apply to deposits; unset means unlimited and zero still binds. A sweep closes open positions itself (tee sweep). With --wallet embedded, Candle builds, signs and broadcasts from the account's embedded wallet in one call; an outcome that may still land exits 3 with its signature, and candle lp status reads it.",
     usage: ["candle lp <subcommand> [flags]"],
     rows: [
       {
@@ -78326,18 +79351,28 @@ var HELP = {
         description: "Pools listing a token: liquidity, fee, 24h volume, estimated yield"
       },
       {
-        invocation: "add <pool> --amount <n> <token> --wallet <tee> [--position <nft>]",
+        invocation: "add <pool> --amount <n> <token> --wallet <tee>|embedded [--position <nft>]",
         description: "Open a position, or add to one; the other side follows the pool's ratio"
       },
-      { invocation: "positions [--wallet <tee>]", description: "Every position across your TEE wallets" },
       {
-        invocation: "remove <position> --percent <n> [--wallet <tee>]",
+        invocation: "positions [--wallet <tee>|embedded]",
+        description: "Every position across your TEE wallets, or the embedded wallet's"
+      },
+      {
+        invocation: "remove <position> --percent <n> [--wallet <tee>|embedded]",
         description: "Withdraw; at 100% also claims fees and closes the position"
       },
-      { invocation: "claim <position> [--wallet <tee>]", description: "Claim fees and any rewards" }
+      { invocation: "claim <position> [--wallet <tee>|embedded]", description: "Claim fees and any rewards" },
+      {
+        invocation: "status <clientTradeId>",
+        description: "An operation's state; settles one that may still land (exit 3 while it may)"
+      }
     ],
     flags: [
-      { invocation: "--wallet <tee>", description: "The TEE wallet by id, address or unique label" },
+      {
+        invocation: "--wallet <tee>|embedded",
+        description: "The TEE wallet by id, address or unique label, or embedded (remove and claim default to it when the key has no TEE wallet)"
+      },
       { invocation: "--rpc-url <url>", description: "Your own Solana RPC (optional; see candle help profile)" },
       {
         invocation: "--client-trade-id <id>",
@@ -78350,7 +79385,9 @@ var HELP = {
       "candle lp pools So11111111111111111111111111111111111111112",
       "candle lp add <pool> --amount 0.5 SOL --wallet AgentOne",
       "candle lp positions",
-      "candle lp remove <position> --percent 100 --wallet AgentOne"
+      "candle lp remove <position> --percent 100 --wallet AgentOne",
+      "candle lp add <pool> --amount 0.5 SOL --wallet embedded --client-trade-id lp-1",
+      "candle lp status lp-1"
     ],
     env: ENV_API
   },
@@ -78558,9 +79595,9 @@ var HELP = {
   },
   transfer: {
     group: "Trade",
-    intro: "Move funds out of a TEE wallet to your wallets or its vault",
-    summary: "Move funds out of a TEE wallet to your own wallets or its vault, through its bound key",
-    description: "Moves one asset out of a TEE wallet this machine can sign for. The bound key must be a Withdraw key (transfer:bound); from that wallet, Candle allows only its own pinned vault or another of the account's wallets you linked while signed in or marked trusted, and, where the server has TEE_WITHDRAWALS_ENABLED on, an address on the account's withdrawal allowlist (named by its label, id or address). To a linked wallet or an approved address only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and the asset must be a base asset; to the vault any token and max are allowed. Candle builds the transaction, this machine approves the relay, Privy signs, Candle broadcasts. The destination and its kind are shown before you confirm. candle transfer status <id> reads a transfer by its id or your --client-id: built, expired, submitted with its signature, unconfirmed (check the chain or candle activity before using a new client id), or failed (kept for 24 hours; older transfers are in candle activity). The asset decides the chain: ETH, USDG or --token is Hood, from a Hood TEE wallet, where this machine checks the one leg moves exactly what you confirmed before it is signed, and ETH max leaves the gas reserve.",
+    intro: "Move funds out of the embedded wallet or a TEE wallet",
+    summary: "Move funds out of the embedded wallet (Candle signs) or a TEE wallet to your own wallets or its vault, through its bound key",
+    description: "Moves one asset out of the embedded wallet (through Candle's transfer rail, as MCP candle_transfer: --to a plain address, one of the account's own wallets or an owner-approved withdrawal address; transfer:write; Candle signs) or out of a TEE wallet this machine can sign for. From the embedded wallet --client-id names the transfer too (the CLI picks one when it is absent and prints it before it sends): a repeat of a sent transfer replays its answer and sends nothing, a repeat of a transfer that may have landed is refused, and candle transfer status <id> reads it; a failure that is not a definite refusal (no answer, a timeout, a 5xx, TRANSFER_FAILED) exits 3 and names the id, so read it, or check candle activity or the chain, before sending again. For a TEE wallet the bound key must be a Withdraw key (transfer:bound); from that wallet, Candle allows only its own pinned vault or another of the account's wallets you linked while signed in or marked trusted, and, where the server has TEE_WITHDRAWALS_ENABLED on, an address on the account's withdrawal allowlist (named by its label, id or address). To a linked wallet or an approved address only configured raw caps and USD limits apply (unset means unlimited, zero still binds), and the asset must be a base asset; to the vault any token and max are allowed. Candle builds the transaction, this machine approves the relay, Privy signs, Candle broadcasts. The destination and its kind are shown before you confirm. candle transfer status <id> reads a transfer by its id or your --client-id: built, expired, submitted with its signature, unconfirmed (check the chain or candle activity before using a new client id), or failed (kept for 24 hours; older transfers are in candle activity). The asset decides the chain: ETH, USDG or --token is Hood, from a Hood TEE wallet, where this machine checks the one leg moves exactly what you confirmed before it is signed, and ETH max leaves the gas reserve.",
     usage: [
       "candle transfer --to <address|wallet name|allowlist label|vault> --asset <SOL|USDC|CNDL|ETH|USDG>|--mint <mint>|--token <0x...> --amount <decimal|max> [--wallet <tee>] [--client-id <id>] [--yes] [--json]",
       "candle transfer status <transfer id|client id> [--json]"
@@ -78585,7 +79622,7 @@ var HELP = {
       },
       {
         invocation: "--client-id <id>",
-        description: "Your own id for this transfer (1 to 128 of letters, digits, . _ : -). An id already used for a built or sent transfer is refused with IDEMPOTENCY_CONFLICT naming that transfer, so a retry never sends twice; read it with candle transfer status <id>"
+        description: "Your own id for this transfer (1 to 128 of letters, digits, . _ : -). For a TEE wallet, an id already used for a built or sent transfer is refused with IDEMPOTENCY_CONFLICT naming that transfer, so a retry never sends twice; read it with candle transfer status <id>. From the embedded wallet a repeat of a sent transfer replays its answer and sends nothing, and an id that may have landed is refused"
       },
       { invocation: "--yes", description: "Skip the confirmation prompt (the destination is still printed)" }
     ],
@@ -78600,7 +79637,7 @@ var HELP = {
   launch: {
     group: "Trade",
     summary: "Create a token on Solana or Hood, with an optional first buy",
-    description: "Creates a token from the wallet you name, with an optional first buy. Embedded launches use /launch/headless on every plan, with the key's embedded-wallet allowance and launch:write; no swap:write is needed. A Solana first buy is a creator bundle, signed by Candle. A Hood first buy is best effort after creation. TEE launches use /launch/self and require Pro or Max, launch:write, a bound key and verified authority; a server with TEE_LAUNCH_BY_SCOPE_ENABLED off also asks for the owner's allowLaunch (deprecated), and with it on a TEE first buy also needs swap:write. TEE buys need TEE_LAUNCH_BUYS_ENABLED on the server; Solana buys also need AGENT_TRADING_ENABLED and Jito. Existing server gates and ceilings apply. The embedded path previews the launch before confirmation; --dry-run stops at the preview. No buy creates only the token. Local image and banner uploads happen before confirmation and are public and permanent even if the launch is declined. Reuse --client-trade-id for recovery. On Solana, --fee-wallet <address> sets the wallet the launch's curve and pool fees earn to, an on-curve wallet by itself or a Squads v4 vault with --fee-wallet-multisig <address> and --fee-wallet-multisig-vault-index <n>; without it the fees earn to the wallet that launches the token where the server has LAUNCH_FEE_WALLET_FROM_LAUNCHER on (an embedded launch already earns to its embedded wallet), otherwise to the account wallet, and the preview, the confirm and --check all say which; a live launch also warns on stderr when it defaults, and --require-fee-wallet refuses the launch without one. On Solana, where the server has CURVE_LAUNCH_RULES_ENABLED on, launch rules are fixed at launch and enforced by the curve program: --open-in delays the open (until then only the launching wallet may buy, up to --dev-buy-max, which defaults to the buy), --max-buy-per-wallet with --cap-window caps what each wallet spends on the curve after the open, and --allowlist <file> with --allowlist-window lets only the listed wallets buy; durations are seconds or 90m, 6h, 2d and amounts are whole quote units, each is checked here before any request, and the preview prints a Launch rules block. Nobody can change the rules after the launch. --check answers first, before any of it: which launch path works on this key and server (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, with nothing uploaded, built or sent; name a wallet with --wallet to narrow it, and it exits 1 when no path works. status reads one launch by its mint or clientLaunchId: build, signed, confirmed, trading, bonded, then migrated, with the market's lifecycle and migration fields. --wait follows it until the token is trading, the launch has failed, or ten minutes pass.",
+    description: "Creates a token from the wallet you name, with an optional first buy. Embedded launches use /launch/headless on every plan, with the key's embedded-wallet allowance and launch:write; no swap:write is needed. A Solana first buy is a creator bundle, signed by Candle. A Hood first buy is best effort after creation. TEE launches use /launch/self and require Pro or Max, launch:write, a bound key and verified authority; a server with TEE_LAUNCH_BY_SCOPE_ENABLED off also asks for the owner's allowLaunch (deprecated), and with it on a TEE first buy also needs swap:write. TEE buys need TEE_LAUNCH_BUYS_ENABLED on the server; Solana buys also need AGENT_TRADING_ENABLED and Jito. Existing server gates and ceilings apply. The embedded path previews the launch before confirmation; --dry-run stops at the preview. No buy creates only the token. Local image and banner uploads happen before confirmation and are public and permanent even if the launch is declined. Reuse --client-trade-id for recovery. On Solana, --fee-wallet <address> sets the wallet the launch's curve and pool fees earn to, an on-curve wallet by itself or a Squads v4 vault with --fee-wallet-multisig <address> and --fee-wallet-multisig-vault-index <n>; without it the fees earn to the wallet that launches the token where the server has LAUNCH_FEE_WALLET_FROM_LAUNCHER on (an embedded launch already earns to its embedded wallet), otherwise to the account wallet, and the preview, the confirm and --check all say which; a live launch also warns on stderr when it defaults, and --require-fee-wallet refuses the launch without one. On Solana, where the server has CURVE_LAUNCH_RULES_ENABLED on, launch rules are fixed at launch and enforced by the curve program: --open-in delays the open (until then only the launching wallet may buy, up to --dev-buy-max, which defaults to the buy), --max-buy-per-wallet with --cap-window caps what each wallet spends on the curve after the open, and --allowlist <file> with --allowlist-window lets only the listed wallets buy; durations are seconds or 90m, 6h, 2d and amounts are whole quote units, each is checked here before any request, and the preview prints a Launch rules block. Nobody can change the rules after the launch. --check answers first, before any of it: which launch path works on this key and server (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, with nothing uploaded, built or sent; name a wallet with --wallet to narrow it, and it exits 1 when no path works. status reads one launch by its mint or clientLaunchId: build, signed, confirmed, trading, bonded, then migrated, with the market's lifecycle and migration fields. --wait follows it until the token is trading, the launch has failed, or ten minutes pass. An embedded Solana launch that Candle could not confirm in time is read on chain over the Solana RPC before anything is reported: finalized without an error prints status landed (exit 0), finalized with an error is LAUNCH_FAILED (exit 1), and anything else is LAUNCH_UNCONFIRMED (exit 3); never launch it again under a new id.",
     usage: [LAUNCH_USAGE, "candle launch status <mint-or-client-launch-id> [--wait]"],
     rows: [
       {
@@ -78611,12 +79648,16 @@ var HELP = {
     flags: [
       ...launchFlagRows,
       {
+        invocation: `${LAUNCH_DEFINITION2.quoteSelection.flag} ${LAUNCH_DEFINITION2.quoteSelection.value}`,
+        description: LAUNCH_DEFINITION2.quoteSelection.help
+      },
+      {
         invocation: "--image <path>",
         description: "Upload a local PNG, JPEG, GIF or WebP (at most 10MB) instead of --image-url; public and permanent before confirmation."
       },
       {
         invocation: "--check",
-        description: "Answer which launch path works (embedded allowance, tier, allowLaunch, TEE_LAUNCH_BUYS_ENABLED) in one call, before any image upload; nothing is sent. Exits 1 when no path works."
+        description: "Answer which launch path works before any image upload; with --quote, also print quote admission, curve figures, graduation raise and issuer disclosure. Exits 1 when the wallet or quote is refused. Nothing is built or sent."
       },
       { invocation: "--yes", description: "Confirm the launch without an interactive prompt." },
       {
@@ -78625,11 +79666,12 @@ var HELP = {
       },
       {
         invocation: "--rpc-url <url>",
-        description: "The Solana RPC for a TEE launch with no first buy, or the Hood RPC for receipt reads."
+        description: "The Solana RPC for a TEE launch with no first buy, or for reading an embedded launch Candle could not confirm; the Hood RPC for receipt reads."
       }
     ],
     examples: [
       "candle launch --check",
+      "candle launch --quote NVDA --check --json",
       "candle launch --check --wallet AgentOne",
       "candle launch --name Demo --symbol DEMO --image ./logo.png --wallet AgentOne",
       "candle launch --name Demo --symbol DEMO --image-url https://example.com/d.png --wallet AgentOne",
@@ -79008,6 +80050,41 @@ var HELP = {
       "candle lab replay cancel <job-id>",
       "candle lab runners --hours 24",
       "candle lab edges --days 7 --min-n 15"
+    ],
+    env: [...ENV_API, "CANDLE_HACC_URL"]
+  },
+  signals: {
+    group: "Account",
+    intro: "hacc's scorecard and per-signal measured records",
+    summary: "hacc's daily scorecard and each signal's measured record, read-only",
+    description: `Reads hacc's public signal records with this profile's production agent key: the daily scorecard (signal lift against the matched baseline, and per source, rule and horizon the count, coverage, conservative and priced mean net returns, tail counts and delay), a page of per-signal records newest first, or one signal's record (entry and per-horizon statuses, conservative and priced net returns, the 24 h path and the matched baseline). Returns are fractions on the wire and shown here as percents; the conservative figure counts a horizon with no print as a total loss, and a priced figure is blank unless the entry and that horizon were both priced. Backfilled rows are history recorded after the fact. Read-only: three GETs to hacc, nothing written, traded or moved. Every output ends with, and every --json value carries as measure, the fixed line "Measured record, not a forecast.", on errors, empty pages and 404s too. A record is a fact about the past, never a forecast or advice. --json preserves hacc's body. A device token or test key cannot read them.`,
+    usage: ["candle signals <scorecard|records|record> [flags]"],
+    rows: [
+      { invocation: "scorecard [--date YYYY-MM-DD]", description: "The latest daily scorecard, or one day's" },
+      {
+        invocation: "records [--source <source>] [--before <id>] [--limit n]",
+        description: "Per-signal records, newest first; --before takes the previous page's next_before"
+      },
+      {
+        invocation: "record <source> <source-id>",
+        description: "One signal's record: the signal id for pattern, chain:mint for launch_read"
+      }
+    ],
+    flags: [
+      { invocation: "--date <YYYY-MM-DD>", description: "A calendar day; absent reads the latest scorecard" },
+      {
+        invocation: "--source <source>",
+        description: "pattern, quant_call, holder_band or launch_read; absent lists every published source"
+      },
+      { invocation: "--before <id>", description: "Ledger id cursor: the previous page's next_before" },
+      { invocation: "--limit <n>", description: "Page size, 1 to 100 (hacc's default 50)" }
+    ],
+    examples: [
+      "candle signals scorecard",
+      "candle signals scorecard --date 2026-11-12 --json",
+      "candle signals records --source pattern --limit 20",
+      "candle signals record pattern 12345",
+      "candle signals record launch_read solana:<mint> --json"
     ],
     env: [...ENV_API, "CANDLE_HACC_URL"]
   },
@@ -79961,8 +81038,8 @@ class AgentProfileError extends Error {
     this.name = "AgentProfileError";
   }
 }
-function parseAgentProfiles(raw) {
-  const profiles = raw?.profiles;
+function parseAgentProfiles(raw2) {
+  const profiles = raw2?.profiles;
   if (!Array.isArray(profiles))
     throw new AgentProfileError("AGENT_PROFILES_INVALID", "profiles must be a list.");
   const out = [];
@@ -80056,6 +81133,9 @@ var TOOL_CLASSES = {
   candle_lab_replay_result: READ,
   candle_lab_runners: READ,
   candle_lab_edges: READ,
+  candle_signal_scorecard: READ,
+  candle_signal_records: READ,
+  candle_signal_record: READ,
   candle_get_agent_profile: READ,
   candle_list_agents: READ,
   candle_list_agent_posts: READ,
@@ -80222,8 +81302,8 @@ function reconcileMessage(kind, readable) {
   const launch = kind === "launch" ? " The dry run is not run again." : "";
   return `Candle could not confirm this ${what}.${check} Re-send the same request (it can never run twice), or stop tracking it.${launch}`;
 }
-function transferReconcileMessage(source, id) {
-  if (source === "embedded") {
+function transferReconcileMessage(source2, id) {
+  if (source2 === "embedded") {
     return "Candle could not confirm this transfer, and cannot read it back by an id. Check the source wallet in an explorer, then say what you found. It is never sent again; a new transfer is a new card.";
   }
   return `Candle could not confirm this transfer${id ? ` (${id})` : ""}. Check it by its signature, send the same signed transaction again while it can still land (never a new one), or stop tracking it.`;
@@ -80814,8 +81894,8 @@ function groupAddress2(address) {
 function confirmTyped(typed) {
   return typeof typed === "string" && typed.trim().toLowerCase() === "confirm";
 }
-function rawToDecimal(raw, decimals) {
-  const text = raw.toString().padStart(decimals + 1, "0");
+function rawToDecimal(raw2, decimals) {
+  const text = raw2.toString().padStart(decimals + 1, "0");
   const whole = text.slice(0, text.length - decimals);
   const fraction = text.slice(text.length - decimals).replace(/0+$/, "");
   return fraction ? `${whole}.${fraction}` : whole;
@@ -80827,23 +81907,23 @@ function decimalToRaw3(value, decimals) {
   const [whole = "0", fraction = ""] = text.split(".");
   if (fraction.length > decimals)
     return;
-  const raw = BigInt(whole + fraction.padEnd(decimals, "0"));
-  return raw > 0n ? raw : undefined;
+  const raw2 = BigInt(whole + fraction.padEnd(decimals, "0"));
+  return raw2 > 0n ? raw2 : undefined;
 }
 async function parseTransferInput(input, decimalsFor2) {
-  const source = input.source;
-  if (source === null || typeof source !== "object")
+  const source2 = input.source;
+  if (source2 === null || typeof source2 !== "object")
     throw refused("INVALID_SOURCE", "Choose a wallet to send from.");
-  if (source.kind !== "vault" && source.kind !== "embedded") {
+  if (source2.kind !== "vault" && source2.kind !== "embedded") {
     throw refused("INVALID_SOURCE", "A transfer sends from a vault wallet or the embedded wallet.");
   }
   const rawChain = input.chain;
   if (typeof rawChain !== "string" || rawChain !== "solana" && !isEvmChainSlug(rawChain))
     throw refused("INVALID_CHAIN", `chain is one of ${["solana", ...enabledEvmChainSlugs()].join(", ")}.`);
   const chain2 = rawChain;
-  if (typeof source.address !== "string" || source.address.length === 0)
+  if (typeof source2.address !== "string" || source2.address.length === 0)
     throw refused("INVALID_SOURCE", "The source wallet's address is missing.");
-  const sourceAddress = normalizeAddress(chain2, source.address);
+  const sourceAddress = normalizeAddress(chain2, source2.address);
   const rawAsset = input.asset;
   let asset;
   if (rawAsset !== null && typeof rawAsset === "object" && typeof rawAsset.symbol === "string") {
@@ -80869,11 +81949,11 @@ async function parseTransferInput(input, decimalsFor2) {
     const decimals = "symbol" in asset ? BASE_ASSETS[asset.symbol].decimals : await decimalsFor2(chain2, asset);
     if (decimals === undefined)
       throw refused("ASSET_UNREADABLE", "The asset's decimals could not be read; nothing was prepared.");
-    const raw = decimalToRaw3(rawAmount2.decimal, decimals);
-    if (raw === undefined) {
+    const raw2 = decimalToRaw3(rawAmount2.decimal, decimals);
+    if (raw2 === undefined) {
       throw refused("INVALID_AMOUNT", `The amount is a positive decimal with at most ${decimals} places, or max.`);
     }
-    amount = { raw: raw.toString() };
+    amount = { raw: raw2.toString() };
   } else {
     throw refused("INVALID_AMOUNT", "The amount is a positive decimal, or max.");
   }
@@ -80882,8 +81962,8 @@ async function parseTransferInput(input, decimalsFor2) {
     throw refused("INVALID_DESTINATION", "The destination is the source itself.");
   return {
     source: {
-      kind: source.kind,
-      ...typeof source.walletId === "string" && source.walletId.length > 0 ? { walletId: source.walletId } : {},
+      kind: source2.kind,
+      ...typeof source2.walletId === "string" && source2.walletId.length > 0 ? { walletId: source2.walletId } : {},
       address: sourceAddress
     },
     chain: chain2,
@@ -81673,8 +82753,8 @@ class CardBook {
       });
     }
     const params = card2.params;
-    const source = op.transfer?.source ?? params.source.kind;
-    if (source === "embedded") {
+    const source2 = op.transfer?.source ?? params.source.kind;
+    if (source2 === "embedded") {
       if (action !== "attest_sent" && action !== "attest_not_sent") {
         throw refused("TRANSFER_NEVER_RESENT", "An embedded-wallet transfer is never sent again. Check the source wallet in an explorer, then say whether it was sent.");
       }
@@ -82028,10 +83108,10 @@ function upsertTape(rows, row2) {
 }
 var SOLANA = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 var EVM = /^0x[0-9a-fA-F]{40}$/;
-function parseStreamRow(raw) {
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+function parseStreamRow(raw2) {
+  if (raw2 === null || typeof raw2 !== "object" || Array.isArray(raw2))
     return;
-  const r = raw;
+  const r = raw2;
   if (typeof r.haccId !== "number" || !Number.isFinite(r.haccId) || r.haccId <= 0)
     return;
   if (typeof r.pattern !== "string" || r.pattern.length === 0 || r.pattern.length > 64)
@@ -82341,8 +83421,8 @@ function watchlistFrom(body) {
   if (!Array.isArray(wallets2))
     return;
   const out = [];
-  for (const raw of wallets2) {
-    const row2 = raw;
+  for (const raw2 of wallets2) {
+    const row2 = raw2;
     if ((row2?.chain === "solana" || row2?.chain === "hood") && typeof row2.address === "string" && row2.address)
       out.push({ chain: row2.chain, address: row2.address });
   }
@@ -82872,16 +83952,16 @@ function refusalOf(status, body) {
   const record4 = asRecord(body) ?? {};
   const relayCode = typeof record4.code === "string" ? record4.code : undefined;
   const code = quantRefusalCode(body) ?? `HTTP_${status}`;
-  const refusal2 = { code, status, shape: relayCode !== undefined ? "relay" : "envelope" };
+  const refusal3 = { code, status, shape: relayCode !== undefined ? "relay" : "envelope" };
   if (typeof record4.retryable === "boolean")
-    refusal2.retryable = record4.retryable;
+    refusal3.retryable = record4.retryable;
   if (typeof record4.resetsAt === "string" || typeof record4.resetsAt === "number")
-    refusal2.resetsAt = record4.resetsAt;
+    refusal3.resetsAt = record4.resetsAt;
   if (typeof record4.turnId === "string")
-    refusal2.turnId = record4.turnId;
+    refusal3.turnId = record4.turnId;
   if (typeof record4.limit === "number")
-    refusal2.limit = record4.limit;
-  return refusal2;
+    refusal3.limit = record4.limit;
+  return refusal3;
 }
 function parseStatus(body) {
   const b = asRecord(body);
@@ -82915,8 +83995,8 @@ function parseEvents(body) {
   if (!b || !Array.isArray(b.events) || typeof b.next !== "number" || typeof b.status !== "string")
     return;
   const events = [];
-  for (const raw of b.events) {
-    const e = asRecord(raw);
+  for (const raw2 of b.events) {
+    const e = asRecord(raw2);
     if (typeof e?.seq !== "number" || typeof e.kind !== "string")
       continue;
     events.push({
@@ -82933,8 +84013,8 @@ function parseHistory(body) {
   if (!b || !Array.isArray(b.items))
     return;
   const items = [];
-  for (const raw of b.items) {
-    const item = asRecord(raw);
+  for (const raw2 of b.items) {
+    const item = asRecord(raw2);
     if (typeof item?.id !== "string" || typeof item.text !== "string")
       continue;
     if (item.role !== "user" && item.role !== "assistant")
@@ -83060,17 +84140,17 @@ var defaultSleep = (ms) => new Promise((resolve3) => {
   const timer = setTimeout(resolve3, ms);
   timer.unref?.();
 });
-function refusalError(refusal2) {
-  const details = { status: refusal2.status, shape: refusal2.shape };
-  if (refusal2.retryable !== undefined)
-    details.retryable = refusal2.retryable;
-  if (refusal2.resetsAt !== undefined)
-    details.resetsAt = refusal2.resetsAt;
-  if (refusal2.turnId !== undefined)
-    details.turnId = refusal2.turnId;
-  if (refusal2.limit !== undefined)
-    details.limit = refusal2.limit;
-  return refused(refusal2.code, `Quant refused: ${refusal2.code}.`, details);
+function refusalError(refusal3) {
+  const details = { status: refusal3.status, shape: refusal3.shape };
+  if (refusal3.retryable !== undefined)
+    details.retryable = refusal3.retryable;
+  if (refusal3.resetsAt !== undefined)
+    details.resetsAt = refusal3.resetsAt;
+  if (refusal3.turnId !== undefined)
+    details.turnId = refusal3.turnId;
+  if (refusal3.limit !== undefined)
+    details.limit = refusal3.limit;
+  return refused(refusal3.code, `Quant refused: ${refusal3.code}.`, details);
 }
 
 class QuantService {
@@ -83273,8 +84353,8 @@ ${text2}` : text2;
           break;
         continue;
       }
-      const refusal2 = answer2.refusal;
-      if (refusal2.code === "too_many_polls") {
+      const refusal3 = answer2.refusal;
+      if (refusal3.code === "too_many_polls") {
         tooMany++;
         if (tooMany > TOO_MANY_POLLS_RETRIES) {
           failure3 = "too_many_polls";
@@ -83283,7 +84363,7 @@ ${text2}` : text2;
         await sleep(TOO_MANY_POLLS_WAIT_MS);
         continue;
       }
-      if (refusal2.shape === "transport") {
+      if (refusal3.shape === "transport") {
         lost++;
         if (lost > LOST_POLL_RETRIES) {
           failure3 = "QUANT_UNREACHABLE";
@@ -83292,7 +84372,7 @@ ${text2}` : text2;
         await sleep(Math.min(1000 * lost, 5000));
         continue;
       }
-      failure3 = refusal2.code;
+      failure3 = refusal3.code;
       break;
     }
     if (this.poll !== poll)
@@ -84142,10 +85222,10 @@ async function sealCoreSlot(vault, header, contents, createdAt) {
     wipe(plain);
   }
 }
-function parseCoreSlotFile(raw) {
+function parseCoreSlotFile(raw2) {
   let value;
   try {
-    value = JSON.parse(raw);
+    value = JSON.parse(raw2);
   } catch {
     throw new CoreSlotError("CORE_SLOT_INVALID", "The core slot file is not valid JSON.");
   }
@@ -84156,15 +85236,15 @@ function parseCoreSlotFile(raw) {
   return file;
 }
 async function readCoreSlotHeader(paths) {
-  let raw;
+  let raw2;
   try {
-    raw = await readFile15(paths.slot, "utf8");
+    raw2 = await readFile15(paths.slot, "utf8");
   } catch (error) {
     if (error.code === "ENOENT")
       return;
     throw error;
   }
-  return parseCoreSlotFile(raw);
+  return parseCoreSlotFile(raw2);
 }
 async function openCoreSlot(input) {
   const file = await readCoreSlotHeader(input.paths);
@@ -84321,7 +85401,7 @@ var text2 = (body, isError = false) => ({
   content: [{ type: "text", text: JSON.stringify(body) }],
   ...isError ? { isError: true } : {}
 });
-var refusal2 = (code, message, extra = {}) => text2({ success: false, error: { code, message }, ...extra }, true);
+var refusal3 = (code, message, extra = {}) => text2({ success: false, error: { code, message }, ...extra }, true);
 var NEXT_PENDING = (kind, idKey) => `The user must approve this in the Candle TUI. Read the outcome with candle_get_operation using this id (kind: ${kind}). Never send it again under a new id; to retry, send the same request with the same ${idKey}.`;
 var NEXT_FINAL = "Final. Do not propose this again unless the user asks.";
 var NEXT_UNKNOWN = "Do not propose this again; the user is resolving it in the Candle TUI.";
@@ -84394,8 +85474,8 @@ function relay(answer2) {
   if (answer2.kind === "result")
     return answer2.result;
   if (answer2.kind === "refused")
-    return refusal2(answer2.code, answer2.message);
-  return refusal2("CORE_CALL_FAILED", answer2.message);
+    return refusal3(answer2.code, answer2.message);
+  return refusal3("CORE_CALL_FAILED", answer2.message);
 }
 function registerToolFace(server, deps) {
   server.handle("tools.list", async () => ({ tools: offeredTools() }));
@@ -84421,7 +85501,7 @@ function registerToolFace(server, deps) {
         tool: name,
         code: "TOOL_NOT_CLASSIFIED"
       });
-      return refusal2("TOOL_NOT_CLASSIFIED", `${name} is not a tool this core has classified, so it is refused.`);
+      return refusal3("TOOL_NOT_CLASSIFIED", `${name} is not a tool this core has classified, so it is refused.`);
     }
     if (verdict.class === "card" && verdict.kind === "transfer") {
       await deps.journal.append({
@@ -84430,11 +85510,11 @@ function registerToolFace(server, deps) {
         tool: name,
         code: "TRANSFER_USER_ONLY"
       });
-      return refusal2("TRANSFER_USER_ONLY", "Only you can start a transfer, from the Candle TUI.");
+      return refusal3("TRANSFER_USER_ONLY", "Only you can start a transfer, from the Candle TUI.");
     }
     if (isCoreLocalTool(name)) {
       if (deps.coreLocal === undefined)
-        return refusal2("METHOD_NOT_AVAILABLE", `${name} is not in this build of the core.`);
+        return refusal3("METHOD_NOT_AVAILABLE", `${name} is not in this build of the core.`);
       return deps.coreLocal(name, callArgs);
     }
     if (name === "candle_get_operation")
@@ -84442,7 +85522,7 @@ function registerToolFace(server, deps) {
     if (verdict.class === "read") {
       const readKey2 = deps.readKey();
       if (readKey2 === undefined)
-        return refusal2("NO_READ_KEY", "The core holds no Read key for this profile. Sign in with candle auth login.");
+        return refusal3("NO_READ_KEY", "The core holds no Read key for this profile. Sign in with candle auth login.");
       return relay(await deps.executor.call(name, callArgs, readKey2));
     }
     if (verdict.class === "paper" || verdict.class === "dry_run") {
@@ -84468,7 +85548,7 @@ function registerToolFace(server, deps) {
           tool: name,
           code: error.code
         });
-        return refusal2(error.code, error.message);
+        return refusal3(error.code, error.message);
       }
     }
     const heldId = verdict.idKey === "coreOpId" ? undefined : callArgs[verdict.idKey];
@@ -84481,7 +85561,7 @@ function registerToolFace(server, deps) {
           tool: name,
           code: "OP_ID_CONFLICT"
         });
-        return refusal2("OP_ID_CONFLICT", "That operation id is held for a different request. Never reuse an id for new parameters.", {
+        return refusal3("OP_ID_CONFLICT", "That operation id is held for a different request. Never reuse an id for new parameters.", {
           opId: heldId
         });
       }
@@ -84494,14 +85574,14 @@ function registerToolFace(server, deps) {
         tool: name,
         code: "NO_VIEW_ATTACHED"
       });
-      return refusal2("NO_VIEW_ATTACHED", "No Candle TUI view is attached, so no card can be shown. Nothing was queued.");
+      return refusal3("NO_VIEW_ATTACHED", "No Candle TUI view is attached, so no card can be shown. Nothing was queued.");
     }
     try {
       return cardAnswer(await deps.cards.propose({ tool: name, params: callArgs }, origin));
     } catch (error) {
       if (!(error instanceof RpcError))
         throw error;
-      return refusal2(error.code, error.message, error.details);
+      return refusal3(error.code, error.message, error.details);
     }
   });
 }
@@ -84509,9 +85589,9 @@ async function getOperation2(args, deps) {
   const clientId2 = args.clientId;
   const kind = args.kind;
   if (typeof clientId2 !== "string" || clientId2.length === 0)
-    return refusal2("MCP_VALIDATION", "clientId must be a string.");
+    return refusal3("MCP_VALIDATION", "clientId must be a string.");
   if (typeof kind !== "string" || !CORE_OPERATION_KINDS.includes(kind)) {
-    return refusal2("MCP_VALIDATION", `kind is one of ${CORE_OPERATION_KINDS.join(", ")}.`);
+    return refusal3("MCP_VALIDATION", `kind is one of ${CORE_OPERATION_KINDS.join(", ")}.`);
   }
   const held = deps.cards.held(clientId2);
   if (held !== undefined)
@@ -84519,10 +85599,10 @@ async function getOperation2(args, deps) {
   if (kind === "trade" || kind === "launch") {
     const readKey2 = deps.readKey();
     if (readKey2 === undefined)
-      return refusal2("NO_READ_KEY", "The core holds no Read key for this profile.");
+      return refusal3("NO_READ_KEY", "The core holds no Read key for this profile.");
     return relay(await deps.executor.call("candle_get_operation", { clientId: clientId2, kind }, readKey2));
   }
-  return refusal2("OPERATION_NOT_HELD", `The core issued no ${kind} operation under this id. A swap the core did not issue is read by replaying it with its clientSwapId.`);
+  return refusal3("OPERATION_NOT_HELD", `The core issued no ${kind} operation under this id. A swap the core did not issue is read by replaying it with its clientSwapId.`);
 }
 
 // src/core/transfer-chain.ts
@@ -84580,10 +85660,10 @@ async function tokenAccountFrozen(rpc, address) {
     return { exists: false, frozen: false };
   return { exists: true, frozen: account.data[TOKEN_ACCOUNT_STATE_OFFSET2] === TOKEN_ACCOUNT_STATE_FROZEN2 };
 }
-function rawToDecimal2(raw, decimals) {
+function rawToDecimal2(raw2, decimals) {
   if (decimals === 0)
-    return raw.toString();
-  const digits = raw.toString().padStart(decimals + 1, "0");
+    return raw2.toString();
+  const digits = raw2.toString().padStart(decimals + 1, "0");
   return `${digits.slice(0, -decimals)}.${digits.slice(-decimals)}`.replace(/\.?0+$/, "");
 }
 async function planSolMax(rpc, from, to) {
@@ -84596,9 +85676,9 @@ async function planSolMax(rpc, from, to) {
   const balance = account?.lamports ?? 0n;
   const reserve = 0n;
   const blockhash = await rpc.getLatestBlockhash();
-  let raw = balance;
+  let raw2 = balance;
   for (let attempt = 0;attempt < 3; attempt++) {
-    const instructions = [systemTransfer(decodePubkey(from), decodePubkey(to), raw)];
+    const instructions = [systemTransfer(decodePubkey(from), decodePubkey(to), raw2)];
     const message = compileLegacyMessage({ feePayer: decodePubkey(from), recentBlockhash: blockhash, instructions });
     const fee = await rpc.getFeeForMessage(toBase64(message));
     if (fee === null) {
@@ -84608,12 +85688,12 @@ async function planSolMax(rpc, from, to) {
     if (available <= 0n) {
       throw new VaultError("TRANSFER_INSUFFICIENT_FUNDS", `${from} holds ${balance} lamports, not above the ${fee} lamport fee; max leaves nothing to send. Nothing was signed or sent.`, { suggestion: "Fund the key with SOL first." });
     }
-    if (raw === available) {
-      const amount = rawToDecimal2(raw, 9);
+    if (raw2 === available) {
+      const amount = rawToDecimal2(raw2, 9);
       return {
         asset: "SOL",
         amount,
-        amountRaw: raw,
+        amountRaw: raw2,
         decimals: 9,
         from,
         to,
@@ -84622,13 +85702,13 @@ async function planSolMax(rpc, from, to) {
         displayLines: [
           `fee payer   ${from}`,
           `destination ${to}`,
-          `amount      ${amount} SOL = ${raw} lamports (max)`,
+          `amount      ${amount} SOL = ${raw2} lamports (max)`,
           "mint        (native SOL)",
           `source reserve ${reserve} lamports (source emptied)`
         ]
       };
     }
-    raw = available;
+    raw2 = available;
   }
   throw new VaultError("VAULT_UNREADABLE", "The SOL max fee quote kept changing. Nothing was signed or sent; retry when the RPC is stable.");
 }
@@ -84640,22 +85720,22 @@ async function planTransfer(input) {
   if (asset === "SOL") {
     if (max)
       return planSolMax(input.rpc, input.from, input.to);
-    const raw2 = decimalToRaw4(input.amount, 9);
-    if (raw2 === null || raw2 === 0n) {
+    const raw3 = decimalToRaw4(input.amount, 9);
+    if (raw3 === null || raw3 === 0n) {
       throw new VaultError("VAULT_INDEX_INVALID", "--amount must be max or a positive SOL decimal with at most 9 places.");
     }
     return {
       asset: "SOL",
       amount: input.amount,
-      amountRaw: raw2,
+      amountRaw: raw3,
       decimals: 9,
       from: input.from,
       to: input.to,
-      instructions: [systemTransfer(fromKey, toKey, raw2)],
+      instructions: [systemTransfer(fromKey, toKey, raw3)],
       displayLines: [
         `fee payer   ${input.from}`,
         `destination ${input.to}`,
-        `amount      ${input.amount} SOL = ${raw2} lamports`,
+        `amount      ${input.amount} SOL = ${raw3} lamports`,
         `mint        (native SOL)`
       ]
     };
@@ -84673,12 +85753,12 @@ async function planTransfer(input) {
     throw new VaultError("VAULT_UNREADABLE", `Could not read mint ${mintAddress}: ${asMessage(error)}`);
   }
   const decimals = profile.decimals;
-  const source = ataFor(profile, fromKey);
-  const raw = max ? tokenAccountAmount((await rpc.getAccountInfo(encodePubkey(source)))?.data ?? new Uint8Array) : decimalToRaw4(input.amount, decimals);
-  if (max && raw === 0n) {
+  const source2 = ataFor(profile, fromKey);
+  const raw2 = max ? tokenAccountAmount((await rpc.getAccountInfo(encodePubkey(source2)))?.data ?? new Uint8Array) : decimalToRaw4(input.amount, decimals);
+  if (max && raw2 === 0n) {
     throw new VaultError("TRANSFER_INSUFFICIENT_FUNDS", `${input.from} holds no ${input.asset} in its source token account; max leaves nothing to send. Nothing was signed or sent.`);
   }
-  if (raw === null || raw === 0n) {
+  if (raw2 === null || raw2 === 0n) {
     throw new VaultError("VAULT_INDEX_INVALID", `--amount must be max or a positive decimal with at most ${decimals} decimal places.`);
   }
   const mint = decodePubkey(mintAddress);
@@ -84694,9 +85774,9 @@ async function planTransfer(input) {
     instructions.push(createAssociatedTokenAccountIdempotent({ payer: fromKey, owner: toKey, mint, tokenProgram }));
     accountCreationLines.push(`create associated token account ${encodePubkey(destination)} (idempotent)`, `account owner ${input.to}`, `account rent ${rent} lamports, paid by ${input.from} if created`);
   }
-  const sourceState = await tokenAccountFrozen(rpc, encodePubkey(source));
+  const sourceState = await tokenAccountFrozen(rpc, encodePubkey(source2));
   const riskLines = profile.risks.map((risk) => `warning     ${risk.message}`);
-  const hook = await resolveTransferHookAccounts(rpc, { profile, source, destination, owner: fromKey, amount: raw });
+  const hook = await resolveTransferHookAccounts(rpc, { profile, source: source2, destination, owner: fromKey, amount: raw2 });
   const hookLines = [];
   if (profile.transferHookProgram) {
     hookLines.push(hook.ok ? `hook        ${profile.transferHookProgram}: ${hook.accounts.length} extra account(s) resolved` : `hook        ${profile.transferHookProgram}: extra accounts could NOT be resolved (${hook.reason}); the send is expected to fail as TOKEN_2022_EXTRA_ACCOUNTS_MISSING`);
@@ -84704,29 +85784,29 @@ async function planTransfer(input) {
   const feeLines = [];
   if (profile.newerTransferFee || profile.olderTransferFee) {
     const epoch2 = await rpc.getEpoch();
-    const { feeRaw, postFeeAmountRaw } = transferFeeFor(profile, raw, epoch2);
+    const { feeRaw, postFeeAmountRaw } = transferFeeFor(profile, raw2, epoch2);
     feeLines.push(`post-fee    ${postFeeAmountRaw} raw arrives (${feeRaw} raw withheld by the mint at epoch ${epoch2})`);
   }
   instructions.push(tokenTransferChecked({
-    source,
+    source: source2,
     mint,
     destination,
     owner: fromKey,
-    amount: raw,
+    amount: raw2,
     decimals,
     tokenProgram,
     extraAccounts: hook.ok ? hook.accounts : []
   }));
   return {
     asset: asset === "USDC" ? "USDC" : mintAddress,
-    amount: max ? rawToDecimal2(raw, decimals) : input.amount,
-    amountRaw: raw,
+    amount: max ? rawToDecimal2(raw2, decimals) : input.amount,
+    amountRaw: raw2,
     decimals,
     mint: mintAddress,
     from: input.from,
     to: input.to,
     instructions,
-    sourceTokenAccount: encodePubkey(source),
+    sourceTokenAccount: encodePubkey(source2),
     ...accountRent !== undefined ? { accountRent } : {},
     token: {
       profile,
@@ -84736,7 +85816,7 @@ async function planTransfer(input) {
     displayLines: [
       `fee payer   ${input.from}`,
       `destination ${input.to}`,
-      `amount      ${max ? rawToDecimal2(raw, decimals) : input.amount} (${raw} raw, ${decimals} dp)${max ? " (max)" : ""}`,
+      `amount      ${max ? rawToDecimal2(raw2, decimals) : input.amount} (${raw2} raw, ${decimals} dp)${max ? " (max)" : ""}`,
       `mint        ${mintAddress}`,
       `program     ${profile.tokenProgram}${profile.token2022 ? " (Token-2022)" : ""}`,
       ...accountCreationLines,
@@ -84925,18 +86005,18 @@ function createTransferChain(chainDeps) {
         rpc: solanaRpc
       }));
       const fee = await deps.solana.read(() => quoteTransferFee(solanaRpc, draft.from, draft.instructions)) ?? FALLBACK_FEE_LAMPORTS2;
-      const raw2 = balance - fee;
-      if (raw2 <= 0n)
+      const raw3 = balance - fee;
+      if (raw3 <= 0n)
         throw refused("TRANSFER_INSUFFICIENT_FUNDS", `${params.source.address} holds no SOL above the fee; max leaves nothing to send.`);
-      return { raw: raw2, decimals: 9 };
+      return { raw: raw3, decimals: 9 };
     }
     const profile = await deps.solana.read(() => readMintProfile(solanaRpc, asset === "USDC" ? USDC_MINT2 : asset));
-    const source = encodePubkey(ataFor(profile, decodePubkey(params.source.address)));
-    const account = await deps.solana.read(() => solanaRpc.getAccountInfo(source));
-    const raw = account === null ? 0n : tokenAccountAmount2(account.data);
-    if (raw === 0n)
+    const source2 = encodePubkey(ataFor(profile, decodePubkey(params.source.address)));
+    const account = await deps.solana.read(() => solanaRpc.getAccountInfo(source2));
+    const raw2 = account === null ? 0n : tokenAccountAmount2(account.data);
+    if (raw2 === 0n)
       throw refused("TRANSFER_INSUFFICIENT_FUNDS", `${params.source.address} holds none of this token; there is nothing to send.`);
-    return { raw, decimals: profile.decimals };
+    return { raw: raw2, decimals: profile.decimals };
   }
   async function solanaDecimals(asset) {
     const name = solanaAsset2(asset);
@@ -84945,11 +86025,11 @@ function createTransferChain(chainDeps) {
     return (await deps.solana.read(() => readMintProfile(solanaRpc, name === "USDC" ? USDC_MINT2 : name))).decimals;
   }
   async function solanaPlan(params) {
-    const { raw, decimals } = "max" in params.amount ? await solanaMax(params) : { raw: BigInt(params.amount.raw), decimals: await solanaDecimals(params.asset) };
+    const { raw: raw2, decimals } = "max" in params.amount ? await solanaMax(params) : { raw: BigInt(params.amount.raw), decimals: await solanaDecimals(params.asset) };
     return deps.solana.read(() => planTransfer({
       from: params.source.address,
       to: params.to,
-      amount: rawToDecimal(raw, decimals),
+      amount: rawToDecimal(raw2, decimals),
       asset: solanaAsset2(params.asset),
       rpc: solanaRpc
     }));
@@ -85390,8 +86470,8 @@ async function prepare(params, call2, deps) {
   }
   const label = assetLabel(parsed.asset);
   const max = "max" in parsed.amount;
-  const raw = max ? preview?.maxRaw ?? "" : parsed.amount.raw;
-  const decimal4 = max ? "max" : rawToDecimal(BigInt(raw), decimals);
+  const raw2 = max ? preview?.maxRaw ?? "" : parsed.amount.raw;
+  const decimal4 = max ? "max" : rawToDecimal(BigInt(raw2), decimals);
   const display = {
     sourceKind: parsed.source.kind,
     source: parsed.source.address,
@@ -85404,7 +86484,7 @@ async function prepare(params, call2, deps) {
     asset: { label, contract: assetContract(parsed.asset) },
     amount: {
       decimal: decimal4,
-      raw: max ? "max" : raw,
+      raw: max ? "max" : raw2,
       ...max ? { max: true } : {},
       ...max && preview?.maxRaw ? { balanceAtPreview: rawToDecimal(BigInt(preview.maxRaw), decimals) } : {}
     },
@@ -85673,13 +86753,13 @@ ${USAGE5}`, json);
     redactor.add(tokens.viewToken);
     const vaultPath = defaultVaultPath(deps.env, deps.homedir());
     const requireVault = async () => {
-      const raw = await readVaultRaw(vaultPath);
-      if (raw === null)
+      const raw2 = await readVaultRaw(vaultPath);
+      if (raw2 === null)
         throw refused("VAULT_REQUIRED", "Trading from the TUI needs a vault on this machine. Run candle vault init.");
-      return raw;
+      return raw2;
     };
-    const unlockWithSecurityKey = async (raw, pin, reason) => {
-      const file = parseVaultFile(raw);
+    const unlockWithSecurityKey = async (raw2, pin, reason) => {
+      const file = parseVaultFile(raw2);
       const envelope = file.envelopes.find(isCtap2Envelope);
       if (envelope === undefined)
         throw new FactorUnavailableError("no security key is enrolled in this vault.");
@@ -85692,7 +86772,7 @@ ${USAGE5}`, json);
         });
         const prfOutput = await assertPrf(sessionDeps, session, envelope, file.vaultId, reason);
         try {
-          return await unlockVault(vaultPath, raw, { factor: "passkey-prf", envelopeId: envelope.id, prfOutput });
+          return await unlockVault(vaultPath, raw2, { factor: "passkey-prf", envelopeId: envelope.id, prfOutput });
         } finally {
           wipe(prfOutput);
         }
@@ -85727,14 +86807,14 @@ ${USAGE5}`, json);
       now: deps.now,
       slotExists: async () => (await Promise.resolve().then(() => (init_ownership(), exports_ownership))).slotExists(paths),
       async unlockVault(factor, reason) {
-        const raw = await requireVault();
+        const raw2 = await requireVault();
         if (factor.type === "security-key") {
-          return openVaultOf(await unlockWithSecurityKey(raw, factor.pin, reason ?? "unlock the vault"));
+          return openVaultOf(await unlockWithSecurityKey(raw2, factor.pin, reason ?? "unlock the vault"));
         }
         if (factor.type !== "passphrase")
           throw new FactorUnavailableError(CORE_HELPER_REASON);
         try {
-          return openVaultOf(await unlockWithPassphrase(vaultPath, raw, factor.value));
+          return openVaultOf(await unlockWithPassphrase(vaultPath, raw2, factor.value));
         } catch (error) {
           if (error instanceof VaultError && error.code === "VAULT_UNLOCK_FAILED")
             throw new FactorRejectedError;
@@ -85742,10 +86822,10 @@ ${USAGE5}`, json);
         }
       },
       async listFactors() {
-        const raw = await readVaultRaw(vaultPath);
-        if (raw === null)
+        const raw2 = await readVaultRaw(vaultPath);
+        if (raw2 === null)
           return [{ type: "passphrase", usable: true }];
-        return factorOptions(parseVaultFile(raw).envelopes, await currentPlatformFacts(deps));
+        return factorOptions(parseVaultFile(raw2).envelopes, await currentPlatformFacts(deps));
       },
       openSlot: async (vault) => {
         const contents = await openCoreSlot({ paths, vault, profile, environment, purpose: "trading" });
@@ -86830,7 +87910,7 @@ async function readTargetSigner(ctx, deviceToken, keyPrefix) {
   const callingPrefix = apiKey !== undefined ? apiKeyPrefix(apiKey) : undefined;
   return { ok: true, keySigner: { ...active, crossKey: callingPrefix !== keyPrefix } };
 }
-async function preflightToKey(ctx, raw, opts) {
+async function preflightToKey(ctx, raw2, opts) {
   const { deps, json } = ctx;
   const refuse3 = (failure3) => {
     writeLocalFailure(deps, failure3, json);
@@ -86848,14 +87928,14 @@ async function preflightToKey(ctx, raw, opts) {
     });
   }
   const keys = listing.body?.keys ?? [];
-  const resolved = await resolveTargetKey(ctx, deviceToken, raw, { keys });
+  const resolved = await resolveTargetKey(ctx, deviceToken, raw2, { keys });
   if (!resolved.ok)
     return { ok: false, exit: resolved.code };
   const keyPrefix = resolved.keyPrefix;
   const row2 = keys.find((key) => key.keyPrefix === keyPrefix);
-  const refusal3 = targetKeyRefusal(row2, keyPrefix, deps.now());
-  if (refusal3 !== null)
-    return refuse3(refusal3);
+  const refusal4 = targetKeyRefusal(row2, keyPrefix, deps.now());
+  if (refusal4 !== null)
+    return refuse3(refusal4);
   const target = row2;
   const walletScope = target.walletScope === "selected" ? "selected" : "all";
   if (walletScope === "selected") {
@@ -86918,10 +87998,10 @@ async function readSelectedScopeRoom(ctx, keyPrefix) {
     return { ok: true, held: served.rows, max: served.max, heldLabels };
   return { ok: true, held: wallets2.length, max: SELECTED_SCOPE_LIMIT, heldLabels };
 }
-function servedScopeLimit(raw) {
-  if (typeof raw !== "object" || raw === null)
+function servedScopeLimit(raw2) {
+  if (typeof raw2 !== "object" || raw2 === null)
     return null;
-  const { max, rows } = raw;
+  const { max, rows } = raw2;
   if (typeof max !== "number" || !Number.isInteger(max) || max < 0)
     return null;
   if (typeof rows !== "number" || !Number.isInteger(rows) || rows < 0)
@@ -87646,16 +88726,16 @@ async function keysSignerMove(args, ctx) {
   const apiKey = await resolveApiKey(deps, ctx.profile);
   const deviceToken = await resolveDeviceToken(deps, ctx.profile);
   const ownKeyPrefix = apiKey !== undefined ? apiKeyPrefix(apiKey) : undefined;
-  let source;
+  let source2;
   let auth;
   if (apiKey !== undefined && toKeyRaw === undefined && (sourceRaw === ownKeyPrefix || sourceRaw === "self")) {
-    source = ownKeyPrefix ?? sourceRaw;
+    source2 = ownKeyPrefix ?? sourceRaw;
     auth = { apiKey };
   } else if (deviceToken !== undefined) {
     const resolved = await resolveTargetKey(ctx, deviceToken, sourceRaw, { codePrefix: "KEY_SIGNER" });
     if (!resolved.ok)
       return resolved.code;
-    source = resolved.keyPrefix;
+    source2 = resolved.keyPrefix;
     auth = { deviceToken };
   } else if (apiKey !== undefined && toKeyRaw === undefined) {
     const self = await readSigner(ctx, "self", { apiKey });
@@ -87669,7 +88749,7 @@ async function keysSignerMove(args, ctx) {
       }, json);
       return 1;
     }
-    source = view2.keyPrefix;
+    source2 = view2.keyPrefix;
     auth = { apiKey };
   } else {
     writeScreenLocalFailure(deps, toKeyRaw !== undefined ? DEVICE_TOKEN_REQUIRED : {
@@ -87678,8 +88758,8 @@ async function keysSignerMove(args, ctx) {
     }, json);
     return 1;
   }
-  if (!KEY_PREFIX_RE.test(source)) {
-    writeScreenUsageFailure(deps, `Not a key prefix: ${source}. ${USAGE_KEYS_SIGNER}`, json);
+  if (!KEY_PREFIX_RE.test(source2)) {
+    writeScreenUsageFailure(deps, `Not a key prefix: ${source2}. ${USAGE_KEYS_SIGNER}`, json);
     return 2;
   }
   if (toKeyRaw !== undefined) {
@@ -87687,9 +88767,9 @@ async function keysSignerMove(args, ctx) {
       writeScreenLocalFailure(deps, DEVICE_TOKEN_REQUIRED, json);
       return 1;
     }
-    return moveToLiveKey(ctx, deviceToken, source, toKeyRaw);
+    return moveToLiveKey(ctx, deviceToken, source2, toKeyRaw);
   }
-  const read = await readSigner(ctx, "apiKey" in auth ? "self" : source, auth);
+  const read = await readSigner(ctx, "apiKey" in auth ? "self" : source2, auth);
   if (!read.ok)
     return writeSignerReadFailure(ctx, read);
   const view = read.body;
@@ -87697,8 +88777,8 @@ async function keysSignerMove(args, ctx) {
   if (active === null) {
     writeScreenLocalFailure(deps, {
       code: "KEY_SIGNER_MISSING",
-      message: `Key ${source} has no active signer, so there is nothing to move its wallets onto. Nothing changed.`,
-      suggestion: `Approve one first (candle tee signer new --key ${source} on the trading machine), or, for a revoked key, move the wallets to a live key: candle keys signer move ${source} --to-key <prefix|label> (device token).`
+      message: `Key ${source2} has no active signer, so there is nothing to move its wallets onto. Nothing changed.`,
+      suggestion: `Approve one first (candle tee signer new --key ${source2} on the trading machine), or, for a revoked key, move the wallets to a live key: candle keys signer move ${source2} --to-key <prefix|label> (device token).`
     }, json);
     return 1;
   }
@@ -87740,7 +88820,7 @@ async function keysSignerMove(args, ctx) {
     }
   }
   const cleanup = await deleteDrainedSlots(ctx, {
-    source,
+    source: source2,
     auth,
     deviceToken,
     apiKey,
@@ -87748,19 +88828,19 @@ async function keysSignerMove(args, ctx) {
     targetQuorumId: active.signerQuorumId
   });
   return reportMove(ctx, {
-    source,
-    target: { keyPrefix: source, fingerprint: active.fingerprint },
+    source: source2,
+    target: { keyPrefix: source2, fingerprint: active.fingerprint },
     alreadyOn: view.wallets.onSigner.length,
     outcomes,
     cleanup
   });
 }
-async function moveToLiveKey(ctx, deviceToken, source, toKeyRaw) {
+async function moveToLiveKey(ctx, deviceToken, source2, toKeyRaw) {
   const { deps, json } = ctx;
   const target = await resolveTargetKey(ctx, deviceToken, toKeyRaw, { codePrefix: "KEY_SIGNER" });
   if (!target.ok)
     return target.code;
-  const read = await readSigner(ctx, source, { deviceToken });
+  const read = await readSigner(ctx, source2, { deviceToken });
   if (!read.ok)
     return writeSignerReadFailure(ctx, read);
   const ids = allSignerWallets(read.body).map((w) => w.id);
@@ -87810,7 +88890,7 @@ async function moveToLiveKey(ctx, deviceToken, source, toKeyRaw) {
       else if ("changed" in committed)
         writeScreenLocalFailure(deps, committed.changed, json);
       else
-        writeScreenLocalFailure(deps, rebindFailureDetails(committed.result, { fromKeyPrefixes: [source] }), json);
+        writeScreenLocalFailure(deps, rebindFailureDetails(committed.result, { fromKeyPrefixes: [source2] }), json);
       return 1;
     }
     for (const row2 of committed.result.body.rebound) {
@@ -87820,9 +88900,9 @@ async function moveToLiveKey(ctx, deviceToken, source, toKeyRaw) {
 `.trim());
     }
   }
-  const cleanup = await deleteDrainedSlots(ctx, { source, auth: { deviceToken }, deviceToken, apiKey: undefined, used });
+  const cleanup = await deleteDrainedSlots(ctx, { source: source2, auth: { deviceToken }, deviceToken, apiKey: undefined, used });
   return reportMove(ctx, {
-    source,
+    source: source2,
     target: { keyPrefix: target.keyPrefix, fingerprint: toKey?.signer?.fingerprint ?? null },
     alreadyOn: 0,
     outcomes,
@@ -88241,8 +89321,8 @@ var DOCTOR_ROW_IDS = {
   "Key rotation": "key_rotation"
 };
 var API_KEY_CHECK = "API key valid";
-function keyRotationRow(until, source) {
-  const fix = source === "CANDLE_API_KEY_FILE" ? "replace the old secret in CANDLE_API_KEY_FILE and restart MCP; the CLI did not update the file" : source === "CANDLE_API_KEY" ? "update CANDLE_API_KEY where this key is deployed to the new secret" : "store the new secret with candle auth login, or rotate from this profile with candle keys rotate";
+function keyRotationRow(until, source2) {
+  const fix = source2 === "CANDLE_API_KEY_FILE" ? "replace the old secret in CANDLE_API_KEY_FILE and restart MCP; the CLI did not update the file" : source2 === "CANDLE_API_KEY" ? "update CANDLE_API_KEY where this key is deployed to the new secret" : "store the new secret with candle auth login, or rotate from this profile with candle keys rotate";
   return {
     check: "Key rotation",
     state: "WARN",
@@ -88438,17 +89518,17 @@ async function doctor(args, ctx) {
     state: "FAIL",
     detail: "No credential found. Fix: run candle auth login, or export CANDLE_API_KEY."
   });
-  const source = (value, envName) => deps.env[envName]?.trim() ? envName : value ? ctx.profile ? `profile ${ctx.profile}` : "legacy store" : "none";
+  const source2 = (value, envName) => deps.env[envName]?.trim() ? envName : value ? ctx.profile ? `profile ${ctx.profile}` : "legacy store" : "none";
   const provenance = {
     apiUrl: {
       value: apiUrl,
       source: ctx.apiUrlFlag !== undefined ? "--api-url" : deps.env.CANDLE_API_URL?.trim() ? "CANDLE_API_URL" : ctx.profile && config.profiles?.[ctx.profile]?.apiUrl?.trim() ? `profile ${ctx.profile}` : config.apiUrl?.trim() ? "config" : "default"
     },
     apiKey: {
-      source: apiCredential?.source === "file" ? "CANDLE_API_KEY_FILE" : source(apiKey, "CANDLE_API_KEY"),
+      source: apiCredential?.source === "file" ? "CANDLE_API_KEY_FILE" : source2(apiKey, "CANDLE_API_KEY"),
       prefix: apiKey ? apiKeyPrefix(apiKey) ?? null : null
     },
-    deviceToken: { source: source(deviceToken, "CANDLE_DEVICE_TOKEN") }
+    deviceToken: { source: source2(deviceToken, "CANDLE_DEVICE_TOKEN") }
   };
   rows.push({ check: "API URL", state: "PASS", detail: `${apiUrl} (from ${provenance.apiUrl.source})` }, {
     check: "API key",
@@ -91062,10 +92142,10 @@ function parsePath(path) {
     throw new VaultError("VAULT_INDEX_INVALID", `Not a derivation path: ${path}`);
   return parts.slice(1).map((part) => {
     const hardened = part.endsWith("'") || part.endsWith("h");
-    const raw = hardened ? part.slice(0, -1) : part;
-    if (!/^\d+$/.test(raw))
+    const raw2 = hardened ? part.slice(0, -1) : part;
+    if (!/^\d+$/.test(raw2))
       throw new VaultError("VAULT_INDEX_INVALID", `Not a derivation path element: ${part}`);
-    const index = Number(raw);
+    const index = Number(raw2);
     if (!hardened) {
       throw new VaultError("VAULT_INDEX_INVALID", `SLIP-0010 Ed25519 has no non-hardened children; ${path} asks for one.`);
     }
@@ -91281,7 +92361,7 @@ async function sweepEverythingTo(input) {
     try {
       const tokenProgram = decodePubkey(acct.programId);
       const mint = decodePubkey(acct.mint);
-      const source = decodePubkey(acct.pubkey);
+      const source2 = decodePubkey(acct.pubkey);
       const destinationAta = associatedTokenAddress(destinationKey, mint, tokenProgram);
       const instructions = [];
       const amount = BigInt(acct.amountRaw);
@@ -91294,7 +92374,7 @@ async function sweepEverythingTo(input) {
           profile = await readMintProfile(rpc, acct.mint);
           const hook = await resolveTransferHookAccounts(rpc, {
             profile,
-            source,
+            source: source2,
             destination: destinationAta,
             owner: ownerKey,
             amount
@@ -91321,7 +92401,7 @@ async function sweepEverythingTo(input) {
           destinationFrozen = existing.data[TOKEN_ACCOUNT_STATE_OFFSET3] === TOKEN_ACCOUNT_STATE_FROZEN3;
         }
         instructions.push(tokenTransferChecked({
-          source,
+          source: source2,
           mint,
           destination: destinationAta,
           owner: ownerKey,
@@ -91331,7 +92411,7 @@ async function sweepEverythingTo(input) {
           extraAccounts
         }));
       }
-      instructions.push(tokenCloseAccount({ account: source, destination: ownerKey, owner: ownerKey, tokenProgram }));
+      instructions.push(tokenCloseAccount({ account: source2, destination: ownerKey, owner: ownerKey, tokenProgram }));
       const kind = amount > 0n ? "token" : "close";
       const outcome = await broadcastAndFinalize2(rpc, ctx, secret64, ownerKey, instructions);
       if (outcome.status === "finalized") {
@@ -91496,8 +92576,8 @@ async function vaultNewKey(args, ctx) {
     return usage2(ctx, batch.error);
   const batchRequested = parsed.values["--count"] !== undefined || labelsFile !== undefined;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     const vault = hold(opened.vault);
@@ -91653,11 +92733,11 @@ function nextAllocatableIndex(counter, exposed) {
   return index;
 }
 async function verifyWrittenFromDisk(vault, address, keyId, chain2 = "solana") {
-  const raw = await readVaultRaw(vault.path);
-  if (raw === null) {
+  const raw2 = await readVaultRaw(vault.path);
+  if (raw2 === null) {
     throw new VaultError("VAULT_WRITE_FAILED", `The vault at ${vault.path} could not be read back after the write.`);
   }
-  const onDisk = { ...vault, raw, file: parseVaultFile(raw) };
+  const onDisk = { ...vault, raw: raw2, file: parseVaultFile(raw2) };
   const secret = await decryptKey(onDisk, keyId);
   try {
     if (!sameAddress4(chain2, addressOfSecret(chain2, secret), address)) {
@@ -91668,10 +92748,10 @@ async function verifyWrittenFromDisk(vault, address, keyId, chain2 = "solana") {
   }
 }
 async function verifyWritten(path, address, keyId, reopen, _ctx, chain2 = "solana") {
-  const raw = await readVaultRaw(path);
-  if (raw === null)
+  const raw2 = await readVaultRaw(path);
+  if (raw2 === null)
     throw new VaultError("VAULT_WRITE_FAILED", `The vault at ${path} could not be read back after the write.`);
-  const reopened = await reopen(path, raw);
+  const reopened = await reopen(path, raw2);
   try {
     const secret = await decryptKey(reopened, keyId);
     try {
@@ -91716,8 +92796,8 @@ async function externalNew(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     const vault = hold(opened.vault);
@@ -91818,8 +92898,8 @@ async function externalList(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const vault = hold((await unlockInteractively(promptCtx, path, raw, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const vault = hold((await unlockInteractively(promptCtx, path, raw2, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
     const externals = vault.index.entries.filter((entry2) => entry2.role === "external");
     const rows = externals.map((entry2) => ({
       address: entry2.address,
@@ -91858,8 +92938,8 @@ async function externalSweep(args, ctx) {
   });
   if ("error" in parsed)
     return usage2(ctx, parsed.error);
-  const [source, extra] = parsed.positionals;
-  if (!source || extra !== undefined) {
+  const [source2, extra] = parsed.positionals;
+  if (!source2 || extra !== undefined) {
     return usage2(ctx, "Usage: candle external sweep <external> --to <vault> [--rpc-url <url>]");
   }
   const to = parsed.values["--to"];
@@ -91878,15 +92958,15 @@ async function externalSweep(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
-      reason: describeSend(`everything from ${source}`, undefined, to)
+      reason: describeSend(`everything from ${source2}`, undefined, to)
     });
     const vault = hold(opened.vault);
-    assertNotEvmEntry(vault.index, source, "external sweep");
+    assertNotEvmEntry(vault.index, source2, "external sweep");
     assertNotEvmEntry(vault.index, to, "external sweep");
-    const sourceEntry = requireExternalEntry(vault.index, source);
+    const sourceEntry = requireExternalEntry(vault.index, source2);
     const destination = findVaultRoleEntry(vault.index, to);
     if (destination === undefined || destination.role !== "vault") {
       const other = vault.index.entries.find((candidate) => candidate.label === to || candidate.address === to);
@@ -91959,12 +93039,12 @@ init_swap();
 var LIST_USAGE = "Usage: candle fees [--cursor <cursor>] [--limit <1-50>] [--json]";
 var CLAIM_USAGE = "Usage: candle fees claim <mint> [--dry-run] [--json]";
 function amountText(row2, missing) {
-  const raw = typeof row2.amountRaw === "string" && /^\d+$/.test(row2.amountRaw) ? row2.amountRaw : null;
-  if (raw === null)
+  const raw2 = typeof row2.amountRaw === "string" && /^\d+$/.test(row2.amountRaw) ? row2.amountRaw : null;
+  if (raw2 === null)
     return missing;
   const decimals = Number.isInteger(row2.decimals) ? row2.decimals : 0;
   const label = row2.symbol ? row2.symbol : row2.mint ?? "";
-  const value = decimalAmount(raw, decimals);
+  const value = decimalAmount(raw2, decimals);
   return `${value.includes(".") ? value.replace(/\.?0+$/, "") : value} ${safeText(label)}`.trim();
 }
 function amountsText(rows, missing) {
@@ -92635,12 +93715,12 @@ async function keysLimits(args, ctx) {
   for (const cap of caps) {
     const eq = cap.indexOf("=");
     const asset = (eq < 0 ? cap : cap.slice(0, eq)).toLowerCase();
-    const raw = eq < 0 ? "" : cap.slice(eq + 1);
+    const raw2 = eq < 0 ? "" : cap.slice(eq + 1);
     if (!(asset in KEY_LIMIT_ASSETS)) {
       writeScreenUsageFailure(deps, `The asset must be one of: ${Object.keys(KEY_LIMIT_ASSETS).join(", ")}.`, json);
       return 2;
     }
-    if (!RAW_AMOUNT.test(raw)) {
+    if (!RAW_AMOUNT.test(raw2)) {
       writeScreenUsageFailure(deps, `${asset}=<raw> takes a positive whole number of base units (${asset} has ${KEY_LIMIT_ASSETS[asset]} decimals), with no sign, decimal point or leading zero.`, json);
       return 2;
     }
@@ -92648,7 +93728,7 @@ async function keysLimits(args, ctx) {
       writeScreenUsageFailure(deps, `${asset} is named twice.`, json);
       return 2;
     }
-    limits.push({ asset, maxPerTxRaw: raw });
+    limits.push({ asset, maxPerTxRaw: raw2 });
   }
   await printIdentity(ctx);
   const apiKey = await resolveApiKey(deps, ctx.profile);
@@ -92776,18 +93856,18 @@ function pagePath(chain2, address, rest = "") {
 function refusalOf2(result2) {
   if (result2.ok)
     return null;
-  const raw = result2.raw;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw))
+  const raw2 = result2.raw;
+  if (!raw2 || typeof raw2 !== "object" || Array.isArray(raw2))
     return null;
-  const { success: success2, error, ...extra } = raw;
+  const { success: success2, error, ...extra } = raw2;
   if (success2 !== false || typeof error !== "string")
     return null;
   return { status: result2.status, code: error, extra };
 }
-function writeRefusal(ctx, refusal3, suggestion) {
-  const message = REFUSALS[refusal3.code] ?? `Candle refused the request (${refusal3.code}).`;
+function writeRefusal(ctx, refusal4, suggestion) {
+  const message = REFUSALS[refusal4.code] ?? `Candle refused the request (${refusal4.code}).`;
   if (ctx.json) {
-    ctx.deps.stdout.write(`${JSON.stringify({ ok: false, code: refusal3.code, status: refusal3.status, message, ...refusal3.extra, ...suggestion ? { suggestion } : {} })}
+    ctx.deps.stdout.write(`${JSON.stringify({ ok: false, code: refusal4.code, status: refusal4.status, message, ...refusal4.extra, ...suggestion ? { suggestion } : {} })}
 `);
     return;
   }
@@ -92795,9 +93875,9 @@ function writeRefusal(ctx, refusal3, suggestion) {
 `);
 }
 function writeApiFailure(ctx, result2, authType) {
-  const refusal3 = refusalOf2(result2);
-  if (refusal3) {
-    writeRefusal(ctx, refusal3);
+  const refusal4 = refusalOf2(result2);
+  if (refusal4) {
+    writeRefusal(ctx, refusal4);
     return 1;
   }
   const failure3 = result2;
@@ -92928,10 +94008,10 @@ function factValue(fact) {
   const value = fact.decimals ? rawUnits2(fact.raw, fact.decimals) : fact.raw;
   return `${value}${fact.unit === "token" ? "" : ` ${fact.unit}`} (${fact.status}, ${fact.coverage}, ${escapeTerminalText(fact.source)}${fact.measuredAt ? `, ${fact.measuredAt}` : ""})`;
 }
-function rawUnits2(raw, decimals) {
-  if (!/^\d+$/.test(raw))
-    return raw;
-  const padded = raw.padStart(decimals + 1, "0");
+function rawUnits2(raw2, decimals) {
+  if (!/^\d+$/.test(raw2))
+    return raw2;
+  const padded = raw2.padStart(decimals + 1, "0");
   const whole = padded.slice(0, padded.length - decimals);
   const fraction = padded.slice(padded.length - decimals).replace(/0+$/, "");
   return fraction ? `${whole}.${fraction}` : whole;
@@ -93080,9 +94160,9 @@ async function tokenClaim(args, ctx) {
   if (result2 === "unknown")
     return writeUnknown(ctx, idempotencyKey);
   if (!result2.ok) {
-    const refusal3 = refusalOf2(result2);
-    if (refusal3?.code === "invalid_signature" && creator && !challengeId) {
-      writeRefusal(ctx, refusal3, `This account's known wallets do not include the verified creator, so the claim needs a signed challenge: candle token claim ${address} --chain ${chain2} --creator --challenge`);
+    const refusal4 = refusalOf2(result2);
+    if (refusal4?.code === "invalid_signature" && creator && !challengeId) {
+      writeRefusal(ctx, refusal4, `This account's known wallets do not include the verified creator, so the claim needs a signed challenge: candle token claim ${address} --chain ${chain2} --creator --challenge`);
       return 1;
     }
     return writeApiFailure(ctx, result2, "key");
@@ -93226,10 +94306,10 @@ async function tokenSection(args, ctx) {
   if (result2 === "unknown")
     return writeUnknown(ctx, idempotencyKey);
   if (!result2.ok) {
-    const refusal3 = refusalOf2(result2);
-    if (refusal3?.code === "revision_conflict") {
-      const latest = refusal3.extra.latest;
-      writeRefusal(ctx, refusal3, `${latest?.revision !== undefined ? `The latest is revision ${latest.revision}. ` : ""}${action === "set" ? SECTION_SUGGESTION : "Rerun with --base-revision set to the latest revision."}`);
+    const refusal4 = refusalOf2(result2);
+    if (refusal4?.code === "revision_conflict") {
+      const latest = refusal4.extra.latest;
+      writeRefusal(ctx, refusal4, `${latest?.revision !== undefined ? `The latest is revision ${latest.revision}. ` : ""}${action === "set" ? SECTION_SUGGESTION : "Rerun with --base-revision set to the latest revision."}`);
       return EXIT_REVISION_CONFLICT;
     }
     return writeApiFailure(ctx, result2, "key");
@@ -93532,8 +94612,8 @@ var USAGE10 = `Usage: candle keys rotate <prefix|label> [--grace <duration> | --
        candle keys rotate <prefix|label> --finish`;
 var MAX_GRACE_SECONDS = 86400;
 var DEFAULT_GRACE_SECONDS = 3600;
-function parseGrace(raw) {
-  const match = raw.trim().match(/^(\d+)(s|m|h)?$/);
+function parseGrace(raw2) {
+  const match = raw2.trim().match(/^(\d+)(s|m|h)?$/);
   const bad = { ok: false, message: "--grace must be a duration such as 0, 90s, 30m or 24h (at most 24h)." };
   if (!match)
     return bad;
@@ -93912,12 +94992,12 @@ async function keysWalletsSet(args, ctx) {
     writeScreenUsageFailure(deps, "Usage: candle keys wallets set <prefix> --wallets <id,id,...>", json);
     return 2;
   }
-  const raw = parsed.values["--wallets"];
-  if (raw === undefined) {
+  const raw2 = parsed.values["--wallets"];
+  if (raw2 === undefined) {
     writeScreenUsageFailure(deps, 'Missing --wallets. Pass a comma-separated list, or "" to assign none.', json);
     return 2;
   }
-  const walletIds = raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  const walletIds = raw2.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
   await printIdentity(ctx);
   const apiKey = await resolveApiKey(deps, ctx.profile);
   if (!apiKey) {
@@ -94122,7 +95202,7 @@ init_presentation();
 init_render();
 var PRODUCTION_KEY_MESSAGE = "The lab needs a production agent key. Create one with `candle keys create`.";
 var REPLAY_USAGE = "Usage: candle lab replay --definition <file|-> --from <iso> --to <iso> [--asset-ids a,b] [--fee-bps n] [--slippage-bps n] [--no-wait]";
-function object3(value) {
+function object4(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 function text3(value) {
@@ -94157,14 +95237,14 @@ async function client(ctx) {
   }
 }
 function failure3(answer2, ctx, statusRoute = false) {
-  const { refusal: refusal3 } = answer2;
-  if (ctx.json && refusal3.body !== undefined)
-    ctx.deps.stdout.write(`${JSON.stringify(refusal3.body)}
+  const { refusal: refusal4 } = answer2;
+  if (ctx.json && refusal4.body !== undefined)
+    ctx.deps.stdout.write(`${JSON.stringify(refusal4.body)}
 `);
   else {
-    const body = object3(refusal3.body);
-    const message = statusRoute && refusal3.status === 404 ? "the lab on this server predates `candle lab status`" : `${refusal3.message}${refusal3.status === 429 && body.resets_at ? ` Resets at ${text3(body.resets_at)}.` : ""}`;
-    writeLocalFailure(ctx.deps, { code: refusal3.code, message: terminalText(message) }, ctx.json);
+    const body = object4(refusal4.body);
+    const message = statusRoute && refusal4.status === 404 ? "the lab on this server predates `candle lab status`" : `${refusal4.message}${refusal4.status === 429 && body.resets_at ? ` Resets at ${text3(body.resets_at)}.` : ""}`;
+    writeLocalFailure(ctx.deps, { code: refusal4.code, message: terminalText(message) }, ctx.json);
   }
   return 1;
 }
@@ -94173,11 +95253,11 @@ function replayOutput(body, ctx) {
     ctx.deps.stdout.write(`${JSON.stringify(body)}
 `);
   else {
-    const result2 = object3(body.result);
-    const lead = object3(result2.lead_card);
+    const result2 = object4(body.result);
+    const lead = object4(result2.lead_card);
     if (Object.keys(lead).length) {
-      const control = object3(lead.control);
-      const breakEven = object3(lead.break_even);
+      const control = object4(lead.control);
+      const breakEven = object4(lead.break_even);
       writeFields(ctx.deps, "stdout", [
         [
           "Control",
@@ -94187,7 +95267,7 @@ function replayOutput(body, ctx) {
           "Break-even",
           `${text3(breakEven.cost_bps_per_side)} bps per side; ${text3(breakEven.round_trip_pct)}% round trip`
         ],
-        ["Regime", text3(object3(lead.regime).label)],
+        ["Regime", text3(object4(lead.regime).label)],
         ["Summary", text3(lead.summary)]
       ], "Lead card");
       if (lead.insufficient === true)
@@ -94254,7 +95334,7 @@ async function memberFee(ctx, apiKey) {
     env: ctx.deps.env,
     fetch: (input, init) => ctx.deps.fetch(input, { ...init, signal: AbortSignal.timeout(1e4) })
   });
-  const fee = answer2.ok ? object3(answer2.body).feeBps : undefined;
+  const fee = answer2.ok ? object4(answer2.body).feeBps : undefined;
   return typeof fee === "number" && Number.isInteger(fee) && fee >= 0 && fee <= 1000 ? fee : undefined;
 }
 async function labReplay(args, ctx) {
@@ -94313,8 +95393,8 @@ ${REPLAY_USAGE}`);
   }
   let definition;
   try {
-    const source = stdin ? new TextDecoder().decode(await ctx.deps.readStdin()) : await ctx.deps.readFile(v["--definition"]);
-    const value = JSON.parse(source);
+    const source2 = stdin ? new TextDecoder().decode(await ctx.deps.readStdin()) : await ctx.deps.readFile(v["--definition"]);
+    const value = JSON.parse(source2);
     if (value === null || typeof value !== "object" || Array.isArray(value))
       throw new Error("Invalid definition");
     definition = value;
@@ -94391,7 +95471,7 @@ async function report(args, ctx, kind) {
     if (kind === "edges")
       ctx.deps.stdout.write(`Edges net of ${text3(body.cost_pct)}% round-trip cost (server's table).
 `);
-    const rows = Array.isArray(list) ? list.map((row2) => columns.map((column) => text3(object3(row2)[column]))) : [];
+    const rows = Array.isArray(list) ? list.map((row2) => columns.map((column) => text3(object4(row2)[column]))) : [];
     if (!rows.length)
       ctx.deps.stdout.write(`No ${kind} in this window.
 `);
@@ -94421,10 +95501,10 @@ function feeWalletGiven(flags) {
 function feeWalletSelection(flags) {
   if (!feeWalletGiven(flags))
     return;
-  const raw = flags["--fee-wallet"];
-  if (raw === undefined)
+  const raw2 = flags["--fee-wallet"];
+  if (raw2 === undefined)
     throw new Error("--fee-wallet-multisig needs --fee-wallet <address>, the vault fees earn to");
-  const bytes = decodeAddress(raw, "--fee-wallet");
+  const bytes = decodeAddress(raw2, "--fee-wallet");
   const feeWallet = encodePubkey(bytes);
   if (isOnCurve(bytes)) {
     if (flags["--fee-wallet-multisig"] !== undefined || flags["--fee-wallet-multisig-vault-index"] !== undefined)
@@ -94645,6 +95725,69 @@ function readLaunchBundle(args) {
 
 // src/launch-check.ts
 init_zod();
+
+// src/launch-quote-check.ts
+init_zod();
+init_trading();
+var check = exports_external.object({
+  check: exports_external.string(),
+  status: exports_external.enum(["pass", "skip", "refuse"]),
+  code: exports_external.string().optional(),
+  message: exports_external.string()
+});
+var launchQuoteCheckSchema = exports_external.object({
+  requested: exports_external.string(),
+  ok: exports_external.boolean(),
+  chain: exports_external.enum(["solana", "hood"]).optional(),
+  address: exports_external.string().optional(),
+  symbol: exports_external.string().optional(),
+  decimals: exports_external.number().int().min(0).max(255).optional(),
+  classification: exports_external.enum(["ordinary", "featured", "trusted", "stock"]).optional(),
+  checks: exports_external.array(check).min(1),
+  economics: exports_external.object({
+    kind: exports_external.enum(["fixed", "derived"]),
+    economicsDigest: exports_external.string().regex(/^0x[0-9a-fA-F]{64}$/),
+    thresholdRaw: exports_external.string().regex(/^\d+$/),
+    startFdv: exports_external.number().finite().positive(),
+    bondingFdv: exports_external.number().finite().positive(),
+    curve: exports_external.record(exports_external.string().regex(/^\d+$/)),
+    priceUsd: exports_external.number().finite().positive().optional(),
+    raiseUsd: exports_external.number().finite().positive().optional()
+  }).optional(),
+  disclosure: exports_external.string().nullable(),
+  executionEnabled: exports_external.boolean()
+}).superRefine((quote, ctx) => {
+  if (quote.ok && (!quote.economics || !quote.address || !quote.chain || quote.decimals === undefined || quote.checks.some((c) => c.status === "refuse")))
+    ctx.addIssue({ code: "custom", message: "An admitted quote needs complete economics and passing checks" });
+  if (!quote.ok && !quote.checks.some((c) => c.status === "refuse"))
+    ctx.addIssue({ code: "custom", message: "A refused quote needs a named check" });
+});
+function launchQuoteLines(quote) {
+  const symbol = safeText(quote.symbol ?? quote.requested);
+  const lines = [
+    `Quote ${symbol}${quote.address ? ` (${safeText(quote.address)})` : ""}: ${quote.ok ? "admitted" : "refused"}.`
+  ];
+  for (const c of quote.checks)
+    lines.push(`  ${c.status.toUpperCase()} ${safeText(c.code ?? c.check)}: ${safeText(c.message)}`);
+  const e = quote.economics;
+  if (e) {
+    const raise = quote.decimals === undefined ? `${e.thresholdRaw} raw` : decimalAmount(e.thresholdRaw, quote.decimals).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+    lines.push(`Curve (${e.kind}): starting FDV ${e.startFdv} ${symbol}; graduation FDV ${e.bondingFdv} ${symbol}.`);
+    lines.push(`Graduation raise: ${raise} ${symbol}${e.raiseUsd === undefined ? "" : ` ($${e.raiseUsd})`}.`);
+    if (e.priceUsd !== undefined)
+      lines.push(`Quote price: $${e.priceUsd}.`);
+    for (const [key, value] of Object.entries(e.curve))
+      lines.push(`  ${safeText(key)}: ${value}`);
+    lines.push(`Economics digest: ${e.economicsDigest}`);
+  }
+  if (quote.disclosure)
+    lines.push(safeText(quote.disclosure));
+  if (!quote.executionEnabled)
+    lines.push("New-quote launch execution is not enabled; this result is a read-only check.");
+  return lines;
+}
+
+// src/launch-check.ts
 init_trading();
 var checkSchema = exports_external.object({
   key: exports_external.object({
@@ -94672,7 +95815,8 @@ var checkSchema = exports_external.object({
     label: exports_external.string().nullable(),
     allowLaunch: exports_external.boolean(),
     active: exports_external.boolean()
-  }))
+  })),
+  quote: launchQuoteCheckSchema.optional()
 }).passthrough();
 var EMBEDDED_NAMES = new Set(LAUNCH_DEFINITION2.wallet.embeddedNames);
 function walletName(row2) {
@@ -94761,8 +95905,27 @@ function embeddedWorks(answer2, requestedChain) {
 function describeRow(row2) {
   return `${row2.label ? `${row2.label} ` : ""}(${row2.id}, ${row2.address})`;
 }
-async function launchCheck(ctx, key, walletFlag, requestedChain, feeWallet = undefined) {
-  const answer2 = checkSchema.parse(await request(ctx, key, "/api/v1/launch/preflight"));
+async function launchCheck2(ctx, key, walletFlag, requestedChain, feeWallet = undefined, selection = {}) {
+  const query3 = new URLSearchParams;
+  if (selection.quote !== undefined) {
+    query3.set("quote", selection.quote);
+    if (requestedChain)
+      query3.set("chain", requestedChain);
+    if (selection.mode)
+      query3.set("mode", selection.mode);
+    if (selection.stakerAllocationBps)
+      query3.set("stakerAllocationBps", selection.stakerAllocationBps);
+    if (selection.dexVersion)
+      query3.set("dexVersion", selection.dexVersion);
+  }
+  const answer2 = checkSchema.parse(await request(ctx, key, `/api/v1/launch/preflight${query3.size ? `?${query3}` : ""}`));
+  if (selection.quote !== undefined) {
+    if (!answer2.quote || answer2.quote.requested !== selection.quote)
+      throw new TradingError("QUOTE_CHECK_UNAVAILABLE", "This server did not check the requested quote. Update the server before retrying; nothing was uploaded or built.");
+    if (requestedChain && answer2.quote.chain && requestedChain !== answer2.quote.chain)
+      throw new TradingError("CHAIN_MISMATCH", "The checked quote disagrees with the requested launch chain.");
+    requestedChain ??= answer2.quote.chain;
+  }
   const embeddedOnly = walletFlag !== undefined && EMBEDDED_NAMES.has(walletFlag);
   const named = walletFlag === undefined || embeddedOnly ? [] : answer2.wallets.filter((row2) => row2.id === walletFlag || row2.address === walletFlag || row2.label === walletFlag);
   if (walletFlag !== undefined && !embeddedOnly && named.length !== 1)
@@ -94780,12 +95943,16 @@ async function launchCheck(ctx, key, walletFlag, requestedChain, feeWallet = und
     lines.push(...embeddedLines(answer2, requestedChain));
   for (const row2 of shownWallets)
     lines.push(...walletLines(answer2, row2, requestedChain));
-  const works = (walletFlag === undefined || embeddedOnly ? embeddedWorks(answer2, requestedChain) : false) || shownWallets.some((row2) => walletWorks(answer2, row2, requestedChain));
-  lines.push(works ? "Nothing was uploaded, built or sent; this was the whole check." : "No launch path works for this key. Nothing was uploaded, built or sent.");
+  const walletWorksForRequest = (walletFlag === undefined || embeddedOnly ? embeddedWorks(answer2, requestedChain) : false) || shownWallets.some((row2) => walletWorks(answer2, row2, requestedChain));
+  const works = walletWorksForRequest && (selection.quote === undefined || answer2.quote?.ok === true);
+  if (selection.quote !== undefined && answer2.quote)
+    lines.push(...launchQuoteLines(answer2.quote));
+  lines.push(works ? "Nothing was uploaded, built or sent; this was the whole check." : walletWorksForRequest && selection.quote !== undefined ? "The quote check refused this launch. Nothing was uploaded, built or sent." : "No launch path works for this key. Nothing was uploaded, built or sent.");
   const result2 = {
     success: true,
     check: true,
     works,
+    ...selection.quote !== undefined ? { walletWorks: walletWorksForRequest, quote: answer2.quote } : {},
     ...requestedChain ? { requestedChain } : {},
     key: answer2.key,
     switches: answer2.switches,
@@ -94806,6 +95973,30 @@ async function launchCheck(ctx, key, walletFlag, requestedChain, feeWallet = und
 `)}
 `);
   return works ? 0 : 1;
+}
+
+// src/launch-landed.ts
+var LAUNCH_SIGNATURE_READS = 6;
+var LAUNCH_SIGNATURE_POLL_MS = 5000;
+async function checkLaunchSignature(read2, sleep, signature, reads = LAUNCH_SIGNATURE_READS) {
+  let detail = "the RPC has no status for it";
+  for (let attempt = 0;attempt < reads; attempt++) {
+    if (attempt > 0)
+      await sleep(LAUNCH_SIGNATURE_POLL_MS);
+    let observed;
+    try {
+      observed = classifyStatus(await read2(signature));
+    } catch {
+      detail = "the RPC read failed";
+      continue;
+    }
+    if (observed.kind === "finalized")
+      return observed.slot !== undefined ? { kind: "landed", slot: observed.slot } : { kind: "landed" };
+    if (observed.kind === "failed")
+      return { kind: "reverted", err: observed.err };
+    detail = observed.kind === "missing" ? "the RPC has no status for it" : `the RPC sees it at ${observed.confirmationStatus ?? "an unknown"} commitment, not finalized`;
+  }
+  return { kind: "unknown", detail };
 }
 
 // src/commands/launch.ts
@@ -94863,6 +96054,7 @@ var LAUNCH_ARG_SPEC = {
   valueFlags: [
     ...launchFlagFields.filter((field) => field.type !== "boolean").map((field) => field.cli.flag),
     LAUNCH_IMAGE_FLAG,
+    "--quote",
     "--rpc-url"
   ],
   booleanFlags: [
@@ -94893,8 +96085,8 @@ function launchBuy(flags, chain2) {
   const decimals = LAUNCH_DEFINITION2.quoteDecimals[quote.toLowerCase()];
   if (decimals === undefined)
     throw new TradingError("INVALID_AMOUNT", `--buy is in the launch's quote asset, and ${safeText(quote)} is not one on ${chainName(chain2)}. Nothing was built.`);
-  const raw = launchBuyRaw(amount, decimals);
-  return { raw, display: `${decimalAmount(raw, decimals)} ${quote}` };
+  const raw2 = launchBuyRaw(amount, decimals);
+  return { raw: raw2, display: `${decimalAmount(raw2, decimals)} ${quote}` };
 }
 var ATOMIC_TEE_REFUSAL = "This is a TEE wallet: agents may only trade it through the trade rail";
 function buyRefusal(error) {
@@ -94946,6 +96138,11 @@ function flagChain(flags) {
   const quoteChain = quote === undefined ? undefined : QUOTE_CHAIN[quote.toLowerCase()];
   if (quoteChain)
     said.push([`--quote-asset ${quote}`, quoteChain]);
+  const selected = flags["--quote"];
+  if (selected && /^0x[0-9a-fA-F]{40}$/.test(selected))
+    said.push(["--quote address", "hood"]);
+  else if (selected && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(selected))
+    said.push(["--quote mint", "solana"]);
   if (flags["--dex-version"] !== undefined)
     said.push(["--dex-version", "hood"]);
   const [first, ...rest] = said;
@@ -94961,13 +96158,29 @@ async function launch(args, ctx) {
     return 2;
   }
   const flags = parsed.values;
+  if (flags["--quote"] !== undefined && flags["--quote-asset"] !== undefined) {
+    writeUsageFailure(ctx.deps, "Pass --quote or --quote-asset, not both.", ctx.json);
+    return 2;
+  }
+  const selectedQuote = flags["--quote"]?.trim();
+  if (selectedQuote !== undefined)
+    flags["--quote"] = selectedQuote;
+  if (selectedQuote !== undefined) {
+    if (!selectedQuote.trim() || selectedQuote.length > 120) {
+      writeUsageFailure(ctx.deps, "--quote takes a symbol or token address (at most 120 characters).", ctx.json);
+      return 2;
+    }
+    const pair = LAUNCH_DEFINITION2.quoteSelection.fixedPairs.find((p) => p.id === selectedQuote.toLowerCase() || p.address === selectedQuote || p.chain === "hood" && p.address.toLowerCase() === selectedQuote.toLowerCase());
+    if (pair)
+      flags["--quote-asset"] = pair.id;
+  }
   if (flags["--quote-asset"])
     flags["--quote-asset"] = flags["--quote-asset"].toLowerCase();
   const id = flags["--client-trade-id"] ?? `launch-${randomUUID9()}`;
   const embedded = EMBEDDED_WALLET_NAMES.has(flags["--wallet"] ?? "");
   const dryRun = parsed.booleans.has("--dry-run");
-  const check = parsed.booleans.has("--check");
-  if (check && dryRun) {
+  const check2 = parsed.booleans.has("--check");
+  if (check2 && dryRun) {
     writeUsageFailure(ctx.deps, `--check and --dry-run are two different stops; pass one. ${USAGE11}`, ctx.json);
     return 2;
   }
@@ -94994,7 +96207,7 @@ async function launch(args, ctx) {
     return 2;
   }
   const missingRequired = !flags["--name"] || !flags["--symbol"] || flags["--image"] === undefined && flags["--image-url"] === undefined || !flags["--wallet"];
-  if (parsed.positionals.length || !check && missingRequired || !validClientId(id)) {
+  if (parsed.positionals.length || !check2 && missingRequired || !validClientId(id)) {
     writeUsageFailure(ctx.deps, USAGE11, ctx.json);
     return 2;
   }
@@ -95019,17 +96232,19 @@ async function launch(args, ctx) {
     if (flags["--buy"]?.trim() && !/^0+(\.0+)?$/.test(flags["--buy"]))
       launchBuyRaw(flags["--buy"], 18);
     const hinted = flagChain(flags);
+    if (selectedQuote !== undefined && !check2 && !flags["--quote-asset"])
+      return tradingFailure(ctx, new TradingError("QUOTE_LAUNCH_UNAVAILABLE", "New-quote launch execution is not enabled. Run candle launch --quote <symbol|address> --check to inspect admission and economics; nothing was uploaded or built."));
     if (hinted === "hood" && feeWalletGiven(flags)) {
       writeUsageFailure(ctx.deps, `--fee-wallet is Solana only; a Hood launch cannot take it. ${USAGE11}`, ctx.json);
       return 2;
     }
-    if (!check && hinted === "hood" && flags["--dex-version"] === undefined) {
+    if (!check2 && hinted === "hood" && flags["--dex-version"] === undefined) {
       writeUsageFailure(ctx.deps, `A Hood launch needs --dex-version v3|v4. ${USAGE11}`, ctx.json);
       return 2;
     }
     let image;
     let banner;
-    if (!check) {
+    if (!check2) {
       try {
         if (flags["--image"] !== undefined)
           image = await readLocalImage(flags["--image"]);
@@ -95040,7 +96255,7 @@ async function launch(args, ctx) {
       }
     }
     let rules;
-    if (!check && launchRulesGiven(flags)) {
+    if (!check2 && launchRulesGiven(flags)) {
       if (hinted === "hood") {
         writeUsageFailure(ctx.deps, `${LAUNCH_RULES_SOLANA_ONLY} ${USAGE11}`, ctx.json);
         return 2;
@@ -95055,8 +96270,13 @@ async function launch(args, ctx) {
       }
     }
     const key = await tradingKey(ctx);
-    if (check)
-      return await launchCheck(ctx, key, flags["--wallet"], hinted, feeWallet);
+    if (check2)
+      return await launchCheck2(ctx, key, flags["--wallet"], hinted, feeWallet, {
+        quote: selectedQuote,
+        mode: flags["--mode"],
+        stakerAllocationBps: flags["--staker-allocation-bps"],
+        dexVersion: flags["--dex-version"]
+      });
     const prior = dryRun ? null : await lookupOperation(ctx, key, id, "launch");
     let retry;
     if (prior) {
@@ -95189,7 +96409,7 @@ async function launch(args, ctx) {
     const result2 = await request(ctx, key, "/api/v1/launch/self/confirm", { clientLaunchId: id, signature });
     return printTradingResult(ctx, { ...result2, clientTradeId: id, kind: "launch", quote, ...used });
   } catch (error) {
-    return tradingFailure(ctx, error, dryRun || check ? undefined : id);
+    return tradingFailure(ctx, error, dryRun || check2 ? undefined : id);
   }
 }
 async function uploadLaunchImages(ctx, key, args) {
@@ -95303,7 +96523,7 @@ function previewLines(answer2, chain2, feeWallet = undefined) {
   const { resolved, curveTerms: terms, devBuyMax, feeWallet: echo, feeWalletSource, fills } = parsed.data;
   const quote = (resolved?.quoteAsset ?? LAUNCH_DEFINITION2.defaultQuote[chain2]).toUpperCase();
   const decimals = (chain2 === "hood" ? HOOD_BASES[quote] : BASES[quote])?.decimals;
-  const whole = (raw) => decimals === undefined ? `${raw} raw` : `${shortAmount2(raw, decimals)} ${quote}`;
+  const whole = (raw2) => decimals === undefined ? `${raw2} raw` : `${shortAmount2(raw2, decimals)} ${quote}`;
   const lines = [];
   if (terms) {
     lines.push(`Curve${resolved ? ` (${safeText(resolved.mode)})` : ""}: raises ${terms.raise} ${safeText(terms.symbol)}; market cap ${terms.startFdv} at start and ${terms.bondingFdv} at graduation; ${percent(terms.supplySoldPct)} of the supply sold by graduation.`);
@@ -95328,7 +96548,7 @@ function previewLines(answer2, chain2, feeWallet = undefined) {
 function rulesBlock(answer2, chain2, flags) {
   const quote = (flags["--quote-asset"] ?? LAUNCH_DEFINITION2.defaultQuote[chain2]).toUpperCase();
   const decimals = BASES[quote]?.decimals;
-  const lines = launchRulesLines(answer2, (raw) => decimals === undefined ? `${raw} raw` : `${shortAmount2(raw, decimals)} ${quote}`);
+  const lines = launchRulesLines(answer2, (raw2) => decimals === undefined ? `${raw2} raw` : `${shortAmount2(raw2, decimals)} ${quote}`);
   return lines.length ? `${lines.join(`
 `)}
 ` : "";
@@ -95365,12 +96585,12 @@ function devBuyCeiling(env, quoteAsset) {
   const bounds = DEV_BUY_CEILINGS[quoteAsset];
   if (!bounds)
     throw new TradingError("DEV_BUY_UNSUPPORTED_FOR_PAIR", `An initial buy is not supported for ${safeText(quoteAsset)}-quoted solana launches`);
-  const raw = env[bounds.env];
-  const value = raw && /^\d+$/.test(raw) ? BigInt(raw) : 0n;
+  const raw2 = env[bounds.env];
+  const value = raw2 && /^\d+$/.test(raw2) ? BigInt(raw2) : 0n;
   return { ceiling: value > 0n ? value : BigInt(bounds.raw), unit: bounds.unit };
 }
-function shortAmount2(raw, decimals) {
-  const full = decimalAmount(raw, decimals);
+function shortAmount2(raw2, decimals) {
+  const full = decimalAmount(raw2, decimals);
   return full.includes(".") ? full.replace(/0+$/, "").replace(/\.$/, "") : full;
 }
 function expThresholdRaw(flags, quoteAsset) {
@@ -95381,8 +96601,8 @@ function expThresholdRaw(flags, quoteAsset) {
     return g === undefined || decimals === undefined ? undefined : BigInt(rawAmount(g, decimals));
   }
   const presets = LAUNCH_DEFINITION2.buyLimits.presetThresholds;
-  const raw = mode ? presets[mode]?.[quoteAsset] : undefined;
-  return raw === undefined ? undefined : BigInt(raw);
+  const raw2 = mode ? presets[mode]?.[quoteAsset] : undefined;
+  return raw2 === undefined ? undefined : BigInt(raw2);
 }
 function firstBuyCeiling(ctx, flags, buy) {
   const quoteAsset = (flags["--quote-asset"] ?? "sol").toLowerCase();
@@ -95683,12 +96903,18 @@ async function embeddedLaunch(ctx, key, args) {
     env: ctx.deps.env
   });
   if (!result2.ok) {
-    const raw = result2.raw;
-    const unresolved = result2.status === 0 || raw?.status === "timeout";
+    const raw2 = result2.raw;
+    const refusal4 = raw2?.error !== null && typeof raw2?.error === "object" ? raw2.error : undefined;
+    if (mayHaveLanded(refusal4?.stage))
+      return await settleUnconfirmedLaunch(ctx, flags, id, chain2, refusal4, result2.code, result2.message, {
+        quote,
+        used
+      });
+    const unresolved = result2.status === 0 || raw2?.status === "timeout";
     throw new TradingError(result2.code ?? (unresolved ? "BUNDLE_UNRESOLVED" : "REQUEST_FAILED"), result2.message, {
       ...unresolved ? { exitCode: 3 } : {},
       suggestion: `Recover with --client-trade-id ${id}; check candle swap status ${id} --kind launch before another attempt.`,
-      ...typeof raw?.bundleId === "string" ? { details: { bundleId: raw.bundleId } } : {}
+      ...typeof raw2?.bundleId === "string" ? { details: { bundleId: raw2.bundleId } } : {}
     });
   }
   return printTradingResult(ctx, {
@@ -95697,6 +96923,50 @@ async function embeddedLaunch(ctx, key, args) {
     kind: "launch",
     quote,
     ...used
+  });
+}
+async function settleUnconfirmedLaunch(ctx, flags, id, chain2, refusal4, serverCode, serverMessage, shown) {
+  const stage = String(refusal4.stage);
+  const signature = typeof refusal4.signature === "string" && refusal4.signature ? refusal4.signature : undefined;
+  const mint = typeof refusal4.mint === "string" && refusal4.mint ? refusal4.mint : undefined;
+  const details = {
+    stage,
+    ...serverCode ? { serverCode } : {},
+    ...signature ? { signature } : {},
+    ...mint ? { mint } : {}
+  };
+  const statusHint = `candle launch status ${id}`;
+  let unread = "Candle did not return the launch signature, so it was not read on chain";
+  if (chain2 === "solana" && stage === "unconfirmed" && signature) {
+    notice(ctx.deps, "stderr", "note", `Candle could not confirm launch ${safeText(signature)} in time. Reading it on chain before reporting anything.`);
+    const solana = await tradingSolanaClient(ctx, flags["--rpc-url"]);
+    const check2 = await checkLaunchSignature((sig) => solana.rpc.getSignatureStatus(sig), (ms) => ctx.deps.sleep(ms), signature);
+    if (check2.kind === "landed") {
+      notice(ctx.deps, "stderr", "note", `Launch ${safeText(signature)} is finalized on chain without an error: it landed. Candle is still recording it; read it with ${statusHint}. Do not launch again under a new id.`);
+      return printTradingResult(ctx, {
+        success: true,
+        status: "landed",
+        chain: chain2,
+        clientLaunchId: id,
+        signature,
+        ...mint ? { mint } : {},
+        ...check2.slot !== undefined ? { slot: check2.slot } : {},
+        confirmation: "finalized",
+        recorded: false,
+        clientTradeId: id,
+        kind: "launch",
+        quote: shown.quote,
+        ...shown.used
+      });
+    }
+    if (check2.kind === "reverted")
+      throw new TradingError("LAUNCH_FAILED", `Launch ${safeText(signature)} is finalized on chain with an error, so no token was created. Candle still holds launch id ${id} for it; a new --client-trade-id starts a clean launch.`, { details: { ...details, onChain: "failed" } });
+    unread = `On chain, ${check2.detail}`;
+  }
+  throw new TradingError("LAUNCH_UNCONFIRMED", `${safeText(serverMessage)} ${unread}. The launch may be on chain: do not launch again under a new id.`, {
+    exitCode: 3,
+    suggestion: `Re-run with the same --client-trade-id ${id}, or read ${statusHint}; nothing is re-sent.`,
+    details
   });
 }
 async function hoodLaunch(ctx, key, args) {
@@ -96043,9 +97313,30 @@ async function lpPositions(args, ctx) {
   if ("error" in parsed)
     return usage5(ctx, parsed.error);
   if (parsed.positionals.length !== 0)
-    return usage5(ctx, "Usage: candle lp positions [--wallet <tee>]");
+    return usage5(ctx, "Usage: candle lp positions [--wallet <tee>|embedded]");
   try {
     const key = await tradingKey(ctx);
+    if (parsed.values["--wallet"] === EMBEDDED) {
+      const positions = lpPositionsSchema.parse(await lpRequest(ctx, key, "/api/v1/agent/lp/positions?wallet=embedded"));
+      if (ctx.json)
+        return printTradingResult(ctx, { success: true, wallet: EMBEDDED, positions: positions.positions });
+      if (positions.positions.length === 0) {
+        ctx.deps.stdout.write(`No DAMM v2 positions in the embedded wallet.
+`);
+        return 0;
+      }
+      writeFields(ctx.deps, "stdout", [["Wallet", EMBEDDED]]);
+      for (const position of positions.positions)
+        writeFields(ctx.deps, "stdout", [
+          ["Position", safeText(position.position)],
+          ["Pool", safeText(position.pool)],
+          [
+            "Position value",
+            position.valueUsd === null || position.valueUsd === undefined ? undefined : formatUsd(position.valueUsd)
+          ]
+        ]);
+      return 0;
+    }
     const { rows } = await listTradingWallets(ctx, key);
     const name2 = parsed.values["--wallet"];
     const wallets2 = rows.filter((row2) => row2.chain === "solana" && (name2 === undefined || matchesWallet(row2, name2)));
@@ -96105,10 +97396,103 @@ async function lpPositions(args, ctx) {
     return tradingFailure(ctx, error);
   }
 }
+var EMBEDDED = "embedded";
+function embeddedFailure(result2, id) {
+  if (result2.status === 404 && !result2.code)
+    return new TradingError("LP_NOT_ENABLED", "This Candle deployment does not serve LP routes (LP_ENABLED is off there, or the API predates them).");
+  const error = result2.raw?.error;
+  const signature = typeof error?.signature === "string" ? error.signature : undefined;
+  const stage = typeof error?.stage === "string" ? error.stage : undefined;
+  const code = result2.code ?? "REQUEST_FAILED";
+  if (code === "LP_UNCONFIRMED")
+    return new TradingError(code, `${result2.message}${signature && !result2.message.includes(signature) ? ` Signature: ${signature}.` : ""}`, {
+      exitCode: 3,
+      suggestion: `candle lp status ${id}`,
+      details: { clientTradeId: id, ...signature ? { signature } : {}, ...stage ? { stage } : {} }
+    });
+  return new TradingError(code, result2.message, {
+    ...result2.uiHint ? { suggestion: result2.uiHint } : {},
+    ...signature || stage ? { details: { clientTradeId: id, ...signature ? { signature } : {}, ...stage ? { stage } : {} } } : {}
+  });
+}
+async function runEmbeddedLp(ctx, plan) {
+  const stream = ctx.json ? "stderr" : "stdout";
+  writeFields(ctx.deps, stream, [
+    ["Intent", safeText(plan.intent)],
+    ["Payer", "embedded wallet (Candle signs and broadcasts)"],
+    ["Operation", plan.id]
+  ]);
+  if (plan.rpcUrl !== undefined)
+    notice(ctx.deps, "stderr", "note", "Candle signs and broadcasts for the embedded wallet: --rpc-url sends nothing here.");
+  if (!plan.yes) {
+    if (!ctx.deps.isTTY.stdin)
+      throw new TradingError("CONFIRMATION_REQUIRED", "Run interactively to confirm, or use --yes for an ordinary LP prompt.");
+    if ((await ctx.deps.promptLine("Proceed? [y/N] ")).trim().toLowerCase() !== "y")
+      return printCancelledResult(ctx, {
+        success: true,
+        status: "cancelled",
+        clientTradeId: plan.id,
+        kind: "lp",
+        action: plan.action,
+        wallet: EMBEDDED
+      });
+  }
+  const result2 = await apiRequest(`/api/v1/agent/lp/${plan.action}`, {
+    apiUrl: ctx.apiUrl,
+    credentials: { apiKey: plan.key },
+    auth: "key",
+    method: "POST",
+    body: { clientTradeId: plan.id, ...plan.body },
+    fetch: ctx.deps.fetch,
+    env: ctx.deps.env
+  });
+  if (!result2.ok)
+    throw embeddedFailure(result2, plan.id);
+  const body = result2.body ?? {};
+  if (!ctx.json && typeof body.signature === "string")
+    ctx.deps.stderr.write(`LP ${plan.action} signature: ${body.signature}
+`);
+  return printTradingResult(ctx, { ...body, clientTradeId: plan.id, kind: "lp", action: plan.action });
+}
+async function lpStatus(args, ctx) {
+  const parsed = parseArgs(args, {});
+  if ("error" in parsed)
+    return usage5(ctx, parsed.error);
+  const id = parsed.positionals[0];
+  if (parsed.positionals.length !== 1 || !id || !validClientId(id))
+    return usage5(ctx, "Usage: candle lp status <clientTradeId>");
+  try {
+    const key = await tradingKey(ctx);
+    const read2 = await lpRequest(ctx, key, `/api/v1/agent/lp/operations/${encodeURIComponent(id)}`);
+    const state = typeof read2.state === "string" ? read2.state : "unknown";
+    if (ctx.json)
+      printTradingResult(ctx, { ...read2, kind: "lp" });
+    else
+      writeFields(ctx.deps, "stdout", [
+        ["Operation", id],
+        ["State", safeText(state)],
+        ["Action", typeof read2.action === "string" ? safeText(read2.action) : undefined],
+        ["Position", typeof read2.position === "string" ? safeText(read2.position) : undefined],
+        [
+          "Signature",
+          typeof read2.signature === "string" ? safeText(read2.signature) : typeof read2.submittedSignature === "string" ? `${safeText(read2.submittedSignature)} (not confirmed)` : undefined
+        ]
+      ]);
+    return state === "unconfirmed" || state === "signed" ? 3 : 0;
+  } catch (error) {
+    return tradingFailure(ctx, error, id);
+  }
+}
 async function walletHolding(ctx, key, position, name2) {
+  if (name2 === EMBEDDED)
+    return null;
   if (name2 !== undefined)
     return tradingWallet(ctx, key, name2, LP_SCOPE);
   const { rows, appId, keyPrefix } = await listTradingWallets(ctx, key, LP_SCOPE);
+  if (!rows.some((row2) => row2.chain === "solana")) {
+    notice(ctx.deps, "stderr", "note", "No TEE wallet on this key: using the account's embedded wallet.");
+    return null;
+  }
   for (const row2 of rows) {
     if (row2.chain !== "solana")
       continue;
@@ -96256,19 +97640,33 @@ async function lpAdd(args, ctx) {
     return usage5(ctx, parsed.error);
   const flags = parsed.values;
   const id = flags["--client-trade-id"] ?? `lp-${randomUUID10()}`;
+  const addUsage = "Usage: candle lp add <pool> --amount <decimal> <token> --wallet <tee>|embedded [--position <nft-mint>] [--slippage-bps 100] [--client-trade-id <id>] [--rpc-url <url>] [--yes]";
   if (parsed.positionals.length !== 2 || !flags["--amount"] || !flags["--wallet"] || !validClientId(id))
-    return usage5(ctx, "Usage: candle lp add <pool> --amount <decimal> <token> --wallet <tee> [--position <nft-mint>] [--slippage-bps 100] [--client-trade-id <id>] [--rpc-url <url>] [--yes]");
+    return usage5(ctx, addUsage);
   try {
     const pool = solanaAddress(parsed.positionals[0], "The pool");
     const token2 = poolToken(parsed.positionals[1]);
     const position = flags["--position"] ? solanaAddress(flags["--position"], "--position") : undefined;
     rawAmount(flags["--amount"], 18);
     const slippageBps = slippageOf(flags["--slippage-bps"]);
-    const solana = await tradingSolanaClient(ctx, flags["--rpc-url"]);
     const key = await tradingKey(ctx);
-    const wallet3 = await tradingWallet(ctx, key, flags["--wallet"], LP_SCOPE);
+    const embedded = flags["--wallet"] === EMBEDDED;
+    const solana = await tradingSolanaClient(ctx, flags["--rpc-url"]);
+    const wallet3 = embedded ? null : await tradingWallet(ctx, key, flags["--wallet"], LP_SCOPE);
     const decimals = await decimalsFor(ctx, baseAsset(token2) ?? token2, () => Promise.resolve(solana));
     const amountRaw = rawAmount(flags["--amount"], decimals);
+    const intent = `Add ${decimalAmount(amountRaw, decimals)} ${baseAsset(token2) ?? token2} of liquidity to DAMM v2 pool ${pool}${position ? ` (position ${position})` : " (new position)"}`;
+    const body = { pool, token: token2, amountRaw, slippageBps, ...position ? { position } : {} };
+    if (!wallet3)
+      return await runEmbeddedLp(ctx, {
+        action: "add",
+        id,
+        key,
+        intent,
+        body,
+        yes: parsed.booleans.has("--yes"),
+        ...flags["--rpc-url"] !== undefined ? { rpcUrl: flags["--rpc-url"] } : {}
+      });
     return await runLpOperation(ctx, {
       action: "add",
       id,
@@ -96276,8 +97674,8 @@ async function lpAdd(args, ctx) {
       wallet: wallet3,
       solana,
       yes: parsed.booleans.has("--yes"),
-      intent: `Add ${decimalAmount(amountRaw, decimals)} ${baseAsset(token2) ?? token2} of liquidity to DAMM v2 pool ${pool}${position ? ` (position ${position})` : " (new position)"}`,
-      body: { pool, token: token2, amountRaw, slippageBps, ...position ? { position } : {} }
+      intent,
+      body
     });
   } catch (error) {
     return tradingFailure(ctx, error, id);
@@ -96294,13 +97692,25 @@ async function lpRemove(args, ctx) {
   const id = flags["--client-trade-id"] ?? `lp-${randomUUID10()}`;
   const percent2 = Number(flags["--percent"]);
   if (parsed.positionals.length !== 1 || !flags["--percent"] || !/^\d+(\.\d{1,2})?$/.test(flags["--percent"]) || !(percent2 > 0 && percent2 <= 100) || !validClientId(id))
-    return usage5(ctx, "Usage: candle lp remove <position> --percent <0.01-100> [--wallet <tee>] [--slippage-bps 100] [--client-trade-id <id>] [--rpc-url <url>] [--yes]");
+    return usage5(ctx, "Usage: candle lp remove <position> --percent <0.01-100> [--wallet <tee>|embedded] [--slippage-bps 100] [--client-trade-id <id>] [--rpc-url <url>] [--yes]");
   try {
     const position = solanaAddress(parsed.positionals[0], "The position");
     const slippageBps = slippageOf(flags["--slippage-bps"]);
-    const solana = await tradingSolanaClient(ctx, flags["--rpc-url"]);
     const key = await tradingKey(ctx);
+    const intent = percent2 === 100 ? `Remove all liquidity from position ${position}, claim its fees and close it (rent returns to the wallet)` : `Remove ${percent2}% of the liquidity in position ${position}`;
+    const body = { position, percent: percent2, slippageBps };
     const wallet3 = await walletHolding(ctx, key, position, flags["--wallet"]);
+    if (!wallet3)
+      return await runEmbeddedLp(ctx, {
+        action: "remove",
+        id,
+        key,
+        intent,
+        body,
+        yes: parsed.booleans.has("--yes"),
+        ...flags["--rpc-url"] !== undefined ? { rpcUrl: flags["--rpc-url"] } : {}
+      });
+    const solana = await tradingSolanaClient(ctx, flags["--rpc-url"]);
     return await runLpOperation(ctx, {
       action: "remove",
       id,
@@ -96308,8 +97718,8 @@ async function lpRemove(args, ctx) {
       wallet: wallet3,
       solana,
       yes: parsed.booleans.has("--yes"),
-      intent: percent2 === 100 ? `Remove all liquidity from position ${position}, claim its fees and close it (rent returns to the wallet)` : `Remove ${percent2}% of the liquidity in position ${position}`,
-      body: { position, percent: percent2, slippageBps }
+      intent,
+      body
     });
   } catch (error) {
     return tradingFailure(ctx, error, id);
@@ -96325,12 +97735,23 @@ async function lpClaim(args, ctx) {
   const flags = parsed.values;
   const id = flags["--client-trade-id"] ?? `lp-${randomUUID10()}`;
   if (parsed.positionals.length !== 1 || !validClientId(id))
-    return usage5(ctx, "Usage: candle lp claim <position> [--wallet <tee>] [--client-trade-id <id>] [--rpc-url <url>] [--yes]");
+    return usage5(ctx, "Usage: candle lp claim <position> [--wallet <tee>|embedded] [--client-trade-id <id>] [--rpc-url <url>] [--yes]");
   try {
     const position = solanaAddress(parsed.positionals[0], "The position");
-    const solana = await tradingSolanaClient(ctx, flags["--rpc-url"]);
     const key = await tradingKey(ctx);
+    const intent = `Claim the fees and any rewards of position ${position}`;
     const wallet3 = await walletHolding(ctx, key, position, flags["--wallet"]);
+    if (!wallet3)
+      return await runEmbeddedLp(ctx, {
+        action: "claim",
+        id,
+        key,
+        intent,
+        body: { position },
+        yes: parsed.booleans.has("--yes"),
+        ...flags["--rpc-url"] !== undefined ? { rpcUrl: flags["--rpc-url"] } : {}
+      });
+    const solana = await tradingSolanaClient(ctx, flags["--rpc-url"]);
     return await runLpOperation(ctx, {
       action: "claim",
       id,
@@ -96338,7 +97759,7 @@ async function lpClaim(args, ctx) {
       wallet: wallet3,
       solana,
       yes: parsed.booleans.has("--yes"),
-      intent: `Claim the fees and any rewards of position ${position}`,
+      intent,
       body: { position }
     });
   } catch (error) {
@@ -96446,7 +97867,10 @@ var MCP_TOOL_NAMES = [
   "candle_lab_replay",
   "candle_lab_replay_result",
   "candle_lab_runners",
-  "candle_lab_edges"
+  "candle_lab_edges",
+  "candle_signal_scorecard",
+  "candle_signal_records",
+  "candle_signal_record"
 ];
 var READ_ONLY_TOOL_NAMES = [
   "candle_get_market",
@@ -96866,10 +98290,10 @@ function actionShapeProblem2(action) {
   const orders = action.type === "order" ? action.orders : action.type === "modify" ? [action.order] : [];
   if (!Array.isArray(orders))
     return "invalid orders";
-  for (const raw of orders) {
-    if (!exactKeys2(raw, ["a", "b", "p", "s", "r", "t"], ["c"]))
+  for (const raw2 of orders) {
+    if (!exactKeys2(raw2, ["a", "b", "p", "s", "r", "t"], ["c"]))
       return "an order carries unexpected or missing fields";
-    const o = raw;
+    const o = raw2;
     const t = o.t;
     const limit = exactKeys2(t, ["limit"]) && exactKeys2(t.limit, ["tif"]);
     const trigger = exactKeys2(t, ["trigger"]) && exactKeys2(t.trigger, ["isMarket", "triggerPx", "tpsl"]);
@@ -96902,10 +98326,10 @@ function checkActionIntent2(action, opts) {
   const orderList = action.type === "order" ? action.orders : action.type === "modify" ? [action.order] : [];
   if (!Array.isArray(orderList))
     return "invalid orders";
-  for (const raw of orderList) {
-    if (!raw || typeof raw !== "object")
+  for (const raw2 of orderList) {
+    if (!raw2 || typeof raw2 !== "object")
       return "invalid order";
-    const o = raw;
+    const o = raw2;
     if (!mainAsset(o.a))
       return "order asset is outside the main perp universe";
     if (typeof o.b !== "boolean" || typeof o.r !== "boolean" || (decimal4(o.s) ?? 0n) <= 0n || (decimal4(o.p) ?? 0n) <= 0n)
@@ -97264,9 +98688,9 @@ function verifyPerpsBuild2(build, opts) {
       if (shapeRefusal)
         return { ok: false, reason: shapeRefusal };
       if (type === "order") {
-        const refusal3 = checkBuilderField2(action, opts.builder);
-        if (refusal3)
-          return { ok: false, reason: refusal3 };
+        const refusal4 = checkBuilderField2(action, opts.builder);
+        if (refusal4)
+          return { ok: false, reason: refusal4 };
       } else if ("builder" in action) {
         return { ok: false, reason: `a ${type} action carries no builder` };
       }
@@ -97373,8 +98797,8 @@ async function hyperliquidWalletSnapshot2(fetcher, network2, address, now = Date
   if (!Array.isArray(open8))
     throw new Error("Hyperliquid returned an unreadable order list");
   const orders = [];
-  for (const raw of open8) {
-    const o = raw;
+  for (const raw2 of open8) {
+    const o = raw2;
     const coin = o?.coin;
     if (typeof coin !== "string") {
       unsupported2.push("an unreadable order");
@@ -97546,6 +98970,16 @@ function hyperliquidExchangeBody2(action, nonce, signature) {
 function hyperliquidRelayBody2(typedData) {
   return { method: "eth_signTypedData_v4", params: { typed_data: typedData } };
 }
+function hyperliquidSignatureHex2(value) {
+  if (typeof value === "string") {
+    hyperliquidSplitSignature2(value);
+    return value;
+  }
+  const sig = value;
+  if (!sig || typeof sig.r !== "string" || typeof sig.s !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(sig.r) || !/^0x[0-9a-fA-F]{64}$/.test(sig.s) || ![0, 1, 27, 28].includes(Number(sig.v)))
+    throw new Error("Invalid embedded Hyperliquid signature");
+  return `${sig.r}${sig.s.slice(2)}${Number(sig.v).toString(16).padStart(2, "0")}`;
+}
 
 // src/hyperliquid-markets.ts
 var INFO_URLS2 = {
@@ -97571,7 +99005,7 @@ function unavailable4() {
 function usage6(message) {
   throw new PerpsMarketError2("PERPS_USAGE", message);
 }
-function object4(value) {
+function object5(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function decimal5(value) {
@@ -97607,10 +99041,10 @@ function parseMarkets2(value) {
   if (!Array.isArray(value) || value.length !== 2)
     return unavailable4();
   const [meta, ctxs] = value;
-  if (!object4(meta) || !Array.isArray(meta.universe) || !Array.isArray(ctxs) || meta.universe.length !== ctxs.length)
+  if (!object5(meta) || !Array.isArray(meta.universe) || !Array.isArray(ctxs) || meta.universe.length !== ctxs.length)
     return unavailable4();
   for (const row2 of meta.universe) {
-    if (!object4(row2) || typeof row2.name !== "string" || !integer2(row2.szDecimals) || row2.szDecimals > 6 || !integer2(row2.maxLeverage))
+    if (!object5(row2) || typeof row2.name !== "string" || !integer2(row2.szDecimals) || row2.szDecimals > 6 || !integer2(row2.maxLeverage))
       return unavailable4();
     for (const key of ["isDelisted", "onlyIsolated"])
       if (row2[key] !== undefined && typeof row2[key] !== "boolean")
@@ -97619,7 +99053,7 @@ function parseMarkets2(value) {
       return unavailable4();
   }
   for (const ctx of ctxs) {
-    if (!object4(ctx))
+    if (!object5(ctx))
       return unavailable4();
     for (const key of ["markPx", "midPx", "oraclePx", "openInterest", "funding", "dayNtlVlm", "prevDayPx", "premium"]) {
       if (ctx[key] !== undefined && ctx[key] !== null && !decimal5(ctx[key]))
@@ -97633,11 +99067,11 @@ function parseMarkets2(value) {
     if (!Array.isArray(meta.marginTables))
       return unavailable4();
     for (const entry2 of meta.marginTables) {
-      if (!Array.isArray(entry2) || !integer2(entry2[0]) || !object4(entry2[1]) || !Array.isArray(entry2[1].marginTiers))
+      if (!Array.isArray(entry2) || !integer2(entry2[0]) || !object5(entry2[1]) || !Array.isArray(entry2[1].marginTiers))
         return unavailable4();
       const tiers = [];
       for (const tier of entry2[1].marginTiers) {
-        if (!object4(tier) || nonnegative2(tier.lowerBound) === null || !integer2(tier.maxLeverage))
+        if (!object5(tier) || nonnegative2(tier.lowerBound) === null || !integer2(tier.maxLeverage))
           return unavailable4();
         tiers.push({ lowerBoundUsd: tier.lowerBound, maxLeverage: tier.maxLeverage });
       }
@@ -97730,15 +99164,15 @@ function perpsCandleWindow2(opts, now) {
   if (index < 0)
     return usage6(`interval must be one of ${PERPS_CANDLE_INTERVALS2.join(" ")}.`);
   const count2 = bounded2(opts.count, 100, 1, 5000, "count");
-  const raw = opts.end;
-  const endTime = raw === undefined ? now : epoch2(raw);
+  const raw2 = opts.end;
+  const endTime = raw2 === undefined ? now : epoch2(raw2);
   const startTime = endTime - count2 * at2(INTERVAL_MS2, index);
   if (!Number.isSafeInteger(endTime) || endTime < 0 || endTime > now || startTime < 0)
     return usage6("end must be an ISO 8601 time or epoch milliseconds, no later than now.");
   return { interval, count: count2, startTime, endTime };
 }
-function epoch2(raw) {
-  return typeof raw === "number" || /^\d+$/.test(raw) ? Number(raw) : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(raw) ? Date.parse(raw) : NaN;
+function epoch2(raw2) {
+  return typeof raw2 === "number" || /^\d+$/.test(raw2) ? Number(raw2) : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(raw2) ? Date.parse(raw2) : NaN;
 }
 var PERPS_FUNDING_HISTORY_MAX_MS2 = 30 * 86400000;
 var PERPS_FUNDING_HISTORY_MAX_ROWS2 = 500;
@@ -97764,7 +99198,7 @@ function parsePerpsFundingHistory2(value, coin, window) {
     return unavailable4();
   const funding = [];
   for (const row2 of value) {
-    if (!object4(row2) || row2.coin !== coin || !integer2(row2.time) || !decimal5(row2.fundingRate) || !decimal5(row2.premium))
+    if (!object5(row2) || row2.coin !== coin || !integer2(row2.time) || !decimal5(row2.fundingRate) || !decimal5(row2.premium))
       return unavailable4();
     if (row2.time >= window.startTime && row2.time <= window.endTime)
       funding.push({
@@ -97802,7 +99236,7 @@ class PerpsMarketReader2 {
     this.configPromise ??= (async () => {
       try {
         const value = await this.opts.readConfig();
-        if (!object4(value) || !object4(value.limits) || !integer2(value.limits.minOpenInterestUsd) || value.network !== "mainnet" && value.network !== "testnet")
+        if (!object5(value) || !object5(value.limits) || !integer2(value.limits.minOpenInterestUsd) || value.network !== "mainnet" && value.network !== "testnet")
           throw new Error("config shape");
         return {
           minOpenInterestUsd: value.limits.minOpenInterestUsd,
@@ -97850,7 +99284,7 @@ class PerpsMarketReader2 {
               if (!Array.isArray(venue) || typeof venue[0] !== "string")
                 return unavailable4();
               if (venue[0] === "HlPerp" && venue[1] !== null) {
-                if (!object4(venue[1]) || !decimal5(venue[1].fundingRate) || !integer2(venue[1].nextFundingTime))
+                if (!object5(venue[1]) || !decimal5(venue[1].fundingRate) || !integer2(venue[1].nextFundingTime))
                   return unavailable4();
                 map2.set(entry2[0], { fundingRate: venue[1].fundingRate, nextFundingTime: venue[1].nextFundingTime });
               }
@@ -97991,7 +99425,7 @@ class PerpsMarketReader2 {
       coin: canonical4,
       ...opts.sigFigs === undefined ? {} : { nSigFigs: opts.sigFigs }
     });
-    if (!object4(value) || value.coin !== canonical4 || !integer2(value.time) || !Array.isArray(value.levels) || value.levels.length !== 2)
+    if (!object5(value) || value.coin !== canonical4 || !integer2(value.time) || !Array.isArray(value.levels) || value.levels.length !== 2)
       return unavailable4();
     const sides = [];
     for (const side of value.levels) {
@@ -97999,7 +99433,7 @@ class PerpsMarketReader2 {
         return unavailable4();
       const levels = [];
       for (const level of side) {
-        if (!object4(level) || nonnegative2(level.px) === null || nonnegative2(level.sz) === null || !integer2(level.n))
+        if (!object5(level) || nonnegative2(level.px) === null || nonnegative2(level.sz) === null || !integer2(level.n))
           return unavailable4();
         levels.push({ px: level.px, sz: level.sz, n: level.n });
       }
@@ -98035,7 +99469,7 @@ class PerpsMarketReader2 {
       return unavailable4();
     const candles = [];
     for (const c of value) {
-      if (!object4(c) || !integer2(c.t) || !integer2(c.T) || !integer2(c.n) || ![c.o, c.h, c.l, c.c, c.v].every((v) => nonnegative2(v) !== null) || c.s !== canonical4 || c.i !== window.interval)
+      if (!object5(c) || !integer2(c.t) || !integer2(c.T) || !integer2(c.n) || ![c.o, c.h, c.l, c.c, c.v].every((v) => nonnegative2(v) !== null) || c.s !== canonical4 || c.i !== window.interval)
         return unavailable4();
       if (c.t <= window.endTime && c.T >= window.startTime)
         candles.push({
@@ -98179,14 +99613,14 @@ function canonical4(value) {
 function isDecimalString2(value) {
   return typeof value === "string" && /^-?[0-9]+(\.[0-9]+)?$/.test(value);
 }
-function asFill2(raw) {
-  const row2 = raw;
+function asFill2(raw2) {
+  const row2 = raw2;
   if (!row2 || typeof row2 !== "object" || typeof row2.coin !== "string" || !isTime2(row2.time) || !Number.isSafeInteger(row2.tid) || !Number.isSafeInteger(row2.oid) || !isDecimalString2(row2.px) || !isDecimalString2(row2.sz) || typeof row2.side !== "string" || !isDecimalString2(row2.closedPnl) || !isDecimalString2(row2.fee) || row2.builderFee !== undefined && !isDecimalString2(row2.builderFee))
     throw unavailable5("Hyperliquid returned a fill this client cannot read");
   return row2;
 }
-function asFunding2(raw) {
-  const row2 = raw;
+function asFunding2(raw2) {
+  const row2 = raw2;
   const delta = row2?.delta;
   if (!row2 || typeof row2 !== "object" || !isTime2(row2.time) || typeof row2.hash !== "string" || !delta || typeof delta !== "object" || typeof delta.coin !== "string" || !isDecimalString2(delta.usdc) || !isDecimalString2(delta.fundingRate) || !isDecimalString2(delta.szi))
     throw unavailable5("Hyperliquid returned a funding payment this client cannot read");
@@ -98323,11 +99757,11 @@ async function readPerpsHistoryPage2(req) {
         break;
       }
       const body = kind === "fills" ? { type: "userFillsByTime", user: state.w, startTime: t, endTime: state.e, aggregateByTime: false } : { type: "userFunding", user: state.w, startTime: t, endTime: state.e };
-      const raw = await postInfo2(req, body, kind === "fills" ? "fills" : "funding");
+      const raw2 = await postInfo2(req, body, kind === "fills" ? "fills" : "funding");
       requests++;
-      if (!Array.isArray(raw))
+      if (!Array.isArray(raw2))
         throw unavailable5(`Hyperliquid returned an unreadable ${kind} response`);
-      const rows = raw.map((r) => kind === "fills" ? asFill2(r) : asFunding2(r));
+      const rows = raw2.map((r) => kind === "fills" ? asFill2(r) : asFunding2(r));
       const keyed = rows.map((row2) => ({ row: row2, id: identity3(kind, row2) })).sort((a, b) => a.row.time - b.row.time || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
       const full = rows.length >= max;
       const startedAt = t;
@@ -98489,14 +99923,14 @@ function perpsRiskFromLimits2(body) {
   const effective = isRecord3(record6.perpsRiskEffective) ? effectivePerpsRisk2(pickSettings2(record6.perpsRiskEffective)) : effectivePerpsRisk2(stored);
   if (perpsRiskProblem2(effective) !== null)
     return { thresholds: { ...HYPERLIQUID_RISK_DEFAULTS2, source: "defaults (server did not report)" }, stored };
-  const source = stored && Object.keys(stored).length > 0 ? "key" : "defaults";
-  return { thresholds: { ...effective, source }, stored };
+  const source2 = stored && Object.keys(stored).length > 0 ? "key" : "defaults";
+  return { thresholds: { ...effective, source: source2 }, stored };
 }
-function pickSettings2(raw) {
+function pickSettings2(raw2) {
   const out = {};
   for (const field of PERPS_RISK_FIELDS2)
-    if (typeof raw[field] === "number")
-      out[field] = raw[field];
+    if (typeof raw2[field] === "number")
+      out[field] = raw2[field];
   return out;
 }
 
@@ -99685,9 +101119,9 @@ async function perpsThresholds(args, ctx) {
       return 1;
     }
     const { thresholds: thresholds2, stored } = perpsRiskFromLimits2(result2.body);
-    const { source, ...effective } = thresholds2;
+    const { source: source2, ...effective } = thresholds2;
     if (ctx.json) {
-      ctx.deps.stdout.write(`${JSON.stringify({ stored, effective, source, defaults: HYPERLIQUID_RISK_DEFAULTS2 })}
+      ctx.deps.stdout.write(`${JSON.stringify({ stored, effective, source: source2, defaults: HYPERLIQUID_RISK_DEFAULTS2 })}
 `);
       return 0;
     }
@@ -99713,12 +101147,12 @@ async function thresholdsWrite(verb, args, ctx) {
   else {
     const fields2 = {};
     for (const [flag, spec] of Object.entries(SET_FLAGS)) {
-      const raw = parsed.values[flag];
-      if (raw === undefined)
+      const raw2 = parsed.values[flag];
+      if (raw2 === undefined)
         continue;
-      const bps2 = thresholdBps(raw, spec.kind);
+      const bps2 = thresholdBps(raw2, spec.kind);
       if (bps2 === null)
-        return usage7(ctx, `${flag} takes ${spec.kind === "pct" ? "a percentage such as 17 or 17.5" : "a ratio such as 0.6"}, not ${raw}.`);
+        return usage7(ctx, `${flag} takes ${spec.kind === "pct" ? "a percentage such as 17 or 17.5" : "a ratio such as 0.6"}, not ${raw2}.`);
       fields2[spec.field] = bps2;
     }
     if (Object.keys(fields2).length === 0)
@@ -99818,7 +101252,9 @@ async function perpsRequest(ctx, key, path, body) {
   if (!result2.ok) {
     if (result2.status === 404 && !result2.code)
       throw new TradingError("PERPS_NOT_ENABLED", "This Candle deployment does not serve perps routes (the API predates them).");
-    throw new TradingError(result2.code ?? "REQUEST_FAILED", result2.message);
+    throw Object.assign(new TradingError(result2.code ?? "REQUEST_FAILED", result2.message), {
+      httpStatus: result2.status
+    });
   }
   if (!result2.body || typeof result2.body !== "object")
     throw new TradingError("INVALID_RESPONSE", "Candle returned an invalid response.");
@@ -99835,8 +101271,26 @@ function builderPin2(ctx) {
   }
 }
 async function perpsWallet(ctx, key, name2, scope) {
+  const embedded = async () => {
+    const found = await perpsRequest(ctx, key, "/api/v1/agent/wallets/embedded");
+    const evm2 = found.wallets?.evm;
+    if (scope && found.embeddedWalletPermission === "denied")
+      throw new TradingError("EMBEDDED_WALLET_NOT_PERMITTED", "Embedded wallet access denied");
+    if (!evm2?.address)
+      throw new TradingError("AGENT_WALLET_MISSING", "Embedded EVM wallet missing");
+    return { row: { id: "embedded", address: evm2.address.toLowerCase() } };
+  };
+  if (name2 === "embedded")
+    return embedded();
   const { rows, appId, keyPrefix } = await listTradingWallets(ctx, key, scope);
   const evm = rows.filter((row3) => row3.chain === "evm");
+  if (name2 === undefined && evm.length === 0) {
+    const fallback = await embedded().catch(() => null);
+    if (fallback) {
+      notice(ctx.deps, "stderr", "note", "Using the embedded wallet (no EVM TEE wallet on this key).");
+      return fallback;
+    }
+  }
   const matches = name2 === undefined ? evm : evm.filter((row3) => matchesName(row3, name2));
   if (matches.length !== 1) {
     throw new TradingError("TEE_WALLET_REQUIRED", evm.length === 0 ? "This key has no EVM TEE wallet bound to it. Hyperliquid perps sign only from one. Give it one: candle vault new-key --chain evm, then candle vault promote --from <cold> --to-key <prefix> (candle tee new is Solana only), and candle tee signer new --key <prefix> on the machine that trades." : matches.length === 0 ? `No EVM TEE wallet on this key is called "${name2}". Bound to this key: ${evm.map(describeWallet).join("; ")}.` : `Name one EVM TEE wallet with --wallet: ${matches.map(describeWallet).join("; ")}.`);
@@ -99913,7 +101367,7 @@ async function confirm(ctx, build, address, yes) {
     return true;
   if (!ctx.deps.isTTY.stdin)
     throw new TradingError("CONFIRMATION_REQUIRED", "Run interactively to confirm, or use --yes.");
-  return (await ctx.deps.promptLine("Sign and submit? [y/N] ")).trim().toLowerCase() === "y";
+  return (await ctx.deps.promptLine(build.signer === "embedded" ? "Send? [y/N] " : "Sign and submit? [y/N] ")).trim().toLowerCase() === "y";
 }
 function venueRefusal(exchange) {
   if (!exchange || typeof exchange !== "object")
@@ -99930,9 +101384,7 @@ function venueRefusal(exchange) {
 }
 async function runPerpsWrite(ctx, opts) {
   const key = await tradingKey(ctx);
-  const { wallet: wallet3 } = await perpsWallet(ctx, key, opts.wallet, PERPS_SCOPE);
-  if (!wallet3)
-    throw new TradingError("TEE_WALLET_REQUIRED", "No EVM TEE wallet resolved.");
+  const { wallet: signerWallet, row: wallet3 } = await perpsWallet(ctx, key, opts.wallet, PERPS_SCOPE);
   const builder = builderPin2(ctx);
   const net = perpsNetwork(ctx);
   const method = opts.method ?? opts.path.split("/").at(-1);
@@ -99946,8 +101398,20 @@ async function runPerpsWrite(ctx, opts) {
     if (!HYPERLIQUID_STANDARD_ACCOUNT_MODES2.includes(mode))
       throw new TradingError("PERPS_ACCOUNT_MODE", `This Hyperliquid account is in ${safeText(mode)} mode. Candle trades only a standard account and does not change modes; switch it back to standard mode on Hyperliquid, then run setup again. This is not a missing fee approval. Nothing was requested or signed.`);
   }
+  if (wallet3.id === "embedded" && ["open", "close"].includes(method) && opts.body.clientId == null) {
+    opts.body = { ...opts.body, clientId: `0x${randomUUID11().replaceAll("-", "")}` };
+    writeFields(ctx.deps, "stderr", [["Client id", String(opts.body.clientId)]]);
+  }
   const clientId2 = typeof opts.body.clientId === "string" ? opts.body.clientId : undefined;
-  const build = await perpsRequest(ctx, key, opts.path, { walletId: wallet3.id, ...opts.body });
+  let build;
+  try {
+    build = await perpsRequest(ctx, key, opts.path, { walletId: wallet3.id, ...opts.body });
+  } catch (error) {
+    const status = error instanceof TradingError ? Number(error.httpStatus) : NaN;
+    if (wallet3.id !== "embedded" || !clientId2 || status >= 400 && status < 500)
+      throw error;
+    throw new TradingError("PERPS_MAYBE_LANDED", "The build answer was lost. Retry the same client id; read candle perps orders or POST /perps/reconcile before continuing.", { exitCode: 3, details: { clientId: clientId2, cloid: clientId2, exchangeBody: null } });
+  }
   build.preview = {
     ...build.preview,
     builderTrust: {
@@ -99967,7 +101431,7 @@ async function runPerpsWrite(ctx, opts) {
   }
   if (build.ready === true)
     return printTradingResult(ctx, build);
-  if (build.replayed === true) {
+  if (build.replayed === true && wallet3.id !== "embedded") {
     if (clientId2 === undefined || build.clientId !== clientId2 || build.walletId !== wallet3.id)
       throw new TradingError("PERPS_BUILD_REFUSED", "Refused a replay that does not name this request's client id and wallet. Nothing was signed.");
     notice(ctx.deps, "stderr", "note", `Client id ${clientId2} already names order ${safeText(build.perpOrderId)} (${safeText(build.status)}${build.venueStatus ? `, ${safeText(build.venueStatus)} on Hyperliquid` : ""}). Nothing was signed or sent; use a new --client-id for a new order.
@@ -99983,19 +101447,19 @@ async function runPerpsWrite(ctx, opts) {
     intent: { method, params: opts.body },
     keyReduceOnly: build.perpsReduceOnly === true
   };
-  const check = method === "setup" ? verifyPerpsBuild2(build, verifyOpts) : await verifyPerpsBuildAgainstVenue2(build, {
+  const check2 = method === "setup" ? verifyPerpsBuild2(build, verifyOpts) : await verifyPerpsBuildAgainstVenue2(build, {
     ...verifyOpts,
     fetcher: ctx.deps.fetch,
     now: ctx.deps.now
   });
-  if (!check.ok)
-    throw new TradingError("PERPS_BUILD_REFUSED", `Refused to sign this build: ${check.reason}. Nothing was signed.`);
+  if (!check2.ok)
+    throw new TradingError("PERPS_BUILD_REFUSED", `Refused to sign this build: ${check2.reason}. Nothing was signed.`);
   if (!opts.submit)
-    return printTradingResult(ctx, { ...build, signed: false, submitted: false });
+    return printTradingResult(ctx, { ...build, signed: wallet3.id === "embedded", submitted: false });
   if (!await confirm(ctx, build, wallet3.address, opts.yes)) {
     throw new TradingError("CANCELLED", "Nothing was signed.", { exitCode: CANCELLED_EXIT });
   }
-  const relay2 = await perpsRequest(ctx, key, `/api/v1/agent/wallets/${encodeURIComponent(wallet3.id)}/sign`, typedDataAuthorization(wallet3, build.typedData));
+  const relay2 = wallet3.id === "embedded" ? { signature: hyperliquidSignatureHex2(build.signature) } : await perpsRequest(ctx, key, `/api/v1/agent/wallets/${encodeURIComponent(wallet3.id)}/sign`, typedDataAuthorization(signerWallet, build.typedData));
   const signature = relay2.signature;
   if (typeof signature !== "string" || !/^0x[0-9a-fA-F]{130}$/.test(signature))
     throw new TradingError("INVALID_RESPONSE", "The relay did not return a signature.");
@@ -100025,7 +101489,15 @@ async function runPerpsWrite(ctx, opts) {
       throw new Error(`HTTP ${res.status}`);
     exchange = JSON.parse(text4);
   } catch (error) {
-    throw new TradingError("PERPS_SUBMIT_FAILED", `Signed, but the submit to Hyperliquid failed (${error instanceof Error ? error.message : "unknown"}). The signed action is in details.exchangeBody; nothing was lost.`, { exitCode: 3, details: { perpOrderId: build.perpOrderId, exchangeBody } });
+    throw new TradingError("PERPS_SUBMIT_FAILED", `Signed, but the submit to Hyperliquid failed (${error instanceof Error ? error.message : "unknown"}). The signed action is in details.exchangeBody; nothing was lost.`, {
+      exitCode: 3,
+      details: {
+        clientId: clientId2 ?? null,
+        cloid: build.cloid ?? null,
+        perpOrderId: build.perpOrderId,
+        exchangeBody
+      }
+    });
   }
   const outcome = hyperliquidExchangeOutcome2(exchange);
   if (outcome.status === "rejected")
@@ -100037,7 +101509,16 @@ async function runPerpsWrite(ctx, opts) {
       }
     });
   if (outcome.status === "unknown")
-    throw new TradingError("PERPS_SUBMIT_FAILED", `Signed and submitted, but Hyperliquid's answer could not be read (${safeText(outcome.error)}). The signed action is in details.exchangeBody; check candle perps orders before acting again.`, { exitCode: 3, details: { perpOrderId: build.perpOrderId, exchangeBody, exchange } });
+    throw new TradingError("PERPS_SUBMIT_FAILED", `Signed and submitted, but Hyperliquid's answer could not be read (${safeText(outcome.error)}). The signed action is in details.exchangeBody; check candle perps orders before acting again.`, {
+      exitCode: 3,
+      details: {
+        clientId: clientId2 ?? null,
+        cloid: build.cloid ?? null,
+        perpOrderId: build.perpOrderId,
+        exchangeBody,
+        exchange
+      }
+    });
   const extra = await afterConfirmed(ctx, key, net, wallet3, build, method, opts.body, exchange);
   return printTradingResult(ctx, {
     ...extra,
@@ -100116,7 +101597,7 @@ async function perpsSetup(args, ctx) {
   if ("error" in parsed)
     return usage8(ctx, parsed.error);
   if (parsed.positionals.length !== 0)
-    return usage8(ctx, "Usage: candle perps setup [--wallet <tee>] [--yes]");
+    return usage8(ctx, "Usage: candle perps setup [--wallet <tee|embedded>] [--yes]");
   try {
     return await runPerpsWrite(ctx, {
       path: "/api/v1/agent/perps/setup",
@@ -100127,7 +101608,7 @@ async function perpsSetup(args, ctx) {
     return tradingFailure(ctx, error);
   }
 }
-var OPEN_USAGE = "Usage: candle perps open <coin> <long|short> <size> [--price <px>] [--tif Gtc|Alo|Ioc] [--slippage-bps <n>] [--tp <px>] [--sl <px>] [--client-id <0x+32 hex>] [--wallet <tee>] [--yes]";
+var OPEN_USAGE = "Usage: candle perps open <coin> <long|short> <size> [--price <px>] [--tif Gtc|Alo|Ioc] [--slippage-bps <n>] [--tp <px>] [--sl <px>] [--client-id <0x+32 hex>] [--wallet <tee|embedded>] [--yes]";
 function clientIdFlag(value) {
   if (value === undefined)
     return;
@@ -100193,7 +101674,7 @@ async function perpsClose(args, ctx) {
     return usage8(ctx, parsed.error);
   const [coin] = parsed.positionals;
   if (parsed.positionals.length !== 1 || !coin)
-    return usage8(ctx, "Usage: candle perps close <coin> [--size <n> | --pct <1-100>] [--slippage-bps <n>] [--client-id <0x+32 hex>] [--wallet <tee>] [--yes]");
+    return usage8(ctx, "Usage: candle perps close <coin> [--size <n> | --pct <1-100>] [--slippage-bps <n>] [--client-id <0x+32 hex>] [--wallet <tee|embedded>] [--yes]");
   const size = parsed.values["--size"];
   if (size !== undefined && !DEC_RE3.test(size))
     return usage8(ctx, "--size must be a plain decimal.");
@@ -100231,7 +101712,7 @@ async function perpsCancel(args, ctx) {
     return usage8(ctx, parsed.error);
   const [cloid] = parsed.positionals;
   if (parsed.positionals.length !== 1 || !cloid || !CLOID_RE2.test(cloid))
-    return usage8(ctx, "Usage: candle perps cancel <cloid> [--wallet <tee>] [--yes]  (cloid: 0x + 32 hex)");
+    return usage8(ctx, "Usage: candle perps cancel <cloid> [--wallet <tee|embedded>] [--yes]  (cloid: 0x + 32 hex)");
   try {
     return await runPerpsWrite(ctx, {
       path: "/api/v1/agent/perps/cancel",
@@ -100252,7 +101733,7 @@ async function perpsLeverage(args, ctx) {
   const [coin, leverage] = parsed.positionals;
   const n = Number(leverage);
   if (parsed.positionals.length !== 2 || !coin || !Number.isInteger(n) || n < 1)
-    return usage8(ctx, "Usage: candle perps leverage <coin> <x> [--isolated] [--wallet <tee>] [--yes]");
+    return usage8(ctx, "Usage: candle perps leverage <coin> <x> [--isolated] [--wallet <tee|embedded>] [--yes]");
   try {
     return await runPerpsWrite(ctx, {
       path: "/api/v1/agent/perps/leverage",
@@ -100275,7 +101756,7 @@ async function perpsPositions(args, ctx) {
   if ("error" in parsed)
     return usage8(ctx, parsed.error);
   if (parsed.positionals.length !== 0)
-    return usage8(ctx, "Usage: candle perps positions [--wallet <tee>]");
+    return usage8(ctx, "Usage: candle perps positions [--wallet <tee|embedded>]");
   try {
     const key = await tradingKey(ctx);
     const { row: row2 } = await perpsWallet(ctx, key, parsed.values["--wallet"]);
@@ -100314,7 +101795,7 @@ async function perpsOrders(args, ctx) {
     return usage8(ctx, parsed.error);
   const limit = parsed.values["--limit"];
   if (parsed.positionals.length !== 0 || limit !== undefined && !/^[1-9][0-9]{0,2}$/.test(limit))
-    return usage8(ctx, "Usage: candle perps orders [--wallet <tee>] [--limit <n>]");
+    return usage8(ctx, "Usage: candle perps orders [--wallet <tee|embedded>] [--limit <n>]");
   try {
     const key = await tradingKey(ctx);
     const { row: row2 } = await perpsWallet(ctx, key, parsed.values["--wallet"]);
@@ -100364,7 +101845,7 @@ function epochMs2(value) {
   return /^[0-9]{1,16}$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : null;
 }
 async function perpsHistory(kind, args, ctx) {
-  const usageLine = `Usage: candle perps ${kind} [--wallet <tee>] [--start-time <ms>] [--end-time <ms>] [--limit <n>] [--cursor <cursor>]`;
+  const usageLine = `Usage: candle perps ${kind} [--wallet <tee|embedded>] [--start-time <ms>] [--end-time <ms>] [--limit <n>] [--cursor <cursor>]`;
   const parsed = parseArgs(args, HISTORY_FLAGS);
   if ("error" in parsed)
     return usage8(ctx, parsed.error);
@@ -100427,7 +101908,7 @@ function perpsFunding(args, ctx) {
 var HYPERLIQUID_RELAY_CHAIN_ID2 = 1337;
 var HYPERLIQUID_RELAY_USDC2 = "0x00000000000000000000000000000000";
 var DEPOSIT_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
-var DEPOSIT_USAGE = "Usage: candle perps deposit <amount> <SOL|USDC|ETH|USDG> [--wallet <tee>] [--to <evm tee>] [--id <clientDepositId>] [--slippage-bps <n>] [--rpc-url <url>] [--yes] [--no-submit] | candle perps deposit status <clientDepositId>";
+var DEPOSIT_USAGE = "Usage: candle perps deposit <amount> <SOL|USDC|ETH|USDG> [--wallet <tee|embedded>] [--to <evm tee>] [--id <clientDepositId>] [--slippage-bps <n>] [--rpc-url <url>] [--yes] [--no-submit] | candle perps deposit status <clientDepositId>";
 var plannedDepositLegsSchema = exports_external.array(exports_external.object({
   kind: exports_external.enum(["approval", "bridgeDeposit"]),
   to: exports_external.string().regex(/^0x[0-9a-fA-F]{40}$/),
@@ -100503,8 +101984,31 @@ async function perpsDeposit(args, ctx) {
   try {
     const key = await tradingKey(ctx);
     const payer = await tradingPayer(ctx, key, values["--wallet"], "swap:write", origin);
-    if (payer.kind !== "tee")
-      throw new TradingError("TEE_WALLET_REQUIRED", `A Hyperliquid deposit pays only from this key's ${origin === "hood" ? "Hood" : "Solana"} TEE wallet, and ${safeText(payer.address)} is the embedded wallet. Name the TEE wallet with --wallet. Nothing was built.`);
+    if (payer.kind !== "tee") {
+      if (values["--to"] !== undefined && values["--to"] !== "embedded")
+        throw new TradingError("VALIDATION_FAILED", "Embedded deposits land only in their own Hyperliquid account");
+      const body = {
+        clientDepositId: id,
+        walletId: "embedded",
+        asset,
+        amountRaw: rawAmount(amount, BRIDGE_ASSETS[asset].decimals),
+        maxSlippageBps: slippageBps
+      };
+      const preview2 = await perpsRequest(ctx, key, "/api/v1/agent/perps/deposit", { ...body, preview: true });
+      if (parsed.booleans.has("--no-submit"))
+        return printTradingResult(ctx, preview2);
+      writeFields(ctx.deps, "stderr", [
+        ["Deposit", id],
+        ["Amount", `${amount} ${asset}`],
+        ["Destination", "Own embedded Hyperliquid account"]
+      ]);
+      if (!parsed.booleans.has("--yes") && (await ctx.deps.promptLine("Send? [y/N] ")).trim().toLowerCase() !== "y")
+        throw new TradingError("CANCELLED", "Deposit cancelled", { exitCode: CANCELLED_EXIT });
+      const result3 = await perpsRequest(ctx, key, "/api/v1/agent/perps/deposit", body);
+      const statusRead = `/api/v1/agent/perps/deposit/${encodeURIComponent(id)}`;
+      const status = await perpsRequest(ctx, key, statusRead);
+      return printTradingResult(ctx, { ...result3, ...status, statusRead });
+    }
     const wallet3 = payer.wallet;
     let destination;
     if (origin === "hood") {
@@ -100709,7 +102213,7 @@ async function runStep2(io, step, path, body, intent) {
   step.nonce = typeof build.nonce === "number" ? build.nonce : null;
   if (typeof build.cloid === "string")
     step.cloid = build.cloid;
-  const check = await verifyPerpsBuildAgainstVenue2(build, {
+  const check2 = await verifyPerpsBuildAgainstVenue2(build, {
     builder: io.builder,
     network: io.network,
     address: io.address,
@@ -100718,9 +102222,9 @@ async function runStep2(io, step, path, body, intent) {
     now: io.now,
     keyReduceOnly: io.keyReduceOnly
   });
-  if (!check.ok) {
+  if (!check2.ok) {
     step.status = "rejected";
-    step.detail = `Refused to sign this build: ${check.reason}. Nothing was signed.`;
+    step.detail = `Refused to sign this build: ${check2.reason}. Nothing was signed.`;
     return false;
   }
   step.status = "built";
@@ -100832,10 +102336,10 @@ async function runPerpsTpsl2(io, params) {
   const coin = typeof server.coin === "string" ? server.coin : params.coin.toUpperCase();
   const venueLegs = snapshot.orders.filter((o) => o.coin === coin && o.tpsl !== null);
   const tracked = [];
-  for (const raw of Array.isArray(server.tracked) ? server.tracked : []) {
-    const seen = venueLegs.find((o) => o.oid === raw.oid && o.tpsl === raw.leg && (o.cloid ?? null) === (raw.cloid ?? null));
+  for (const raw2 of Array.isArray(server.tracked) ? server.tracked : []) {
+    const seen = venueLegs.find((o) => o.oid === raw2.oid && o.tpsl === raw2.leg && (o.cloid ?? null) === (raw2.cloid ?? null));
     if (seen)
-      tracked.push({ leg: raw.leg, oid: seen.oid, cloid: seen.cloid, triggerPx: seen.triggerPx });
+      tracked.push({ leg: raw2.leg, oid: seen.oid, cloid: seen.cloid, triggerPx: seen.triggerPx });
   }
   const trackedOids = new Set(tracked.map((l) => l.oid));
   const unowned = venueLegs.filter((o) => !trackedOids.has(o.oid)).map((o) => ({ leg: o.tpsl, oid: o.oid, cloid: o.cloid, triggerPx: o.triggerPx }));
@@ -101205,9 +102709,9 @@ async function perpsMargin(args, ctx) {
     }
     if (mode !== "cross" && mode !== "isolated")
       return usage9(ctx, "--mode must be cross or isolated.");
-    const raw = values["--leverage"];
-    const leverage = raw === undefined ? undefined : Number(raw);
-    if (leverage !== undefined && (!/^[1-9][0-9]{0,2}$/.test(raw) || !Number.isInteger(leverage)))
+    const raw2 = values["--leverage"];
+    const leverage = raw2 === undefined ? undefined : Number(raw2);
+    if (leverage !== undefined && (!/^[1-9][0-9]{0,2}$/.test(raw2) || !Number.isInteger(leverage)))
       return usage9(ctx, "--leverage must be a whole number of at least 1.");
     return await runPerpsWrite(ctx, {
       path: "/api/v1/agent/perps/leverage",
@@ -101243,11 +102747,10 @@ async function perpsScheduleCancel(args, ctx) {
 }
 async function workflowIo(ctx, opts) {
   const key = await tradingKey(ctx);
-  const { wallet: wallet3 } = await perpsWallet(ctx, key, opts.wallet, PERPS_SCOPE);
-  if (!wallet3)
-    throw new TradingError("TEE_WALLET_REQUIRED", "No EVM TEE wallet resolved.");
+  const { wallet: signerWallet, row: wallet3 } = await perpsWallet(ctx, key, opts.wallet, PERPS_SCOPE);
   const builder = builderPin2(ctx);
   const reduceOnly = await perpsRequest(ctx, key, "/api/v1/agent/keys/self/perps-reduce-only").catch(() => null);
+  let embeddedSignature;
   return {
     network: perpsNetwork(ctx),
     walletId: wallet3.id,
@@ -101256,10 +102759,16 @@ async function workflowIo(ctx, opts) {
     keyReduceOnly: reduceOnly === null ? true : reduceOnly.perpsReduceOnly === true,
     fetcher: ctx.deps.fetch,
     now: ctx.deps.now,
-    build: (path, body) => perpsRequest(ctx, key, path, body),
+    build: async (path, body) => {
+      const build = await perpsRequest(ctx, key, path, body);
+      embeddedSignature = build.signature;
+      return build;
+    },
     read: (path) => perpsRequest(ctx, key, path),
     sign: async (typedData) => {
-      const relay2 = await perpsRequest(ctx, key, `/api/v1/agent/wallets/${encodeURIComponent(wallet3.id)}/sign`, typedDataAuthorization(wallet3, typedData));
+      if (wallet3.id === "embedded")
+        return hyperliquidSignatureHex2(embeddedSignature);
+      const relay2 = await perpsRequest(ctx, key, `/api/v1/agent/wallets/${encodeURIComponent(wallet3.id)}/sign`, typedDataAuthorization(signerWallet, typedData));
       if (typeof relay2.signature !== "string" || !/^0x[0-9a-fA-F]{130}$/.test(relay2.signature))
         throw new TradingError("INVALID_RESPONSE", "The relay did not return a signature.");
       return relay2.signature;
@@ -101708,7 +103217,7 @@ function parseSendAssetAmount(value, form) {
     return null;
   return BigInt(whole) * 1000000n + BigInt(frac.padEnd(6, "0"));
 }
-function isObject3(value) {
+function isObject4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function exactKeys3(value, keys) {
@@ -101719,15 +103228,15 @@ function sameEvm(a, b) {
   return typeof a === "string" && EVM_ADDRESS_RE5.test(a) && a.toLowerCase() === b.toLowerCase();
 }
 function typesMatch(types4, expected) {
-  if (!isObject3(types4) || !exactKeys3(types4, Object.keys(expected)))
+  if (!isObject4(types4) || !exactKeys3(types4, Object.keys(expected)))
     return false;
   return Object.entries(expected).every(([key, want]) => {
     const fields2 = types4[key];
-    return Array.isArray(fields2) && fields2.length === want.length && fields2.every((field, i) => isObject3(field) && exactKeys3(field, ["name", "type"]) && field.name === want[i]?.name && field.type === want[i]?.type);
+    return Array.isArray(fields2) && fields2.length === want.length && fields2.every((field, i) => isObject4(field) && exactKeys3(field, ["name", "type"]) && field.name === want[i]?.name && field.type === want[i]?.type);
   });
 }
 function domainMatches(domain, expected) {
-  return isObject3(domain) && exactKeys3(domain, ["name", "version", "chainId", "verifyingContract"]) && domain.name === expected.name && domain.version === expected.version && domain.chainId === expected.chainId && typeof domain.verifyingContract === "string" && domain.verifyingContract.toLowerCase() === ZERO;
+  return isObject4(domain) && exactKeys3(domain, ["name", "version", "chainId", "verifyingContract"]) && domain.name === expected.name && domain.version === expected.version && domain.chainId === expected.chainId && typeof domain.verifyingContract === "string" && domain.verifyingContract.toLowerCase() === ZERO;
 }
 function verifyWithdrawMapping(build, expect) {
   const refuse3 = (reason) => ({ ok: false, reason });
@@ -101746,14 +103255,14 @@ function verifyWithdrawMapping(build, expect) {
   if (parseWithdrawAmount(build.amountUsdc) !== expect.amountMicros)
     return refuse3("the build is for another amount");
   const typed = build.typedData;
-  if (!isObject3(typed) || typed.primary_type !== "NonceMapping")
+  if (!isObject4(typed) || typed.primary_type !== "NonceMapping")
     return refuse3("the typed data is not a NonceMapping");
   if (!domainMatches(typed.domain, { name: "RelayNonceMapping", version: "2", chainId: 1 }))
     return refuse3("the NonceMapping domain is not Relay's");
   if (!typesMatch(typed.types, RELAY_NONCE_MAPPING_TYPES))
     return refuse3("the NonceMapping type list differs");
   const message = typed.message;
-  if (!isObject3(message) || !exactKeys3(message, ["chainId", "wallet", "depositor", "id", "nonce"]))
+  if (!isObject4(message) || !exactKeys3(message, ["chainId", "wallet", "depositor", "id", "nonce"]))
     return refuse3("the NonceMapping message has other fields");
   if (message.chainId !== "hyperliquid")
     return refuse3("the NonceMapping names another chain");
@@ -101775,14 +103284,14 @@ function verifyWithdrawSendAsset(authorization, expect) {
   if (pins === null)
     return refuse3("no withdrawal pins are set");
   const typed = authorization.typedData;
-  if (!isObject3(typed) || typed.primary_type !== "HyperliquidTransaction:SendAsset")
+  if (!isObject4(typed) || typed.primary_type !== "HyperliquidTransaction:SendAsset")
     return refuse3("the typed data is not a SendAsset");
   if (!domainMatches(typed.domain, { name: "HyperliquidSignTransaction", version: "1", chainId: 42161 }))
     return refuse3("the SendAsset domain is not Hyperliquid's user-signed domain");
   if (!typesMatch(typed.types, HYPERLIQUID_SEND_ASSET_TYPES))
     return refuse3("the SendAsset type list differs");
   const m = typed.message;
-  if (!isObject3(m) || !exactKeys3(m, SEND_ASSET_KEYS))
+  if (!isObject4(m) || !exactKeys3(m, SEND_ASSET_KEYS))
     return refuse3("the SendAsset message has other fields");
   if (m.hyperliquidChain !== "Mainnet")
     return refuse3("the SendAsset is not on Mainnet");
@@ -101801,7 +103310,7 @@ function verifyWithdrawSendAsset(authorization, expect) {
   if (typeof m.destination !== "string" || !pins.depositories.includes(m.destination.toLowerCase()))
     return refuse3("the SendAsset destination is not a Relay depository on the allow-list");
   const action = authorization.action;
-  if (!isObject3(action) || !exactKeys3(action, ["type", "signatureChainId", ...SEND_ASSET_KEYS]))
+  if (!isObject4(action) || !exactKeys3(action, ["type", "signatureChainId", ...SEND_ASSET_KEYS]))
     return refuse3("the action has other fields");
   if (action.type !== "sendAsset" || action.signatureChainId !== "0xa4b1")
     return refuse3("the action is not a sendAsset");
@@ -101831,12 +103340,12 @@ function usage10(ctx, line) {
   return 2;
 }
 function withdrawPins(env) {
-  const raw = env.CANDLE_PERPS_WITHDRAW_PINS;
-  if (raw === undefined || raw.trim() === "")
+  const raw2 = env.CANDLE_PERPS_WITHDRAW_PINS;
+  if (raw2 === undefined || raw2.trim() === "")
     return CANDLE_PERPS_WITHDRAW_PINS;
   let parsed;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(raw2);
   } catch {
     throw new TradingError("INVALID_PINS", "CANDLE_PERPS_WITHDRAW_PINS is not JSON.");
   }
@@ -101912,13 +103421,74 @@ async function perpsWithdraw(args, ctx) {
       throw new TradingError("PERPS_WITHDRAW_UNVERIFIED", "Hyperliquid withdrawals wait on a recorded verification of Relay's quote shape in this release. Nothing was built.");
     }
     const key = await tradingKey(ctx);
-    const { wallet: wallet3 } = await perpsWallet(ctx, key, parsed.values["--wallet"], WITHDRAW_SCOPE);
+    const { wallet: wallet3, row: row2 } = await perpsWallet(ctx, key, parsed.values["--wallet"], WITHDRAW_SCOPE);
+    if (row2.id === "embedded") {
+      if (to !== "solana" && to !== "hood")
+        throw new TradingError("VALIDATION_FAILED", "Withdraw to solana or hood");
+      const discovered = await perpsRequest(ctx, key, "/api/v1/agent/wallets/embedded");
+      const destination = discovered.wallets[to === "hood" ? "evm" : "solana"];
+      if (!destination?.address)
+        throw new TradingError("AGENT_WALLET_MISSING", "Embedded destination wallet missing");
+      writeFields(ctx.deps, "stderr", [
+        ["Withdrawal", id],
+        ["Withdraw", `${amount} USDC`],
+        ["Hyperliquid account", row2.address],
+        ["Destination", `Own embedded ${to} wallet`],
+        ["To", destination.address]
+      ]);
+      const positions2 = await perpsRequest(ctx, key, "/api/v1/agent/perps/positions?walletId=embedded");
+      if (Array.isArray(positions2.positions) && positions2.positions.length)
+        notice(ctx.deps, "stderr", "warning", "Open positions: withdrawing margin raises liquidation risk.");
+      if ((await ctx.deps.promptLine(`Type confirm to withdraw ${amount} USDC to ${destination.address}: `)).trim().toLowerCase() !== "confirm")
+        throw new TradingError("CANCELLED", "Withdrawal cancelled", { exitCode: CANCELLED_EXIT });
+      const answer2 = await perpsRequest(ctx, key, "/api/v1/agent/perps/withdraw", {
+        walletId: "embedded",
+        clientWithdrawalId: id,
+        amountUsdc: amount,
+        to
+      });
+      if (!answer2.signature)
+        return printTradingResult(ctx, answer2);
+      const from = answer2.from;
+      const target = answer2.to;
+      if (answer2.id !== id || answer2.signer !== "embedded" || from?.address?.toLowerCase() !== row2.address.toLowerCase() || target?.address?.toLowerCase() !== destination.address.toLowerCase() || target?.chain !== to)
+        throw new TradingError("PERPS_BUILD_REFUSED", "Withdrawal destination mismatch");
+      const send2 = verifyWithdrawSendAsset(answer2, {
+        mappingNonce: Number(answer2.nonce),
+        amountMicros,
+        pins
+      });
+      if (!send2.ok)
+        throw new TradingError("PERPS_BUILD_REFUSED", `Withdrawal refused: ${send2.reason}`);
+      const signature2 = hyperliquidSignatureHex2(answer2.signature);
+      const exchangeBody2 = hyperliquidExchangeBody2(answer2.action, Number(answer2.nonce), signature2);
+      try {
+        const res = await ctx.deps.fetch(HYPERLIQUID_EXCHANGE_URLS2.mainnet, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(exchangeBody2)
+        });
+        const exchange2 = await res.json();
+        if (!res.ok || hyperliquidExchangeOutcome2(exchange2).status === "unknown")
+          throw new Error("Unconfirmed venue answer");
+        await perpsRequest(ctx, key, "/api/v1/agent/perps/withdraw/submitted", {
+          clientWithdrawalId: id,
+          exchangeResponse: exchange2
+        }).catch(() => {});
+        return printTradingResult(ctx, { ...answer2, signature: signature2, exchange: exchange2 });
+      } catch {
+        throw new TradingError("PERPS_MAYBE_LANDED", "Check withdrawal status; retry only the same id or signed body", {
+          exitCode: 3,
+          details: { clientId: id, exchangeBody: exchangeBody2 }
+        });
+      }
+    }
     if (!wallet3)
       throw new TradingError("TEE_WALLET_REQUIRED", "No EVM TEE wallet resolved.");
     const { rows } = await listTradingWallets(ctx, key);
     if (to !== "solana" && to !== "hood")
       throw new TradingError("PERPS_WITHDRAW_UNVERIFIED", `A withdrawal lands on this key's Solana or Hood TEE wallet; "${to}" has no TEE wallet to land on yet. Nothing was built.`);
-    const ownDestinations = to === "hood" ? [wallet3.address] : rows.filter((row2) => row2.chain === "solana").map((row2) => row2.address);
+    const ownDestinations = to === "hood" ? [wallet3.address] : rows.filter((row3) => row3.chain === "solana").map((row3) => row3.address);
     if (ownDestinations.length === 0)
       throw new TradingError("TEE_WALLET_REQUIRED", "This key has no Solana TEE wallet, so --to solana has nowhere to land. Withdraw --to hood instead.");
     writeFields(ctx.deps, "stderr", [["Withdrawal", id]]);
@@ -101955,8 +103525,8 @@ async function perpsWithdraw(args, ctx) {
     if (Array.isArray(positions?.positions) && positions.positions.length > 0)
       notice(ctx.deps, ctx.json ? "stderr" : "stdout", "warning", `This account has open positions: withdrawing margin raises their liquidation risk.
 `.trim());
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, resolvedVault.path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, resolvedVault.path, raw2, {
       promptText: "Vault passphrase (input hidden): ",
       reason: `withdraw ${formatWithdrawAmount(amountMicros)} USDC to ${build.to.address}`
     });
@@ -101996,9 +103566,9 @@ async function perpsWithdraw(args, ctx) {
       clientWithdrawalId: id,
       exchangeResponse: exchange
     }).catch(() => null);
-    const refusal3 = venueRefusal(exchange);
-    if (refusal3)
-      throw new TradingError("PERPS_VENUE_REFUSED", refusal3, { details: { clientWithdrawalId: id, exchange } });
+    const refusal4 = venueRefusal(exchange);
+    if (refusal4)
+      throw new TradingError("PERPS_VENUE_REFUSED", refusal4, { details: { clientWithdrawalId: id, exchange } });
     notice(ctx.deps, "stderr", "note", `Submitted to Hyperliquid; following Relay's fill.
 `.trim());
     const deadline = ctx.deps.now() + WITHDRAW_POLL_MS;
@@ -102053,7 +103623,7 @@ class X402DecodeError extends Error {
   }
 }
 var BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
-var isObject4 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isObject5 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var isString = (value) => typeof value === "string";
 function encodeHeader(value) {
   return Buffer.from(JSON.stringify(value), "utf8").toString("base64");
@@ -102068,12 +103638,12 @@ function decodeHeader(value) {
   } catch {
     throw new X402DecodeError("not JSON");
   }
-  if (!isObject4(parsed))
+  if (!isObject5(parsed))
     throw new X402DecodeError("not a JSON object");
   return parsed;
 }
 function parseRequirements(value) {
-  if (!isObject4(value))
+  if (!isObject5(value))
     throw new X402DecodeError("requirements are not an object");
   const { scheme, network: network2, amount, asset, payTo, maxTimeoutSeconds, extra } = value;
   if (!isString(scheme) || !isString(network2) || !isString(amount) || !isString(asset) || !isString(payTo)) {
@@ -102082,31 +103652,31 @@ function parseRequirements(value) {
   if (typeof maxTimeoutSeconds !== "number" || !Number.isInteger(maxTimeoutSeconds)) {
     throw new X402DecodeError("maxTimeoutSeconds is not an integer");
   }
-  if (extra !== undefined && !isObject4(extra))
+  if (extra !== undefined && !isObject5(extra))
     throw new X402DecodeError("extra is not an object");
   return { scheme, network: network2, amount, asset, payTo, maxTimeoutSeconds, ...extra ? { extra } : {} };
 }
 function decodePaymentRequired(header) {
-  const object5 = decodeHeader(header);
-  if (object5.x402Version !== X402_VERSION)
+  const object6 = decodeHeader(header);
+  if (object6.x402Version !== X402_VERSION)
     throw new X402DecodeError("x402Version is not 2");
-  const resource = object5.resource;
-  if (!isObject4(resource) || !isString(resource.url))
+  const resource = object6.resource;
+  if (!isObject5(resource) || !isString(resource.url))
     throw new X402DecodeError("resource is missing");
-  if (!Array.isArray(object5.accepts))
+  if (!Array.isArray(object6.accepts))
     throw new X402DecodeError("accepts is not an array");
-  if (object5.error !== undefined && !isString(object5.error))
+  if (object6.error !== undefined && !isString(object6.error))
     throw new X402DecodeError("error is not a string");
   return {
     x402Version: X402_VERSION,
-    ...isString(object5.error) ? { error: object5.error } : {},
+    ...isString(object6.error) ? { error: object6.error } : {},
     resource: {
       url: resource.url,
       ...isString(resource.description) ? { description: resource.description } : {},
       ...isString(resource.mimeType) ? { mimeType: resource.mimeType } : {}
     },
-    accepts: object5.accepts.map(parseRequirements),
-    ...isObject4(object5.extensions) ? { extensions: object5.extensions } : {}
+    accepts: object6.accepts.map(parseRequirements),
+    ...isObject5(object6.extensions) ? { extensions: object6.extensions } : {}
   };
 }
 function paymentRequiredOf(headers2) {
@@ -102124,8 +103694,8 @@ function settlementOf(headers2) {
   if (header === undefined)
     return null;
   try {
-    const object5 = decodeHeader(header);
-    const { success: success2, errorReason, payer, transaction, network: network2 } = object5;
+    const object6 = decodeHeader(header);
+    const { success: success2, errorReason, payer, transaction, network: network2 } = object6;
     if (typeof success2 !== "boolean" || !isString(transaction) || !isString(network2))
       return null;
     return {
@@ -102158,11 +103728,11 @@ function signupSignerRef(spkiSha256) {
 function planStatePath(paths) {
   return paths.log.replace(/\.jsonl$/, ".plan.json");
 }
-var isObject5 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isObject6 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 var str = (value) => typeof value === "string" ? value : undefined;
 var plan = (value) => value === "pro" || value === "max" ? value : undefined;
 function parsePending(value) {
-  if (!isObject5(value) || !isObject5(value.body))
+  if (!isObject6(value) || !isObject6(value.body))
     return;
   const p = plan(value.plan);
   const { id, path, paymentHeader, amountRaw, payer, startedAt } = value;
@@ -102191,7 +103761,7 @@ function parsePending(value) {
   };
 }
 function parseSigner(value) {
-  if (!isObject5(value))
+  if (!isObject6(value))
     return;
   const { spkiSha256, publicKeyDer, fingerprint, payer, createdAt } = value;
   if (typeof spkiSha256 !== "string" || !/^[0-9a-f]{64}$/.test(spkiSha256) || typeof publicKeyDer !== "string" || typeof fingerprint !== "string" || typeof payer !== "string" || typeof createdAt !== "string") {
@@ -102202,25 +103772,25 @@ function parseSigner(value) {
 function parsePlanState(text4) {
   if (text4 === null)
     return { autoRenew: false };
-  let raw;
+  let raw2;
   try {
-    raw = JSON.parse(text4);
+    raw2 = JSON.parse(text4);
   } catch {
     return { autoRenew: false };
   }
-  if (!isObject5(raw))
+  if (!isObject6(raw2))
     return { autoRenew: false };
-  const ceiling = str(raw.renewCeilingRaw);
-  const pending = parsePending(raw.pending);
-  const signers = Array.isArray(raw.signupSigners) ? raw.signupSigners.map(parseSigner).filter((s) => s !== undefined) : [];
-  const p = plan(raw.plan);
+  const ceiling = str(raw2.renewCeilingRaw);
+  const pending = parsePending(raw2.pending);
+  const signers = Array.isArray(raw2.signupSigners) ? raw2.signupSigners.map(parseSigner).filter((s) => s !== undefined) : [];
+  const p = plan(raw2.plan);
   return {
-    autoRenew: raw.autoRenew === true,
+    autoRenew: raw2.autoRenew === true,
     ...p ? { plan: p } : {},
-    ...str(raw.payer) ? { payer: str(raw.payer) } : {},
-    ...str(raw.periodEnd) && Number.isFinite(Date.parse(str(raw.periodEnd) ?? "")) ? { periodEnd: str(raw.periodEnd) } : {},
+    ...str(raw2.payer) ? { payer: str(raw2.payer) } : {},
+    ...str(raw2.periodEnd) && Number.isFinite(Date.parse(str(raw2.periodEnd) ?? "")) ? { periodEnd: str(raw2.periodEnd) } : {},
     ...ceiling && /^[0-9]{1,20}$/.test(ceiling) ? { renewCeilingRaw: ceiling } : {},
-    ...str(raw.lastRenewAttemptAt) ? { lastRenewAttemptAt: str(raw.lastRenewAttemptAt) } : {},
+    ...str(raw2.lastRenewAttemptAt) ? { lastRenewAttemptAt: str(raw2.lastRenewAttemptAt) } : {},
     ...pending ? { pending } : {},
     ...signers.length > 0 ? { signupSigners: signers } : {}
   };
@@ -102278,14 +103848,14 @@ function isAddress2(value) {
   }
 }
 function networkConfig(env) {
-  const raw = env[NETWORK_ENV]?.trim() ?? "";
+  const raw2 = env[NETWORK_ENV]?.trim() ?? "";
   let network2;
-  if (raw === "" || raw === "mainnet" || raw === SOLANA_MAINNET)
+  if (raw2 === "" || raw2 === "mainnet" || raw2 === SOLANA_MAINNET)
     network2 = SOLANA_MAINNET;
-  else if (raw === "devnet" || raw === SOLANA_DEVNET)
+  else if (raw2 === "devnet" || raw2 === SOLANA_DEVNET)
     network2 = SOLANA_DEVNET;
   else
-    return { ok: false, message: `${NETWORK_ENV} must be mainnet or devnet, not "${raw}".` };
+    return { ok: false, message: `${NETWORK_ENV} must be mainnet or devnet, not "${raw2}".` };
   const override = env[PAY_TO_ENV]?.trim() ?? "";
   if (network2 === SOLANA_MAINNET) {
     if (override !== "") {
@@ -102439,18 +104009,18 @@ async function readIfPresent2(path) {
 var micros = (value, fallback) => typeof value === "string" && /^[0-9]{1,15}$/.test(value) ? BigInt(value) : fallback;
 async function readLimits(paths) {
   const text4 = await readIfPresent2(paths.limits);
-  let raw = {};
+  let raw2 = {};
   if (text4 !== null) {
     try {
       const parsed = JSON.parse(text4);
       if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed))
-        raw = parsed;
+        raw2 = parsed;
     } catch {}
   }
   return {
-    dailyLimitUsdMicros: micros(raw.dailyLimitUsdMicros, DEFAULT_DAILY_LIMIT_USD_MICROS),
-    maxPerCallUsdMicros: micros(raw.maxPerCallUsdMicros, DEFAULT_MAX_PER_CALL_USD_MICROS),
-    paused: raw.paused === true
+    dailyLimitUsdMicros: micros(raw2.dailyLimitUsdMicros, DEFAULT_DAILY_LIMIT_USD_MICROS),
+    maxPerCallUsdMicros: micros(raw2.maxPerCallUsdMicros, DEFAULT_MAX_PER_CALL_USD_MICROS),
+    paused: raw2.paused === true
   };
 }
 async function writeLimits(paths, limits) {
@@ -102609,8 +104179,8 @@ async function openVaultSigner(ctx, options) {
   const resolved = vaultPathFor(ctx, { positionals: [], values: {}, booleans: new Set });
   if ("error" in resolved)
     throw new VaultError("VAULT_MISSING", resolved.error);
-  const raw = await requireVaultRaw(ctx, resolved);
-  const opened = await unlockInteractively(ctx, resolved.path, raw, {
+  const raw2 = await requireVaultRaw(ctx, resolved);
+  const opened = await unlockInteractively(ctx, resolved.path, raw2, {
     reason: options.reason,
     purpose: "x402 payment"
   });
@@ -102655,14 +104225,14 @@ init_client();
 // src/x402/siwx.ts
 init_esm();
 var SIWX_EXTENSION = "sign-in-with-x";
-var isObject6 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+var isObject7 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 function spendChallengeOf(extensions, apiHost, network2) {
   const extension = extensions?.[SIWX_EXTENSION];
-  if (!isObject6(extension) || !isObject6(extension.info))
+  if (!isObject7(extension) || !isObject7(extension.info))
     return null;
   const info3 = extension.info;
   const chains = Array.isArray(extension.supportedChains) ? extension.supportedChains : [];
-  const chain2 = chains.find((c) => isObject6(c) && c.chainId === network2 && c.type === "ed25519");
+  const chain2 = chains.find((c) => isObject7(c) && c.chainId === network2 && c.type === "ed25519");
   if (!chain2)
     return null;
   const { domain, uri, version, nonce, issuedAt, expirationTime } = info3;
@@ -102838,10 +104408,10 @@ async function paidRequest(input) {
   let required = paymentRequiredOf(first.headers);
   if (!required)
     return plain(first);
-  const refused2 = (result2, refusal3) => ({
+  const refused2 = (result2, refusal4) => ({
     result: result2,
     payment: null,
-    refusal: refusal3,
+    refusal: refusal4,
     servedFromCredit: false
   });
   const network2 = networkConfig(input.env);
@@ -103122,9 +104692,9 @@ function isSolanaAddress2(value) {
     return false;
   }
 }
-var isObject7 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
-function quotedPlanOf(raw) {
-  const plan2 = isObject7(raw) && isObject7(raw.plan) ? raw.plan : null;
+var isObject8 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+function quotedPlanOf(raw2) {
+  const plan2 = isObject8(raw2) && isObject8(raw2.plan) ? raw2.plan : null;
   if (!plan2)
     return null;
   const n = (v) => typeof v === "string" && /^[0-9]{1,20}$/.test(v) ? BigInt(v) : null;
@@ -103136,14 +104706,14 @@ function quotedPlanOf(raw) {
   return { listRaw, creditRaw, dueRaw, signup: plan2.signup === true };
 }
 function receiptOf(body) {
-  if (!isObject7(body) || body.status !== "fulfilled" || typeof body.account !== "string")
+  if (!isObject8(body) || body.status !== "fulfilled" || typeof body.account !== "string")
     return null;
   if (body.plan !== "pro" && body.plan !== "max")
     return null;
   const paid = typeof body.amountPaidUsdMicros === "string" && /^[0-9]{1,20}$/.test(body.amountPaidUsdMicros);
-  const s = isObject7(body.signup) ? body.signup : null;
-  const signer = s && isObject7(s.signer) ? s.signer : null;
-  const wallets2 = s && isObject7(s.wallets) ? s.wallets : null;
+  const s = isObject8(body.signup) ? body.signup : null;
+  const signer = s && isObject8(s.signer) ? s.signer : null;
+  const wallets2 = s && isObject8(s.wallets) ? s.wallets : null;
   const signup = s && typeof s.keyPrefix === "string" && signer && typeof signer.fingerprint === "string" && typeof signer.signerQuorumId === "string" && wallets2 && typeof wallets2.solana === "string" && typeof wallets2.evm === "string" ? {
     keyPrefix: s.keyPrefix,
     fingerprint: signer.fingerprint,
@@ -103561,7 +105131,7 @@ async function runPlanPayment(ctx, run2) {
         return 1;
       }
     }
-    const termsUrl = isObject7(quote.raw) && isObject7(quote.raw.terms) && typeof quote.raw.terms.url === "string" ? quote.raw.terms.url : CANDLE_TERMS_URL;
+    const termsUrl = isObject8(quote.raw) && isObject8(quote.raw.terms) && typeof quote.raw.terms.url === "string" ? quote.raw.terms.url : CANDLE_TERMS_URL;
     writeFields(deps, json || run2.mode === "auto" ? "stderr" : "stdout", [
       ["Plan", `Candle ${planName(run2.plan)}, 30 days${renew ? " (renewal)" : ""}${isSignup ? ", new account" : ""}`],
       ...quoted && quoted.creditRaw > 0n ? [
@@ -103696,7 +105266,7 @@ async function serverPlan(ctx, apiKey) {
     env: ctx.deps.env,
     fetch: ctx.deps.fetch
   });
-  if (!result2.ok || !isObject7(result2.body))
+  if (!result2.ok || !isObject8(result2.body))
     return null;
   const tier = typeof result2.body.tier === "string" ? result2.body.tier : null;
   const expires = result2.body.maxTierExpiresAt;
@@ -103796,9 +105366,9 @@ async function planStatus(args, ctx) {
     if (!payments.ok && payments.status === 404) {
       paymentNote = "x402 payment history is not available yet on this Candle server; any payment shown is this machine's record.";
     }
-    if (payments.ok && isObject7(payments.body) && Array.isArray(payments.body.payments)) {
-      const found = payments.body.payments.find((p) => isObject7(p) && p.kind === PLAN_SPEND_KIND);
-      lastServer = isObject7(found) ? found : null;
+    if (payments.ok && isObject8(payments.body) && Array.isArray(payments.body.payments)) {
+      const found = payments.body.payments.find((p) => isObject8(p) && p.kind === PLAN_SPEND_KIND);
+      lastServer = isObject8(found) ? found : null;
     }
   }
   const local = foldSpendLog(await readSpendLog(paths)).filter((e) => e.kind === PLAN_SPEND_KIND).sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))[0];
@@ -104206,10 +105776,10 @@ init_human_output();
 init_presentation();
 init_key_output();
 var NAME_SHAPE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
-function canonicalSecretName(raw) {
-  if (!NAME_SHAPE.test(raw))
+function canonicalSecretName(raw2) {
+  if (!NAME_SHAPE.test(raw2))
     return;
-  return raw.toUpperCase();
+  return raw2.toUpperCase();
 }
 function secretRef(profile, name2) {
   return profile === undefined ? `secret:${name2}` : `profile:${profile}:secret:${name2}`;
@@ -104234,12 +105804,12 @@ async function secretsSet(args, ctx) {
   const parsed = parseArgs(args, {});
   if ("error" in parsed)
     return usage11(ctx, parsed.error);
-  const [raw, extra] = parsed.positionals;
-  if (!raw || extra !== undefined)
+  const [raw2, extra] = parsed.positionals;
+  if (!raw2 || extra !== undefined)
     return usage11(ctx, "Usage: candle secrets set <name>");
-  const name2 = canonicalSecretName(raw);
+  const name2 = canonicalSecretName(raw2);
   if (name2 === undefined) {
-    return usage11(ctx, `A secret name is letters, digits and underscores, starting with a letter: ${raw}`);
+    return usage11(ctx, `A secret name is letters, digits and underscores, starting with a letter: ${raw2}`);
   }
   if (!ctx.deps.isTTY.stdin || !ctx.deps.isTTY.stdout) {
     writeScreenLocalFailure(ctx.deps, {
@@ -104296,12 +105866,12 @@ async function secretsRemove(args, ctx) {
   const parsed = parseArgs(args, {});
   if ("error" in parsed)
     return usage11(ctx, parsed.error);
-  const [raw, extra] = parsed.positionals;
-  if (!raw || extra !== undefined)
+  const [raw2, extra] = parsed.positionals;
+  if (!raw2 || extra !== undefined)
     return usage11(ctx, "Usage: candle secrets remove <name>");
-  const name2 = canonicalSecretName(raw);
+  const name2 = canonicalSecretName(raw2);
   if (name2 === undefined) {
-    return usage11(ctx, `A secret name is letters, digits and underscores, starting with a letter: ${raw}`);
+    return usage11(ctx, `A secret name is letters, digits and underscores, starting with a letter: ${raw2}`);
   }
   await ctx.deps.secretsStore.delete(secretRef(ctx.profile, name2));
   const names = await storedSecretNames(ctx.deps, ctx.profile);
@@ -104380,8 +105950,8 @@ async function runPlugin(name2, rawArgs, ctx) {
       return usage2(ctx, resolvedVault.error);
     const vaultPath = resolvedVault.path;
     const resolved = await runVaultCommand(ctx, async ({ hold }) => {
-      const raw = await requireVaultRaw(ctx, resolvedVault);
-      const vault = hold((await unlockInteractively(promptCtx, vaultPath, raw)).vault);
+      const raw2 = await requireVaultRaw(ctx, resolvedVault);
+      const vault = hold((await unlockInteractively(promptCtx, vaultPath, raw2)).vault);
       for (const requested of split2.wallets) {
         const entry2 = findExternalEntry(vault.index, requested);
         if (entry2 === undefined) {
@@ -104508,6 +106078,17 @@ function writeHyperliquidPnl(ctx, section2) {
   out.write(`
 ${financialHeading("Hyperliquid", style)}
 `);
+  if (section2.embeddedOrders) {
+    out.write(`${fields([["Embedded orders for this key", section2.embeddedOrders.rows.length]], style).join(`
+`)}
+`);
+    for (const row2 of section2.embeddedOrders.rows)
+      out.write(`${terminalText(row2.kind)} ${terminalText(row2.coin ?? "")} ${terminalText(row2.status)} ${terminalText(row2.clientId ?? row2.id)}
+`);
+    notice(ctx.deps, "stdout", "note", "Embedded rows are scoped to this key. Shared-account funding and PnL are not attributed to individual keys.");
+    if (section2.embeddedOrders.truncated)
+      notice(ctx.deps, "stdout", "warning", "Only recent embedded orders are shown.");
+  }
   if (!section2.read) {
     notice(ctx.deps, "stdout", "warning", `Unavailable: ${terminalText(section2.reason)}`);
     return;
@@ -105140,14 +106721,14 @@ async function portfolio(args, ctx) {
     let vaultReason;
     let vaultSkipped = false;
     let known = 0;
-    const raw = noVault ? null : await readVaultRaw(resolvedVault.path);
+    const raw2 = noVault ? null : await readVaultRaw(resolvedVault.path);
     let vault;
-    if (raw !== null) {
+    if (raw2 !== null) {
       if (!refuseEnvPassphrase(ctx))
         return 1;
       try {
         const unlockCtx = refusePromptsWithoutTerminal(ctx, "portfolio");
-        vault = hold((await unlockInteractively(unlockCtx, resolvedVault.path, raw)).vault);
+        vault = hold((await unlockInteractively(unlockCtx, resolvedVault.path, raw2)).vault);
       } catch (error) {
         if (!isNoTerminalRefusal(error))
           throw error;
@@ -105155,7 +106736,7 @@ async function portfolio(args, ctx) {
     }
     if (noVault) {
       vaultReason = "not read (--no-vault)";
-    } else if (raw === null) {
+    } else if (raw2 === null) {
       vaultReason = `no vault at ${resolvedVault.path}`;
     } else if (vault === undefined) {
       vaultReason = NO_TERMINAL_REASON;
@@ -105667,13 +107248,13 @@ function solanaHoldings(read3, prices) {
   };
 }
 function valueHoldings(read3, prices) {
-  const raw = [];
+  const raw2 = [];
   if (read3.lamports !== null && BigInt(read3.lamports) > 0n) {
-    raw.push({ mint: SOL_MINT, amountRaw: read3.lamports, decimals: 9, program: "native" });
+    raw2.push({ mint: SOL_MINT, amountRaw: read3.lamports, decimals: 9, program: "native" });
   }
   for (const token2 of read3.tokens ?? [])
-    raw.push(token2);
-  return raw.map((h) => {
+    raw2.push(token2);
+  return raw2.map((h) => {
     const price = prices[h.mint];
     const priceUsd = price?.priceUsd ?? null;
     const amount = formatAmount(h.amountRaw, h.decimals);
@@ -105691,14 +107272,14 @@ function valueHoldings(read3, prices) {
 function hoodHoldings(read3, prices, tokensPart) {
   if (read3 === undefined || read3.wei === null && read3.tokens === null)
     return { holdings: null, unread: [] };
-  const raw = [];
+  const raw2 = [];
   if (read3.wei !== null && BigInt(read3.wei) > 0n) {
-    raw.push({ mint: HOOD_NATIVE, amountRaw: read3.wei, decimals: NATIVE_DECIMALS, program: "native", symbol: "ETH" });
+    raw2.push({ mint: HOOD_NATIVE, amountRaw: read3.wei, decimals: NATIVE_DECIMALS, program: "native", symbol: "ETH" });
   }
   for (const token2 of read3.tokens ?? []) {
     if (!/^\d+$/.test(token2.amountRaw) || BigInt(token2.amountRaw) === 0n)
       continue;
-    raw.push({
+    raw2.push({
       mint: token2.mint,
       amountRaw: token2.amountRaw,
       decimals: token2.decimals,
@@ -105706,7 +107287,7 @@ function hoodHoldings(read3, prices, tokensPart) {
       ...token2.symbol ? { symbol: token2.symbol } : {}
     });
   }
-  const holdings2 = raw.map(({ symbol, ...h }) => {
+  const holdings2 = raw2.map(({ symbol, ...h }) => {
     const price = prices[hoodPriceKey(h.mint)];
     const priceUsd = price?.priceUsd ?? null;
     const amount = formatAmount(h.amountRaw, h.decimals);
@@ -106236,42 +107817,42 @@ function offerFailure(status, headers2, body) {
   }
   return { code: "PAYMENT_REQUIRED", message, details };
 }
-function turnRefusal(refusal3) {
-  const details = { status: refusal3.status };
-  if (refusal3.retryable !== undefined)
-    details.retryable = refusal3.retryable;
-  switch (refusal3.code) {
+function turnRefusal(refusal4) {
+  const details = { status: refusal4.status };
+  if (refusal4.retryable !== undefined)
+    details.retryable = refusal4.retryable;
+  switch (refusal4.code) {
     case "limit_reached":
       return {
-        code: refusal3.code,
-        message: refusal3.resetsAt !== undefined ? `This account has used today's Quant answers. They reset at ${refusal3.resetsAt}.` : "This account has used today's Quant answers.",
-        details: { ...details, ...refusal3.resetsAt !== undefined ? { resetsAt: refusal3.resetsAt } : {} }
+        code: refusal4.code,
+        message: refusal4.resetsAt !== undefined ? `This account has used today's Quant answers. They reset at ${refusal4.resetsAt}.` : "This account has used today's Quant answers.",
+        details: { ...details, ...refusal4.resetsAt !== undefined ? { resetsAt: refusal4.resetsAt } : {} }
       };
     case "turn_in_progress":
       return {
-        code: refusal3.code,
-        message: `Quant is already answering another question on this account${refusal3.turnId ? ` (turn ${refusal3.turnId})` : ""}. Try again when it ends.`,
-        details: { ...details, ...refusal3.turnId ? { turnId: refusal3.turnId } : {} }
+        code: refusal4.code,
+        message: `Quant is already answering another question on this account${refusal4.turnId ? ` (turn ${refusal4.turnId})` : ""}. Try again when it ends.`,
+        details: { ...details, ...refusal4.turnId ? { turnId: refusal4.turnId } : {} }
       };
     case "text_too_long":
       return {
-        code: refusal3.code,
-        message: refusal3.limit !== undefined ? `Too long: Quant takes up to ${refusal3.limit} characters.` : "Too long for Quant.",
-        details: { ...details, ...refusal3.limit !== undefined ? { limit: refusal3.limit } : {} }
+        code: refusal4.code,
+        message: refusal4.limit !== undefined ? `Too long: Quant takes up to ${refusal4.limit} characters.` : "Too long for Quant.",
+        details: { ...details, ...refusal4.limit !== undefined ? { limit: refusal4.limit } : {} }
       };
     case "RATE_LIMITED":
-      return { code: refusal3.code, message: "Too many requests just now. Wait a minute and ask again.", details };
+      return { code: refusal4.code, message: "Too many requests just now. Wait a minute and ask again.", details };
     case "VALIDATION_FAILED":
-      return { code: refusal3.code, message: "The API refused the question as malformed.", details };
+      return { code: refusal4.code, message: "The API refused the question as malformed.", details };
     case "NO_IDENTITY_WALLET":
       return {
-        code: refusal3.code,
+        code: refusal4.code,
         message: "This key's account has no identity wallet, and Quant answers per identity wallet.",
         details
       };
     case "TERMS_REQUIRED":
       return {
-        code: refusal3.code,
+        code: refusal4.code,
         message: "Quant's terms are not accepted on this account yet.",
         suggestion: "Run: candle quant terms",
         details
@@ -106281,14 +107862,14 @@ function turnRefusal(refusal3) {
       return {
         code: "QUANT_UNREACHABLE",
         message: `No answer from the API after ${QUANT_ASK_SEND_TRIES} tries.`,
-        details: { ...details, cause: refusal3.code }
+        details: { ...details, cause: refusal4.code }
       };
   }
-  if (refusal3.status === 404)
+  if (refusal4.status === 404)
     return offFailure();
   return {
-    code: refusal3.code,
-    message: `Quant refused the question: ${refusal3.code} (HTTP ${refusal3.status}).`,
+    code: refusal4.code,
+    message: `Quant refused the question: ${refusal4.code} (HTTP ${refusal4.status}).`,
     details
   };
 }
@@ -106305,23 +107886,23 @@ async function follow(client2, ctx, turnId, signal) {
     if (signal.aborted)
       break;
     if (!answer2.ok) {
-      const refusal3 = answer2.refusal;
-      if (refusal3.code === "too_many_polls" && ++tooMany <= TOO_MANY_POLLS_RETRIES2) {
+      const refusal4 = answer2.refusal;
+      if (refusal4.code === "too_many_polls" && ++tooMany <= TOO_MANY_POLLS_RETRIES2) {
         await ctx.deps.sleep(TOO_MANY_POLLS_WAIT_MS2);
         continue;
       }
-      if (refusal3.shape === "transport" && ++lost <= LOST_POLL_RETRIES2) {
+      if (refusal4.shape === "transport" && ++lost <= LOST_POLL_RETRIES2) {
         await ctx.deps.sleep(Math.min(1000 * lost, 5000));
         continue;
       }
-      if (refusal3.status === 404 && refusal3.code === "HTTP_404")
+      if (refusal4.status === 404 && refusal4.code === "HTTP_404")
         return { ok: false, failure: offFailure() };
       return {
         ok: false,
         failure: {
-          code: refusal3.code === "TIMEOUT" || refusal3.code === "NETWORK_ERROR" ? "QUANT_UNREACHABLE" : refusal3.code,
-          message: `Lost Quant's answer while it was being written: ${refusal3.code}.`,
-          details: { turnId, status: refusal3.status }
+          code: refusal4.code === "TIMEOUT" || refusal4.code === "NETWORK_ERROR" ? "QUANT_UNREACHABLE" : refusal4.code,
+          message: `Lost Quant's answer while it was being written: ${refusal4.code}.`,
+          details: { turnId, status: refusal4.status }
         }
       };
     }
@@ -106416,21 +107997,21 @@ async function quantAsk(args, ctx) {
   try {
     const clientTurnId = newClientTurnId();
     let turnId;
-    let refusal3;
+    let refusal4;
     for (let attempt = 1;attempt <= QUANT_ASK_SEND_TRIES; attempt++) {
       const sent = await client2.sendTurn({ text: text4, clientTurnId });
       if (sent.ok) {
         turnId = sent.body.turnId;
         break;
       }
-      refusal3 = sent.refusal;
-      if (refusal3.shape !== "transport" || stop.signal.aborted)
+      refusal4 = sent.refusal;
+      if (refusal4.shape !== "transport" || stop.signal.aborted)
         break;
     }
     if (turnId === undefined) {
       if (reason === "interrupted")
         return await stopped(ctx, client2, undefined, reason, timeoutS);
-      const failure4 = refusal3?.status === 402 && offer ? offerFailure(offer.status, offer.headers, offer.body) : turnRefusal(refusal3 ?? { code: "BAD_RESPONSE", status: 0, shape: "transport" });
+      const failure4 = refusal4?.status === 402 && offer ? offerFailure(offer.status, offer.headers, offer.body) : turnRefusal(refusal4 ?? { code: "BAD_RESPONSE", status: 0, shape: "transport" });
       writeScreenLocalFailure(ctx.deps, failure4, ctx.json);
       return 1;
     }
@@ -106606,15 +108187,15 @@ var OTHER_CHAIN = "Candle trades Solana and Hood today; that is not a Solana or 
 function chainOfAddress(address, chain2) {
   return requestAddressChain2(address, chain2);
 }
-var isObject8 = (value) => value !== null && typeof value === "object";
+var isObject9 = (value) => value !== null && typeof value === "object";
 function readCard(body) {
-  if (!isObject8(body) || body.success !== true || !isObject8(body.card))
+  if (!isObject9(body) || body.success !== true || !isObject9(body.card))
     return null;
   const card2 = body.card;
   const blocks = ["identity", "market", "forensics", "events", "hacc", "sameName", "sources", "links"];
   if (typeof card2.mint !== "string" || typeof card2.chain !== "string" || !getChain2(card2.chain))
     return null;
-  if (!blocks.every((block2) => isObject8(card2[block2])))
+  if (!blocks.every((block2) => isObject9(card2[block2])))
     return null;
   return card2;
 }
@@ -106959,11 +108540,11 @@ async function readMints(rpc, mints) {
   }
   return out;
 }
-function formatAmount2(raw, decimals) {
+function formatAmount2(raw2, decimals) {
   if (decimals === undefined)
-    return `${raw} raw`;
-  const negative = raw < 0n;
-  const abs = negative ? -raw : raw;
+    return `${raw2} raw`;
+  const negative = raw2 < 0n;
+  const abs = negative ? -raw2 : raw2;
   const whole = abs / 10n ** BigInt(decimals);
   const frac = (abs % 10n ** BigInt(decimals)).toString().padStart(decimals, "0").replace(/0+$/, "");
   return `${negative ? "-" : ""}${whole}${frac ? `.${frac}` : ""}`;
@@ -107061,8 +108642,8 @@ async function sign5(args, ctx) {
   return runVaultCommand(ctx, async ({ hold }) => {
     let tx;
     try {
-      const raw2 = await readInput(ctx, parsed.values["--file"]);
-      tx = decodeTransaction(decodeStrictBase64(new TextDecoder().decode(raw2)));
+      const raw3 = await readInput(ctx, parsed.values["--file"]);
+      tx = decodeTransaction(decodeStrictBase64(new TextDecoder().decode(raw3)));
     } catch (error) {
       if (error instanceof TransactionDecodeError) {
         throw new VaultError("SIGN_TRANSACTION_UNDECODABLE", `The input is not one base64 legacy or v0 transaction: ${error.message}.`, { suggestion: "Nothing was signed. Pass one base64 transaction through --file <path> or stdin." });
@@ -107080,8 +108661,8 @@ async function sign5(args, ctx) {
         });
       throw error;
     }
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(promptCtx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(promptCtx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     const vault = hold(opened.vault);
@@ -107253,8 +108834,8 @@ async function signMessage2(args, ctx) {
     } catch (error) {
       throw new VaultError("VAULT_UNREADABLE", `The message could not be read: ${error instanceof Error ? error.message : error}.`);
     }
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(promptCtx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(promptCtx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     const vault = hold(opened.vault);
@@ -107312,6 +108893,412 @@ async function signMessage2(args, ctx) {
     deps.stdout.write(`${signatureBase58}
 `);
     return 0;
+  });
+}
+
+// src/commands/signals.ts
+init_args();
+init_deps();
+init_human_output();
+init_render();
+
+// src/signal-records.ts
+var SIGNAL_RECORDS_DEFAULT_URL2 = "https://api.hacc.fun";
+var SIGNAL_RECORDS_TIMEOUT_MS2 = 1e4;
+var MEASURE2 = "Measured record, not a forecast.";
+var RECORD_SOURCES2 = ["pattern", "quant_call", "holder_band", "launch_read"];
+var RECORDS_LIMIT_MAX2 = 100;
+var SOURCE_ID_MAX2 = 128;
+function isObject10(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function withMeasure2(body) {
+  return { ...isObject10(body) ? body : {}, measure: MEASURE2 };
+}
+function isScorecardDate2(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value))
+    return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+function isRecordSource2(value) {
+  return typeof value === "string" && RECORD_SOURCES2.includes(value);
+}
+function localRefusal2(code, message) {
+  return { ok: false, refusal: { status: 0, code, message, body: withMeasure2({ error: message, code }) } };
+}
+function createSignalRecordsClient2(options) {
+  const base2 = new URL(options.apiUrl ?? SIGNAL_RECORDS_DEFAULT_URL2);
+  if (base2.protocol !== "https:" || base2.username || base2.password || base2.search || base2.hash) {
+    throw new Error("Signal records need an HTTPS CANDLE_HACC_URL without credentials, query or fragment.");
+  }
+  const root = base2.toString().replace(/\/+$/, "");
+  const doFetch = options.fetch ?? globalThis.fetch;
+  const timeoutMs = options.timeoutMs ?? SIGNAL_RECORDS_TIMEOUT_MS2;
+  async function get(path) {
+    const controller = new AbortController;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    try {
+      const response = await doFetch(`${root}${path}`, {
+        method: "GET",
+        redirect: "error",
+        signal: controller.signal,
+        headers: { authorization: `Bearer ${options.apiKey}`, accept: "application/json" }
+      });
+      const received = await response.json().catch(() => {
+        return;
+      });
+      if (timedOut)
+        return localRefusal2("TIMEOUT", "The signal records request timed out.");
+      if (!response.ok) {
+        const message = isObject10(received) && typeof received.error === "string" ? received.error : `Signal records request failed (${response.status}).`;
+        const code = isObject10(received) && typeof received.code === "string" ? received.code : response.status === 404 ? "NOT_FOUND" : `HTTP_${response.status}`;
+        return {
+          ok: false,
+          refusal: {
+            status: response.status,
+            code,
+            message,
+            body: withMeasure2(isObject10(received) ? received : { error: message })
+          }
+        };
+      }
+      if (!isObject10(received))
+        return localRefusal2("BAD_RESPONSE", "hacc returned an unreadable response.");
+      return { ok: true, status: response.status, body: withMeasure2(received) };
+    } catch {
+      return timedOut ? localRefusal2("TIMEOUT", "The signal records request timed out.") : localRefusal2("NETWORK_ERROR", "Could not reach hacc.");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return {
+    scorecard(date2) {
+      if (date2 !== undefined && !isScorecardDate2(date2)) {
+        return Promise.resolve(localRefusal2("INVALID_DATE", "date must be YYYY-MM-DD."));
+      }
+      return get(date2 === undefined ? "/v1/public/scorecard" : `/v1/public/scorecard/${date2}`);
+    },
+    records(query3 = {}) {
+      const search = new URLSearchParams;
+      if (query3.source !== undefined) {
+        if (!isRecordSource2(query3.source)) {
+          return Promise.resolve(localRefusal2("INVALID_SOURCE", `source must be one of ${RECORD_SOURCES2.join(", ")}.`));
+        }
+        search.set("source", query3.source);
+      }
+      if (query3.before !== undefined) {
+        if (!Number.isSafeInteger(query3.before) || query3.before < 1) {
+          return Promise.resolve(localRefusal2("INVALID_BEFORE", "before must be a positive integer."));
+        }
+        search.set("before", String(query3.before));
+      }
+      if (query3.limit !== undefined) {
+        if (!Number.isInteger(query3.limit) || query3.limit < 1 || query3.limit > RECORDS_LIMIT_MAX2) {
+          return Promise.resolve(localRefusal2("INVALID_LIMIT", `limit must be an integer from 1 to ${RECORDS_LIMIT_MAX2}.`));
+        }
+        search.set("limit", String(query3.limit));
+      }
+      return get(`/v1/public/signal-records${search.size ? `?${search}` : ""}`);
+    },
+    record(source2, sourceId) {
+      if (!isRecordSource2(source2)) {
+        return Promise.resolve(localRefusal2("INVALID_SOURCE", `source must be one of ${RECORD_SOURCES2.join(", ")}.`));
+      }
+      if (typeof sourceId !== "string" || sourceId.length < 1 || sourceId.length > SOURCE_ID_MAX2) {
+        return Promise.resolve(localRefusal2("INVALID_SOURCE_ID", `source_id must be 1 to ${SOURCE_ID_MAX2} characters.`));
+      }
+      return get(`/v1/public/signal-records/${source2}/${encodeURIComponent(sourceId)}`);
+    }
+  };
+}
+
+// src/commands/signals.ts
+var PRODUCTION_KEY_MESSAGE2 = "Signal records need a production agent key. Create one with `candle keys create`.";
+var SCORECARD_USAGE = "Usage: candle signals scorecard [--date YYYY-MM-DD]";
+var RECORDS_USAGE = `Usage: candle signals records [--source ${RECORD_SOURCES2.join("|")}] [--before <id>] [--limit 1-${RECORDS_LIMIT_MAX2}]`;
+var RECORD_USAGE = `Usage: candle signals record <${RECORD_SOURCES2.join("|")}> <source-id>`;
+var HORIZONS = ["15m", "1h", "4h", "24h"];
+function object6(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function text4(value) {
+  return value === undefined || value === null || value === "" ? "—" : terminalText(String(value));
+}
+function percent2(value, signed2 = false) {
+  if (typeof value !== "number" || !Number.isFinite(value))
+    return "—";
+  const shown = (value * 100).toFixed(2);
+  return `${signed2 && value > 0 ? "+" : ""}${shown}%`;
+}
+function bool(value) {
+  return value === true ? "yes" : value === false ? "no" : "—";
+}
+function measureLine(ctx, stream) {
+  ctx.deps[stream].write(`
+${MEASURE2}
+`);
+}
+function usage13(ctx, message) {
+  if (ctx.json)
+    ctx.deps.stdout.write(`${JSON.stringify({ ok: false, code: "USAGE", message, measure: MEASURE2 })}
+`);
+  else {
+    ctx.deps.stderr.write(`${terminalLines(message)}
+`);
+    measureLine(ctx, "stderr");
+  }
+  return 2;
+}
+function refuse3(ctx, code, message, details) {
+  if (ctx.json) {
+    ctx.deps.stdout.write(`${JSON.stringify({ ok: false, code, message, ...details ? { details } : {}, measure: MEASURE2 })}
+`);
+  } else {
+    ctx.deps.stderr.write(`${terminalLines(message)}
+`);
+    measureLine(ctx, "stderr");
+  }
+  return 1;
+}
+async function client2(ctx) {
+  const apiKey = await resolveApiKey(ctx.deps, ctx.profile);
+  if (!apiKey?.startsWith("cndl_live_")) {
+    refuse3(ctx, "SIGNAL_RECORDS_PRODUCTION_KEY_REQUIRED", PRODUCTION_KEY_MESSAGE2);
+    return;
+  }
+  try {
+    return createSignalRecordsClient2({
+      apiKey,
+      apiUrl: ctx.deps.env.CANDLE_HACC_URL?.trim() || undefined,
+      fetch: ctx.deps.fetch
+    });
+  } catch {
+    refuse3(ctx, "SIGNAL_RECORDS_URL_INVALID", "Signal records need a valid HTTPS CANDLE_HACC_URL without credentials, query or fragment.");
+  }
+}
+function answer2(ctx, result2, render2) {
+  if (!result2.ok) {
+    const { status, code, message, body } = result2.refusal;
+    return refuse3(ctx, code, message, status ? { status, body } : undefined);
+  }
+  if (ctx.json)
+    ctx.deps.stdout.write(`${JSON.stringify(result2.body)}
+`);
+  else {
+    render2(result2.body);
+    measureLine(ctx, "stdout");
+  }
+  return 0;
+}
+async function signalsScorecard(args, ctx) {
+  const parsed = parseArgs(args, { valueFlags: ["--date"] });
+  if ("error" in parsed)
+    return usage13(ctx, `${parsed.error}
+${SCORECARD_USAGE}`);
+  const date2 = parsed.values["--date"];
+  if (parsed.positionals.length || date2 !== undefined && !isScorecardDate2(date2))
+    return usage13(ctx, SCORECARD_USAGE);
+  const hacc = await client2(ctx);
+  if (!hacc)
+    return 1;
+  return answer2(ctx, await hacc.scorecard(date2), (body) => {
+    const window = object6(body.window);
+    const universes = Array.isArray(body.baseline_universes) ? body.baseline_universes.map(text4).join(", ") : "—";
+    writeFields(ctx.deps, "stdout", [
+      ["Date", text4(body.date)],
+      ["As of", text4(body.as_of)],
+      ["Window", `${text4(window.from)} to ${text4(window.to)}`],
+      ["Signal lift (24h)", percent2(body.signal_lift, true)],
+      ["Signal pairs", text4(body.signal_pairs)],
+      ["Pending 24h", text4(body.pending_24h)],
+      ["Baselines", universes || "—"]
+    ], "hacc scorecard");
+    const rows = Array.isArray(body.rows) ? body.rows.map(object6) : [];
+    ctx.deps.stdout.write(`
+`);
+    if (!rows.length) {
+      ctx.deps.stdout.write(`No scorecard rows for this day.
+`);
+      return;
+    }
+    writeTable(ctx.deps, "stdout", [
+      "Source",
+      "Rule",
+      "Variant",
+      "Horizon",
+      "Count",
+      "Coverage",
+      "Mean (conservative)",
+      "Mean (priced)",
+      "Baseline",
+      "Lift",
+      "2x/5x/20x",
+      "Delay p50/p95 s",
+      "Marked"
+    ], rows.map((row2) => [
+      text4(row2.source),
+      text4(row2.rule_id),
+      text4(row2.variant),
+      text4(row2.horizon),
+      text4(row2.count),
+      percent2(row2.coverage),
+      percent2(row2.mean_conservative, true),
+      percent2(row2.mean_priced, true),
+      percent2(row2.baseline_mean, true),
+      percent2(row2.lift, true),
+      `${text4(row2.tail_2x)}/${text4(row2.tail_5x)}/${text4(row2.tail_20x)}`,
+      `${text4(row2.delay_p50_s)}/${text4(row2.delay_p95_s)}`,
+      [row2.shadow === true ? "shadow" : "", row2.backfilled === true ? "backfilled" : ""].filter(Boolean).join(", ") || "—"
+    ]), [
+      {},
+      { priority: 6 },
+      { priority: 5 },
+      {},
+      {},
+      {},
+      {},
+      { priority: 3 },
+      {},
+      {},
+      { priority: 4 },
+      { priority: 1 },
+      {}
+    ]);
+  });
+}
+function integerFlag(value, min, max) {
+  if (value === undefined)
+    return;
+  if (!/^\d+$/.test(value))
+    return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n >= min && n <= max ? n : null;
+}
+async function signalsRecords(args, ctx) {
+  const parsed = parseArgs(args, { valueFlags: ["--source", "--before", "--limit"] });
+  if ("error" in parsed)
+    return usage13(ctx, `${parsed.error}
+${RECORDS_USAGE}`);
+  const v = parsed.values;
+  const source2 = v["--source"];
+  const before = integerFlag(v["--before"], 1, Number.MAX_SAFE_INTEGER);
+  const limit = integerFlag(v["--limit"], 1, RECORDS_LIMIT_MAX2);
+  if (parsed.positionals.length || source2 !== undefined && !isRecordSource2(source2) || before === null || limit === null)
+    return usage13(ctx, RECORDS_USAGE);
+  const hacc = await client2(ctx);
+  if (!hacc)
+    return 1;
+  const query3 = {
+    ...source2 !== undefined && isRecordSource2(source2) ? { source: source2 } : {},
+    ...before !== undefined ? { before } : {},
+    ...limit !== undefined ? { limit } : {}
+  };
+  return answer2(ctx, await hacc.records(query3), (body) => {
+    const records = Array.isArray(body.records) ? body.records.map(object6) : [];
+    if (!records.length)
+      ctx.deps.stdout.write(`No signal records on this page.
+`);
+    else
+      writeTable(ctx.deps, "stdout", [
+        "Source",
+        "Id",
+        "Variant",
+        "Chain",
+        "Emitted",
+        "Entry",
+        "24h status",
+        "Net 24h (conservative)",
+        "Net 24h (priced)",
+        "Max multiple",
+        "Baseline 24h",
+        "Backfilled"
+      ], records.map((record6) => [
+        text4(record6.source),
+        text4(record6.source_id),
+        text4(record6.variant),
+        text4(record6.chain),
+        text4(record6.emitted_at),
+        text4(record6.entry_status),
+        text4(object6(record6.outcome_status)["24h"]),
+        percent2(object6(record6.net_return_conservative)["24h"], true),
+        percent2(object6(record6.net_return_priced)["24h"], true),
+        text4(object6(record6.path_24h).max_multiple),
+        percent2(object6(object6(record6.baseline).net_return_conservative)["24h"], true),
+        bool(record6.backfilled)
+      ]), [
+        { id: true },
+        { id: true },
+        { priority: 3 },
+        { priority: 4 },
+        { priority: 6 },
+        { priority: 2 },
+        { priority: 5 },
+        {},
+        { priority: 1 },
+        { priority: 2 },
+        { priority: 5 },
+        {}
+      ]);
+    if (typeof body.next_before === "number") {
+      ctx.deps.stdout.write(`
+Next page: candle signals records --before ${body.next_before}${source2 ? ` --source ${source2}` : ""}
+`);
+    }
+  });
+}
+async function signalsRecord(args, ctx) {
+  const parsed = parseArgs(args, {});
+  if ("error" in parsed)
+    return usage13(ctx, `${parsed.error}
+${RECORD_USAGE}`);
+  const [source2, sourceId] = parsed.positionals;
+  if (parsed.positionals.length !== 2 || !isRecordSource2(source2) || !sourceId || sourceId.length > 128)
+    return usage13(ctx, RECORD_USAGE);
+  const hacc = await client2(ctx);
+  if (!hacc)
+    return 1;
+  return answer2(ctx, await hacc.record(source2, sourceId), (record6) => {
+    const path = object6(record6.path_24h);
+    const baseline = object6(record6.baseline);
+    writeFields(ctx.deps, "stdout", [
+      ["Source", text4(record6.source)],
+      ["Id", text4(record6.source_id)],
+      ["Variant", text4(record6.variant)],
+      ["Chain", text4(record6.chain)],
+      ["Emitted", text4(record6.emitted_at)],
+      ["Backfilled", bool(record6.backfilled)],
+      ["Entry", text4(record6.entry_status)]
+    ], "hacc signal record");
+    ctx.deps.stdout.write(`
+`);
+    const status = object6(record6.outcome_status);
+    const conservative = object6(record6.net_return_conservative);
+    const priced = object6(record6.net_return_priced);
+    const baselineNet = object6(baseline.net_return_conservative);
+    writeTable(ctx.deps, "stdout", ["Horizon", "Status", "Net (conservative)", "Net (priced)", "Baseline (conservative)"], HORIZONS.map((h) => [
+      h,
+      text4(status[h]),
+      percent2(conservative[h], true),
+      percent2(priced[h], true),
+      percent2(baselineNet[h], true)
+    ]), Array.from({ length: 5 }, () => ({})));
+    ctx.deps.stdout.write(`
+`);
+    writeFields(ctx.deps, "stdout", [
+      ["Max multiple (24h)", text4(path.max_multiple)],
+      ["Reached 2x/5x/20x", `${bool(path.hit_2x)}/${bool(path.hit_5x)}/${bool(path.hit_20x)}`],
+      ["Drawdown before 2x", percent2(path.drawdown_before_2x, true)],
+      ["24h path settled", bool(path.settled)],
+      [
+        "Baseline",
+        Object.keys(baseline).length ? `${text4(baseline.match)} (${text4(baseline.universe)})` : "none matched"
+      ]
+    ]);
   });
 }
 
@@ -107395,8 +109382,8 @@ function limitsView(limits) {
     paused: limits.paused
   };
 }
-function parseUsd(raw) {
-  const cleaned = raw.trim().replace(/^\$/, "");
+function parseUsd(raw2) {
+  const cleaned = raw2.trim().replace(/^\$/, "");
   const match = /^([0-9]{1,9})(?:\.([0-9]{1,6}))?$/.exec(cleaned);
   if (!match)
     return null;
@@ -107512,11 +109499,11 @@ async function showOrSet(args, ctx, field, word3) {
   if (!paths)
     return 2;
   const limits = await readLimits(paths);
-  const raw = parsed.positionals[0];
-  if (raw !== undefined) {
-    const value = parseUsd(raw);
+  const raw2 = parsed.positionals[0];
+  if (raw2 !== undefined) {
+    const value = parseUsd(raw2);
     if (value === null) {
-      writeUsageFailure(ctx.deps, `Not a dollar amount: ${raw}. Use a number such as 5 or 0.25.`, ctx.json);
+      writeUsageFailure(ctx.deps, `Not a dollar amount: ${raw2}. Use a number such as 5 or 0.25.`, ctx.json);
       return 2;
     }
     limits[field] = value;
@@ -107527,7 +109514,7 @@ async function showOrSet(args, ctx, field, word3) {
 `);
   else {
     const label = field === "dailyLimitUsdMicros" ? "Daily per-use limit" : "Per-call ceiling";
-    writeFields(ctx.deps, "stdout", [[label, `$${usdText(limits[field])}${raw !== undefined ? " (saved)" : ""}`]]);
+    writeFields(ctx.deps, "stdout", [[label, `$${usdText(limits[field])}${raw2 !== undefined ? " (saved)" : ""}`]]);
   }
   return 0;
 }
@@ -107626,7 +109613,7 @@ async function runStake(action, args, ctx) {
     valueFlags: ["--wallet", "--client-stake-id"],
     booleanFlags: ["--yes", ...action === "claim" ? ["--all"] : []]
   });
-  const usage13 = "Usage: candle stake [add <amount> | remove <amount> | finish [<withdrawal>] | claim <rewardId> | claim --all] [--wallet <main|id|address|label>] [--client-stake-id <id>] [--yes] [--json]";
+  const usage14 = "Usage: candle stake [add <amount> | remove <amount> | finish [<withdrawal>] | claim <rewardId> | claim --all] [--wallet <main|id|address|label>] [--client-stake-id <id>] [--yes] [--json]";
   if ("error" in parsed) {
     writeUsageFailure(ctx.deps, parsed.error, ctx.json);
     return 2;
@@ -107635,7 +109622,7 @@ async function runStake(action, args, ctx) {
   const id = values["--client-stake-id"] ?? `stake-${randomUUID15()}`;
   const all = booleans.has("--all");
   if (!validClientId(id) || id.length > 128 || (action === "positions" ? positionals.length !== 0 : action === "finish" ? positionals.length > 1 : action === "claim" ? all ? positionals.length !== 0 : positionals.length !== 1 : positionals.length !== 1)) {
-    writeUsageFailure(ctx.deps, usage13, ctx.json);
+    writeUsageFailure(ctx.deps, usage14, ctx.json);
     return 2;
   }
   try {
@@ -107859,16 +109846,16 @@ function resolveRenameTarget(index, old, id) {
 // src/vault/rename-batch.ts
 init_format();
 var MAX_RENAME_BATCH = 256;
-function csvCells(text4) {
+function csvCells(text5) {
   const cells = [];
   let cell = "";
   let quoted = false;
   let closed = false;
-  for (let i = 0;i < text4.length; i++) {
-    const char = text4[i];
+  for (let i = 0;i < text5.length; i++) {
+    const char = text5[i];
     if (quoted) {
       if (char === '"') {
-        if (text4[i + 1] === '"') {
+        if (text5[i + 1] === '"') {
           cell += '"';
           i++;
         } else {
@@ -107894,7 +109881,7 @@ function csvCells(text4) {
   return cells;
 }
 function parseRenamePairs(contents) {
-  const lines = contents.split(/\r?\n/).map((text4, at3) => ({ text: text4, line: at3 + 1 })).filter(({ text: text4 }) => text4.trim() !== "" && !/^\s*#/.test(text4));
+  const lines = contents.split(/\r?\n/).map((text5, at3) => ({ text: text5, line: at3 + 1 })).filter(({ text: text5 }) => text5.trim() !== "" && !/^\s*#/.test(text5));
   const rows = [];
   const findings = [];
   const header = csvCells(lines[0]?.text ?? "")?.map((cell) => cell.trim()) ?? [];
@@ -107909,11 +109896,11 @@ function parseRenamePairs(contents) {
   if (data.length < 1 || data.length > MAX_RENAME_BATCH) {
     findings.push({ line: 0, problem: `A rename file must hold 1 to ${MAX_RENAME_BATCH} rows; found ${data.length}.` });
   }
-  for (const { text: text4, line } of data) {
+  for (const { text: text5, line } of data) {
     let from;
     let to;
     if (csv) {
-      const cells = csvCells(text4);
+      const cells = csvCells(text5);
       if (cells === undefined || cells.length !== header.length) {
         findings.push({ line, problem: "Malformed CSV row or field count does not match the header." });
         continue;
@@ -107921,7 +109908,7 @@ function parseRenamePairs(contents) {
       from = cells[header.indexOf("from")];
       to = cells[header.indexOf("to")];
     } else {
-      const match = /^(\S+)[ \t]+(\S+)([ \t]*)$/.exec(text4);
+      const match = /^(\S+)[ \t]+(\S+)([ \t]*)$/.exec(text5);
       if (match !== null)
         [from, to] = [match[1], `${match[2]}${match[3]}`];
     }
@@ -108042,8 +110029,8 @@ async function vaultRename(args, ctx) {
     rows = parsedFile.rows;
   }
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(promptCtx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(promptCtx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     const vault = hold(opened.vault);
@@ -108176,7 +110163,7 @@ function rerunFile(rows) {
     return rows.map((row2) => `${row2.from} ${row2.to}`);
   return ["from,to", ...rows.map((row2) => `${row2.from},"${row2.to.replaceAll('"', '""')}"`)];
 }
-function refusal3(ctx, findings, exit) {
+function refusal4(ctx, findings, exit) {
   const message = "TEE rename refused. Nothing was changed.";
   if (ctx.json)
     writeJson(ctx.deps, { ok: false, code: "TEE_RENAME_BATCH_REFUSED", message, findings });
@@ -108197,9 +110184,9 @@ function serverFailure(ctx, result2, pairs, batch) {
     }, json);
     return 1;
   }
-  const raw = result2.raw?.error?.findings;
-  if (Array.isArray(raw) && raw.length > 0) {
-    const findings = raw.map((finding) => {
+  const raw2 = result2.raw?.error?.findings;
+  if (Array.isArray(raw2) && raw2.length > 0) {
+    const findings = raw2.map((finding) => {
       const ids = Array.isArray(finding.matches) ? ` Candidates: ${finding.matches.map((m) => String(m.id)).join(", ")}.` : "";
       return {
         line: batch ? pairs[Number(finding.row)]?.line ?? 0 : 0,
@@ -108207,7 +110194,7 @@ function serverFailure(ctx, result2, pairs, batch) {
       };
     });
     if (batch)
-      return refusal3(ctx, findings, 1);
+      return refusal4(ctx, findings, 1);
     writeLocalFailure(deps, {
       code: "TEE_RENAME_REFUSED",
       message: `${findings.map((finding) => finding.problem).join(" ")} Nothing was changed.`,
@@ -108270,7 +110257,7 @@ async function teeRename(args, ctx) {
     }
     const parsedFile = parseRenamePairs(contents);
     if (parsedFile.findings.length > 0)
-      return refusal3(ctx, parsedFile.findings, 2);
+      return refusal4(ctx, parsedFile.findings, 2);
     pairs = parsedFile.rows;
   } else {
     const invalid4 = validateLabel(next);
@@ -108313,10 +110300,10 @@ async function teeRename(args, ctx) {
   const vaultPath = vaultPathFor(ctx, { values: {}, booleans: new Set, positionals: [] });
   if ("error" in vaultPath)
     return usage2(ctx, vaultPath.error);
-  const raw = rows.some((row2) => row2.tee) ? await readVaultRaw(vaultPath.path) : null;
+  const raw2 = rows.some((row2) => row2.tee) ? await readVaultRaw(vaultPath.path) : null;
   const promptCtx = refusePromptsWithoutTerminal(ctx, "tee rename");
   return runVaultCommand(ctx, async ({ hold }) => {
-    const vault = raw === null ? null : hold((await unlockInteractively(promptCtx, vaultPath.path, raw, {
+    const vault = raw2 === null ? null : hold((await unlockInteractively(promptCtx, vaultPath.path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     })).vault);
     const local = [];
@@ -108349,7 +110336,7 @@ async function teeRename(args, ctx) {
     }
     if (findings.length > 0) {
       if (batch)
-        return refusal3(ctx, findings, 1);
+        return refusal4(ctx, findings, 1);
       writeLocalFailure(deps, {
         code: twice ? "VAULT_LABEL_AMBIGUOUS" : "VAULT_LABEL_TAKEN",
         message: `${findings.map((finding) => finding.problem).join(" ")} Nothing was changed.`,
@@ -108501,12 +110488,12 @@ function readClusterResult2(value, mint) {
   if (v.status !== "available" || v.chain !== "solana" || v.source !== "third_party" || !["hit", "miss"].includes(v.cache) || typeof v.fetchedAt !== "string" || typeof v.expiresAt !== "string" || !Number.isFinite(Date.parse(v.fetchedAt)) || !(Date.parse(v.expiresAt) > Date.parse(v.fetchedAt)))
     return null;
   const a = v.analysis;
-  const percent2 = (n) => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 100;
-  if (!a || !percent2(a.clusterSupplyPct) || !Array.isArray(a.clusters) || !a.clusters.length || a.clusters.length > 100)
+  const percent3 = (n) => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 100;
+  if (!a || !percent3(a.clusterSupplyPct) || !Array.isArray(a.clusters) || !a.clusters.length || a.clusters.length > 100)
     return null;
   let addresses = 0;
   for (const c of a.clusters) {
-    if (!c || !percent2(c.supplyPct) || c.supplyPct > a.clusterSupplyPct + 0.01 || !Array.isArray(c.addresses) || !Array.isArray(c.tags) || c.tags.length > 32 || c.tags.some((t) => typeof t !== "string" || t.length > 100) || c.addresses.some((x) => typeof x !== "string" || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(x)))
+    if (!c || !percent3(c.supplyPct) || c.supplyPct > a.clusterSupplyPct + 0.01 || !Array.isArray(c.addresses) || !Array.isArray(c.tags) || c.tags.length > 32 || c.tags.some((t) => typeof t !== "string" || t.length > 100) || c.addresses.some((x) => typeof x !== "string" || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(x)))
       return null;
     addresses += c.addresses.length;
   }
@@ -108826,27 +110813,27 @@ function mayHaveCommitted(result2) {
   return result2.retryable === true || result2.status >= 500 && result2.retryable !== false;
 }
 async function tokenEdit(args, ctx) {
-  const usage13 = usageFor2(ctx, EDIT_USAGE);
+  const usage14 = usageFor2(ctx, EDIT_USAGE);
   const split2 = splitClears(args);
   if ("error" in split2)
-    return usage13(split2.error);
+    return usage14(split2.error);
   const parsed = parseArgs(split2.rest, {
     valueFlags: ["--chain", "--idempotency-key", ...EDIT_FIELDS.map((field) => field.cli.flag)]
   });
   if ("error" in parsed)
-    return usage13(parsed.error);
+    return usage14(parsed.error);
   const [mint] = parsed.positionals;
   if (parsed.positionals.length !== 1 || !mint)
-    return usage13();
+    return usage14();
   const chain2 = chainFor(mint, parsed.values["--chain"]);
   if (!chain2)
-    return usage13("--chain must be solana or hood.");
+    return usage14("--chain must be solana or hood.");
   const body = editBodyOf(parsed.values, split2.clears);
   if ("error" in body)
-    return usage13(body.error);
+    return usage14(body.error);
   const given2 = parsed.values["--idempotency-key"];
   if (given2 !== undefined && (given2.length < 1 || given2.length > 128)) {
-    return usage13("--idempotency-key must be 1 to 128 characters.");
+    return usage14("--idempotency-key must be 1 to 128 characters.");
   }
   const idempotencyKey = given2 ?? randomUUID16();
   const apiKey = await resolveApiKey(ctx.deps, ctx.profile);
@@ -108917,14 +110904,14 @@ async function tokenHistory2(args, ctx) {
   const parsed = parseArgs(args, { valueFlags: ["--chain", "--limit", "--cursor"] });
   if ("error" in parsed || parsed.positionals.length !== 1)
     return tokenHistory(args, ctx);
-  const usage13 = usageFor2(ctx, HISTORY_USAGE);
+  const usage14 = usageFor2(ctx, HISTORY_USAGE);
   const mint = parsed.positionals[0];
   const chain2 = chainFor(mint, parsed.values["--chain"]);
   if (!chain2)
-    return usage13("--chain must be solana or hood.");
+    return usage14("--chain must be solana or hood.");
   const limit = parsed.values["--limit"];
   if (limit !== undefined && (!/^[1-9]\d?$/.test(limit) || Number(limit) > 50)) {
-    return usage13("--limit is a whole number from 1 to 50.");
+    return usage14("--limit is a whole number from 1 to 50.");
   }
   const query3 = new URLSearchParams({
     ...limit !== undefined ? { limit } : {},
@@ -108976,6 +110963,7 @@ More: --cursor ${escapeTerminalText(data.nextCursor)}
 
 // src/commands/transfer.ts
 init_args();
+init_client();
 init_evm_lite();
 init_presentation();
 init_profiles();
@@ -108983,6 +110971,7 @@ init_render();
 init_solana_verify();
 init_trading();
 init_swap();
+import { randomUUID as randomUUID17 } from "node:crypto";
 var USAGE17 = `Usage: candle transfer --to <address|wallet name|allowlist label|vault> --asset <SOL|USDC|CNDL|ETH|USDG>|--mint <mint>|--token <0x...> --amount <decimal|max> [--wallet <name>] [--client-id <id>] [--rpc-url <url>] [--yes] [--json]
        candle transfer status <transfer id|client id> [--json]`;
 var CLIENT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -109011,11 +111000,11 @@ async function readWithdrawalAddresses(ctx, key) {
     throw new TradingError("INVALID_RESPONSE", "The withdrawal allowlist read did not return a list.");
   return body.addresses;
 }
-async function resolveDestination(ctx, key, source, to, chain2 = "solana") {
+async function resolveDestination(ctx, key, source2, to, chain2 = "solana") {
   const hood = chain2 === "hood";
   const same = (a, b) => hood ? sameEvmAddress(a, b) : a === b;
   if (to === "vault") {
-    const lifecycle = await request(ctx, key, `/api/v1/agent/wallets/${encodeURIComponent(source.id)}/lifecycle`);
+    const lifecycle = await request(ctx, key, `/api/v1/agent/wallets/${encodeURIComponent(source2.id)}/lifecycle`);
     const vault = lifecycle.vaultDestination;
     if (typeof vault !== "string" || vault.length === 0)
       throw new TradingError("VAULT_NOT_PINNED", "This wallet has no pinned vault recorded on Candle, so --to vault names nothing. Pass the address instead.");
@@ -109027,16 +111016,16 @@ async function resolveDestination(ctx, key, source, to, chain2 = "solana") {
     return { kind: "vault", address: checked.address };
   }
   const rowChain2 = hood ? "evm" : "solana";
-  const rows = (await readLinkedWallets(ctx, key)).filter((row2) => row2.chain === rowChain2 && row2.revokedAt === undefined && !same(row2.address, source.address));
+  const rows = (await readLinkedWallets(ctx, key)).filter((row2) => row2.chain === rowChain2 && row2.revokedAt === undefined && !same(row2.address, source2.address));
   const matches2 = rows.filter((row2) => row2.label === to || row2._id === to || same(row2.address, to));
   if (matches2.length > 1)
     throw new TradingError("DESTINATION_AMBIGUOUS", `"${to}" names ${matches2.length} linked wallets: ${matches2.map((row2) => `${row2.label ?? ""} (${row2._id}, ${row2.address})`.trim()).join("; ")}. Name one by id or address.`);
   const match = matches2[0];
   if (match)
     return { kind: "linked", address: match.address, id: match._id, ...match.label ? { label: match.label } : {} };
-  if (same(to, source.address))
+  if (same(to, source2.address))
     throw new TradingError("DESTINATION_IS_SOURCE", "--to names the wallet the funds would leave. Name a different destination.");
-  const allowlist = (await readWithdrawalAddresses(ctx, key)).filter((row2) => row2.chain === chain2 && row2.revokedAt === undefined && !same(row2.address, source.address));
+  const allowlist = (await readWithdrawalAddresses(ctx, key)).filter((row2) => row2.chain === chain2 && row2.revokedAt === undefined && !same(row2.address, source2.address));
   const approved = allowlist.filter((row2) => row2.label === to || row2.id === to || same(row2.address, to));
   if (approved.length > 1)
     throw new TradingError("DESTINATION_AMBIGUOUS", `"${to}" names ${approved.length} approved withdrawal addresses: ${approved.map((row2) => `${row2.label ?? ""} (${row2.id}, ${row2.address})`.trim()).join("; ")}. Name one by id or address.`);
@@ -109107,6 +111096,64 @@ ${fields(rows, style).join(`
   if (note)
     notice(ctx.deps, "stderr", "note", note);
 }
+async function embeddedTransfer(ctx, key, t) {
+  const plain = t.chain === "hood" ? checkEvmAddress(t.to).ok : BASE58_ADDRESS.test(t.to);
+  if (!plain)
+    throw new TradingError("VALIDATION_FAILED", `From the embedded wallet, --to must be a ${t.chain === "hood" ? "0x" : "Solana"} address: one of the account's own wallets or an owner-approved withdrawal address. Nothing was sent.`);
+  const amountRaw = t.isMax ? "max" : rawAmount(t.amount, await t.decimals());
+  const label = t.asset ?? t.token;
+  const amountText2 = t.isMax ? `the full spendable balance of ${label}` : `${t.amount} ${label}`;
+  const clientTransferId = t.clientId ?? `transfer-${randomUUID17()}`;
+  const confirmed = await confirmTransfer(ctx, [
+    `Transfer ${amountText2} from the embedded wallet (${t.chain}) to ${t.to}`,
+    `Client id: ${clientTransferId} (if the answer is lost, read it with candle transfer status ${clientTransferId}; do not send again under a new id)`
+  ], t.yes);
+  if (!confirmed)
+    return printCancelledResult(ctx, { success: true, status: "cancelled", wallet: "embedded", to: t.to });
+  const body = { chain: t.chain };
+  if (t.asset !== undefined)
+    body.asset = t.asset;
+  else
+    body.mint = t.token;
+  body.amountRaw = amountRaw;
+  body.to = t.to;
+  body.clientTransferId = clientTransferId;
+  const result2 = await apiRequest("/api/v1/agent/transfer", {
+    apiUrl: ctx.apiUrl,
+    credentials: { apiKey: key },
+    auth: "key",
+    method: "POST",
+    body,
+    fetch: ctx.deps.fetch,
+    env: ctx.deps.env
+  });
+  if (!result2.ok)
+    throw embeddedTransferFailure(result2, clientTransferId);
+  if (!result2.body || typeof result2.body !== "object")
+    throw new TradingError("INVALID_RESPONSE", "Candle returned an invalid response.", {
+      exitCode: 3,
+      suggestion: `candle transfer status ${clientTransferId}`,
+      details: { clientTransferId }
+    });
+  return printTradingResult(ctx, { ...result2.body, clientTransferId });
+}
+function embeddedTransferFailure(result2, id) {
+  const error = result2.raw?.error;
+  const signature = typeof error?.signature === "string" ? error.signature : undefined;
+  const stage = typeof error?.stage === "string" ? error.stage : undefined;
+  const code = result2.code ?? "REQUEST_FAILED";
+  const details = { clientTransferId: id, ...signature ? { signature } : {}, ...stage ? { stage } : {} };
+  const definite = code !== "TRANSFER_FAILED" && result2.status >= 400 && result2.status < 500 && result2.status !== 408 && result2.status !== 429;
+  if (definite)
+    return new TradingError(code, result2.message, {
+      ...result2.uiHint ? { suggestion: result2.uiHint } : {},
+      details
+    });
+  const named = `Read it with candle transfer status ${id}, or check candle activity or the chain, before sending again: a new client id sends again and can move the funds twice.`;
+  if (code === "TRANSFER_FAILED")
+    return new TradingError(code, `Candle could not confirm the embedded transfer, so it may have landed on chain. ${named}${signature ? ` Signature: ${signature}.` : ""}`, { exitCode: 3, suggestion: `candle transfer status ${id}`, details });
+  return new TradingError(code, `${result2.message} The request was sent, so the embedded transfer may have landed on chain (client id ${id}). ${named}`, { exitCode: 3, suggestion: `candle transfer status ${id}`, details });
+}
 async function confirmTransfer(ctx, lines, yes) {
   const output = ctx.json ? ctx.deps.stderr : ctx.deps.stdout;
   for (const line of lines)
@@ -109167,7 +111214,17 @@ async function transfer(args, ctx) {
     const key = await tradingKey(ctx);
     const payer = await tradingPayer(ctx, key, flags2["--wallet"], "transfer:write");
     if (payer.kind === "embedded")
-      throw new TradingError("PAYER_UNSUPPORTED", "This command moves a linked wallet this machine can sign for. The embedded wallet transfers through the agent transfer rail (MCP candle_transfer), not from here. Name a TEE wallet with --wallet.");
+      return await embeddedTransfer(ctx, key, {
+        chain: "solana",
+        asset,
+        token: flags2["--mint"],
+        to,
+        isMax,
+        amount: flags2["--amount"],
+        clientId: flags2["--client-id"],
+        yes: parsed.booleans.has("--yes"),
+        decimals: async () => asset ? BASES[asset]?.decimals ?? 9 : await decimalsFor(ctx, flags2["--mint"], lazySolanaClient(ctx, flags2["--rpc-url"]))
+      });
     if (!payer.scopes.includes("transfer:bound"))
       throw new TradingError("SCOPE_MISSING", `Moving funds out of a TEE wallet needs a Withdraw key. Widen the bound key with: candle keys access ${apiKeyPrefix(key) ?? "<bound prefix>"} --access withdraw. Or mint one with: candle keys create --access withdraw, then bind the wallet to it with: candle tee rebind`);
     const wallet3 = payer.wallet;
@@ -109250,7 +111307,7 @@ function transferLegMoves(leg, expected) {
   return decoded !== undefined && sameEvmAddress(decoded.recipient, expected.to) && decoded.amount.toString() === expected.amountRaw;
 }
 async function hoodTransfer(ctx, args) {
-  const { flags: flags2, asset, to, isMax } = args;
+  const { flags: flags2, asset, to, isMax, yes } = args;
   const checked = flags2["--token"] === undefined ? undefined : checkEvmAddress(flags2["--token"]);
   const tokenAddress = asset !== undefined ? HOOD_BASES[asset]?.address ?? null : checked?.ok ? checked.address : null;
   const label = asset ?? tokenAddress;
@@ -109259,7 +111316,17 @@ async function hoodTransfer(ctx, args) {
   const key = await tradingKey(ctx);
   const payer = await tradingPayer(ctx, key, flags2["--wallet"], "transfer:write", "hood");
   if (payer.kind === "embedded")
-    throw new TradingError("PAYER_UNSUPPORTED", "This command moves a linked wallet this machine can sign for. The embedded wallet transfers through the agent transfer rail (MCP candle_transfer), not from here. Name a Hood TEE wallet with --wallet.");
+    return await embeddedTransfer(ctx, key, {
+      chain: "hood",
+      asset,
+      token: tokenAddress ?? undefined,
+      to,
+      isMax,
+      amount: flags2["--amount"],
+      clientId: flags2["--client-id"],
+      yes,
+      decimals: async () => asset ? HOOD_BASES[asset]?.decimals ?? 18 : await hoodDecimals({ chain: "hood", asset: tokenAddress }, lazyEvmRpc(ctx, flags2["--rpc-url"]))
+    });
   if (!payer.scopes.includes("transfer:bound"))
     throw new TradingError("SCOPE_MISSING", `Moving funds out of a TEE wallet needs a Withdraw key. Widen the bound key with: candle keys access ${apiKeyPrefix(key) ?? "<bound prefix>"} --access withdraw. Or mint one with: candle keys create --access withdraw, then bind the wallet to it with: candle tee rebind`);
   const wallet3 = payer.wallet;
@@ -109316,7 +111383,7 @@ async function hoodTransfer(ctx, args) {
     first,
     submitPath: "/api/v1/agent/transfer/submit",
     submitFields: { transferId },
-    unwrap: (answer2) => answer2,
+    unwrap: (answer3) => answer3,
     primaryLeg: "transfer",
     allowedLegs: ["transfer"],
     checkLeg: (_kind, leg2) => transferLegMoves(leg2, { token: tokenAddress, to: destination.address, amountRaw }),
@@ -109464,7 +111531,7 @@ function stepReporter(write3, tty, ascii = false) {
 }
 function commandSteps(ctx) {
   const style = terminalStyle(ctx.deps, "stderr", ctx.json);
-  const reporter = stepReporter(ctx.json ? () => {} : (text4) => ctx.deps.stderr.write(text4), style.motion, !style.styled);
+  const reporter = stepReporter(ctx.json ? () => {} : (text5) => ctx.deps.stderr.write(text5), style.motion, !style.styled);
   return { ...reporter, [Symbol.dispose ?? Symbol.for("Symbol.dispose")]: () => reporter.stop() };
 }
 function formatBytes(n) {
@@ -109785,7 +111852,7 @@ async function update(args, ctx, current = CLI_VERSION) {
       writeScreenUsageFailure(deps, `Unexpected argument: ${parsed.positionals[0]}`, json);
       return 2;
     }
-    const check = parsed.booleans.has("--check");
+    const check2 = parsed.booleans.has("--check");
     const pinned = parsed.values["--to"];
     const pinnedVersion = pinned === undefined ? undefined : versionOfTag(pinned);
     if (pinned !== undefined && pinnedVersion === null) {
@@ -109853,7 +111920,7 @@ npm i -g @candledottv/cli@latest`);
       return 1;
     }
     const order = compareVersions(current, target.version);
-    if (check) {
+    if (check2) {
       if (json) {
         const payload = { current, latest: target.version, updated: false, path: realExec };
         deps.stdout.write(`${JSON.stringify(payload)}
@@ -110272,9 +112339,9 @@ async function vaultBackup(args, ctx) {
     notice(deps, "stderr", "note", `--to ${ICLOUD_SHORTHAND} is ${destination}
 `.trim());
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
     assertOutsideConfigDir(destination, deps.env, deps.homedir());
-    const file = parseVaultFile(raw);
+    const file = parseVaultFile(raw2);
     if (target.requires !== undefined) {
       const folder = dirname11(destination);
       try {
@@ -110301,7 +112368,7 @@ async function vaultBackup(args, ctx) {
       notice(deps, "stderr", "note", `${sealedBackupLine(verdict.destination, destination)}
 `.trim());
     }
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
       ...verdict.sealed ? {
         among: {
@@ -110503,7 +112570,7 @@ async function vaultVerifyBackup(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
     const target = resolve5(copyPath);
     const copyRaw = await readVaultRaw(target);
     if (copyRaw === null)
@@ -110512,7 +112579,7 @@ async function vaultVerifyBackup(args, ctx) {
       });
     const copyHeader = parseVaultFile(copyRaw);
     const sealed = isSealedCopy(copyRaw);
-    const liveFile = parseVaultFile(raw);
+    const liveFile = parseVaultFile(raw2);
     const carried = liveFile.envelopes.filter((envelope) => copyHeader.envelopes.some((candidate) => sameEnvelopeBytes(candidate, envelope)));
     const facts = await currentPlatformFacts(deps);
     const usable = carried.filter((envelope) => isPassphraseEnvelope(envelope) || canDrive(envelope, facts));
@@ -110522,7 +112589,7 @@ async function vaultVerifyBackup(args, ctx) {
     const restrict = usable.length > 0 && !(requestsPassphrase && !carried.some(isPassphraseEnvelope));
     const keyUsable = usable.some(isSecurityKeyEnvelope);
     const securityKeysNotInCopy = liveFile.envelopes.filter(isSecurityKeyEnvelope).filter((key) => !copyHeader.envelopes.some((candidate) => candidate.id === key.id)).map((key) => key.id);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
       ...restrict ? {
         among: {
@@ -110609,12 +112676,12 @@ function freshBackupAdvice(copyPath, keyIds) {
   return `Fresh backup advised: ${copyPath} does not carry security key ${keyIds.join(", ")}; a new \`candle vault backup\` would open with it too.`;
 }
 async function verifyCopy(_ctx, copyPath, reopen, live, purpose) {
-  const raw = await readVaultRaw(copyPath);
-  if (raw === null)
+  const raw2 = await readVaultRaw(copyPath);
+  if (raw2 === null)
     throw new VaultError("VAULT_MISSING", `No file at ${copyPath}.`, {
       suggestion: `The copy this run just wrote is not there. Check the path and the volume: ls -l ${copyPath}`
     });
-  const copy = await reopen(copyPath, raw, purpose);
+  const copy = await reopen(copyPath, raw2, purpose);
   try {
     const report2 = await verifyVaultIntegrity(copy, { live });
     const record6 = await verifyEvmRecordCopy(copy, evmRecordPath(copyPath));
@@ -110828,8 +112895,8 @@ async function vaultDemoteBatch(args, ctx) {
     solana = opened;
   }
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, resolvedVault.path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, resolvedVault.path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     const held = hold(opened.vault);
@@ -110981,8 +113048,8 @@ Summary: ${summary.done} done, ${summary.incomplete} incomplete, ${summary.faile
     return exit;
   });
 }
-async function openHeld(opened, held, raw) {
-  const vault = await reopenWithHeldDek(held.path, raw, held);
+async function openHeld(opened, held, raw2) {
+  const vault = await reopenWithHeldDek(held.path, raw2, held);
   return {
     vault,
     factor: opened.factor,
@@ -111002,7 +113069,7 @@ async function demoteOne(ctx, session, row2, values, booleans) {
     if (booleans.has(flag))
       args.push(flag);
   const covered = row2.destination === null ? null : `Type confirm to sweep everything to ${row2.destination}: `;
-  const promptLine = async (text4) => text4 === covered ? "confirm" : ctx.deps.promptLine(text4);
+  const promptLine = async (text5) => text5 === covered ? "confirm" : ctx.deps.promptLine(text5);
   const captured = [];
   const errLines = [];
   const stdout = ctx.json ? { write: (chunk) => void captured.push(chunk) } : ctx.deps.stdout;
@@ -111060,11 +113127,11 @@ async function demoteOne(ctx, session, row2, values, booleans) {
   return outcome;
 }
 function firstSentence(chunk) {
-  const text4 = chunk.replace(/\s+/g, " ").replace(/^[^\p{L}\p{N}]+/u, "").trim();
-  if (text4 === "")
+  const text5 = chunk.replace(/\s+/g, " ").replace(/^[^\p{L}\p{N}]+/u, "").trim();
+  if (text5 === "")
     return;
-  const end = text4.search(/\.(\s|$)/);
-  return end < 0 ? text4 : text4.slice(0, end + 1);
+  const end = text5.search(/\.(\s|$)/);
+  return end < 0 ? text5 : text5.slice(0, end + 1);
 }
 function writeResultLine(deps, outcome) {
   const word3 = { done: "done", incomplete: "incomplete", failed: "FAILED", skipped: "skipped" }[outcome.status];
@@ -111233,8 +113300,8 @@ async function vaultExportKey(args, ctx) {
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
     await assertExportTargetWritable(destination);
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
       promptText: "Vault passphrase (input hidden): "
     });
@@ -111411,13 +113478,13 @@ async function addPasskeyFactor(ctx, parsed, resolvedVault, hold) {
     version: helper.version
   };
   const association = await checkAppleAppSiteAssociation(deps, helper.identity);
-  const raw = await requireVaultRaw(ctx, resolvedVault);
+  const raw2 = await requireVaultRaw(ctx, resolvedVault);
   const envelopeId = freshEnvelopeId();
   const label = parsed.values["--label"] ?? "synced passkey";
-  const opened = await unlockInteractively(ctx, path, raw, {
+  const opened = await unlockInteractively(ctx, path, raw2, {
     acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
     promptText: "Current vault passphrase, to unlock (input hidden): ",
-    among: factorAddAmong(parseVaultFile(raw).envelopes)
+    among: factorAddAmong(parseVaultFile(raw2).envelopes)
   });
   const vault = hold(opened.vault);
   const openedWith = {
@@ -111681,8 +113748,8 @@ async function addSecurityKeyFactor(ctx, parsed, resolvedVault, hold) {
   }
   const facts = await currentPlatformFacts(deps);
   assertFactorAddable("passkey-prf", facts, "ctap2");
-  const raw = await requireVaultRaw(ctx, resolvedVault);
-  const file = parseVaultFile(raw);
+  const raw2 = await requireVaultRaw(ctx, resolvedVault);
+  const file = parseVaultFile(raw2);
   const envelopeId = freshEnvelopeId();
   const vaultId = file.vaultId;
   const keysInHeader = file.envelopes.filter(isCtap2Envelope);
@@ -111695,7 +113762,7 @@ async function addSecurityKeyFactor(ctx, parsed, resolvedVault, hold) {
   let session;
   let enrolling;
   let deferredAfter;
-  const opened = await unlockInteractively(ctx, path, raw, {
+  const opened = await unlockInteractively(ctx, path, raw2, {
     acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
     promptText: "Current vault passphrase, to unlock (input hidden): ",
     among: factorAddAmong(file.envelopes),
@@ -111941,13 +114008,13 @@ async function addTouchIdFactor(ctx, parsed, resolvedVault, hold) {
     version: helper.version,
     biometry: helper.biometry
   };
-  const raw = await requireVaultRaw(ctx, resolvedVault);
+  const raw2 = await requireVaultRaw(ctx, resolvedVault);
   const envelopeId = freshEnvelopeId();
   const label = parsed.values["--label"] ?? "Touch ID";
-  const opened = await unlockInteractively(ctx, path, raw, {
+  const opened = await unlockInteractively(ctx, path, raw2, {
     acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
     promptText: "Current vault passphrase, to unlock (input hidden): ",
-    among: factorAddAmong(parseVaultFile(raw).envelopes)
+    among: factorAddAmong(parseVaultFile(raw2).envelopes)
   });
   const vault = hold(opened.vault);
   const openedWith = {
@@ -112144,11 +114211,11 @@ async function createVault(request2, clock) {
   }
   const path = sidecarPath(request2.path);
   await writeSidecar(path, nextSidecar(await readSidecar(path), file)).catch(() => {});
-  const raw = await readVaultRaw(request2.path);
-  if (raw === null) {
+  const raw2 = await readVaultRaw(request2.path);
+  if (raw2 === null) {
     throw new VaultError("VAULT_WRITE_FAILED", `The vault was written to ${request2.path} but could not be read back.`);
   }
-  return unlockWithPassphrase(request2.path, raw, request2.passphrase, {
+  return unlockWithPassphrase(request2.path, raw2, request2.passphrase, {
     notice: request2.notice,
     derivationLabel: request2.verificationLabel
   });
@@ -112189,8 +114256,8 @@ async function vaultPhraseShow(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const vault = hold((await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const vault = hold((await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
       promptText: "Vault passphrase (input hidden): ",
       reason: "show the recovery phrase"
@@ -112378,8 +114445,8 @@ This vault has exactly one recoverable factor: the passphrase. Lose it and no co
       notice(deps, "stdout", "note", `
 This vault has a 24-word recovery phrase. It re-derives every key this vault derives, on any BIP-39 wallet, and it is the only way back if you lose both the file and your backups.
 `.trim());
-      const answer2 = (await deps.promptLine("Show the recovery phrase now? Type yes to see it, anything else to skip: ")).trim().toLowerCase();
-      if (answer2 === "yes") {
+      const answer3 = (await deps.promptLine("Show the recovery phrase now? Type yes to see it, anything else to skip: ")).trim().toLowerCase();
+      if (answer3 === "yes") {
         await runPhraseCeremony(ctx, vault);
       } else {
         notice(deps, "stdout", "note", `Skipped. You can run the ceremony later with: candle vault phrase show
@@ -112432,8 +114499,8 @@ Nothing has a copy of this vault yet. A copy in iCloud Drive is a copy of the ci
 `.trim());
   notice(deps, "stdout", "note", `This vault holds no keys yet, so what a copy taken now protects is the root every key comes back from. Back it up again after your first \`vault new-key\`: until then \`verify-backup\` will report this copy as stale, correctly.
 `.trim());
-  const answer2 = (await deps.promptLine("Back up your encrypted vault to iCloud Drive now? Type yes to back it up, anything else to skip: ")).trim().toLowerCase();
-  if (answer2 !== "yes") {
+  const answer3 = (await deps.promptLine("Back up your encrypted vault to iCloud Drive now? Type yes to back it up, anything else to skip: ")).trim().toLowerCase();
+  if (answer3 !== "yes") {
     notice(deps, "stdout", "note", `Skipped. Back it up whenever you like with: candle vault backup --to ${ICLOUD_SHORTHAND}
 `.trim());
     return;
@@ -112462,10 +114529,10 @@ async function vaultFactorList(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async () => {
-    const raw = await readVaultRaw(path);
-    if (raw === null)
+    const raw2 = await readVaultRaw(path);
+    if (raw2 === null)
       throw missingVault(ctx, resolvedVault);
-    const file = parseVaultFile(raw);
+    const file = parseVaultFile(raw2);
     const facts = await currentPlatformFacts(deps);
     const rows = file.envelopes.map((envelope) => {
       const availability = envelopeAvailability(envelope, facts);
@@ -112541,8 +114608,8 @@ async function vaultFactorAdd(args, ctx) {
     if (kind !== "passphrase") {
       return usage2(ctx, `Unknown factor: ${kind}. This release adds: passphrase, security-key, touch-id, passkey`);
     }
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
       promptText: "Current vault passphrase, to unlock (input hidden): "
     });
@@ -112611,8 +114678,8 @@ async function vaultFactorRemove(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const vault = hold((await unlockInteractively(ctx, path, raw, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const vault = hold((await unlockInteractively(ctx, path, raw2, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
     const target = vault.file.envelopes.find((envelope) => envelope.id === id);
     if (!target)
       throw new VaultError("VAULT_FACTOR_UNAVAILABLE", `This vault has no envelope with id ${id}.`, {
@@ -112865,8 +114932,8 @@ async function vaultFund(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
       reason: describeSend(amount, asset, teeAddress)
     });
@@ -112985,9 +115052,9 @@ async function vaultFundEvm(ctx, parsed, teeAddress) {
   if (parsed.values["--from"] !== undefined) {
     return usage2(ctx, "--from applies to an external wallet only; a TEE wallet is funded from its pinned vault key.");
   }
-  const client2 = resolveHoodClient(ctx, parsed.values["--rpc-url"]);
-  if ("error" in client2)
-    return usage2(ctx, client2.error);
+  const client3 = resolveHoodClient(ctx, parsed.values["--rpc-url"]);
+  if ("error" in client3)
+    return usage2(ctx, client3.error);
   if (!refuseEnvPassphrase(ctx))
     return 1;
   if (!requireTty(ctx, "vault fund"))
@@ -112997,8 +115064,8 @@ async function vaultFundEvm(ctx, parsed, teeAddress) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
       reason: describeSend(amount, asset, teeAddress)
     });
@@ -113027,15 +115094,15 @@ async function vaultFundEvm(ctx, parsed, teeAddress) {
       throw new VaultError("GRANT_DESTINATION_UNRESOLVED", `${teeEntry.address} has no pinned EVM vault key in this vault to fund from.`, { suggestion: "Nothing was signed. candle vault status lists this vault's keys and their pins." });
     }
     assertVaultSigner(fromEntry);
-    ctx.deps.stderr.write(`${hoodHostLine(client2, "the chain id")}
+    ctx.deps.stderr.write(`${hoodHostLine(client3, "the chain id")}
 `);
-    await assertHoodChain(client2);
+    await assertHoodChain(client3);
     notice(ctx.deps, "stdout", "note", `Every funded unit adds to the TEE wallet exposure; the initial float is not a maximum loss.
 `.trim());
     return runEvmTransfer({
       ctx,
-      rpcUrl: client2.url,
-      builtIn: client2.builtIn,
+      rpcUrl: client3.url,
+      builtIn: client3.builtIn,
       pinHoodChain: true,
       from: fromEntry,
       to: teeEntry.address,
@@ -113045,7 +115112,7 @@ async function vaultFundEvm(ctx, parsed, teeAddress) {
       decryptSecret: () => decryptKey(vault, fromEntry.id),
       usage: (line) => usage2(ctx, line),
       writeJson: (value) => writeJson(ctx.deps, { ...value, tee: teeEntry.address })
-    }, client2.rpc);
+    }, client3.rpc);
   });
 }
 function refuseRetiredFund(ctx, address) {
@@ -113144,13 +115211,13 @@ function mapLegacyTeeEntry(entry2, keyId, grant, createdAtFallback) {
   return { entry: mapped, secret64 };
 }
 function buildTeeMeta(entry2, lifecycle, grant) {
-  const source = entry2.tee;
-  const network2 = source?.network ?? "solana-mainnet";
+  const source2 = entry2.tee;
+  const network2 = source2?.network ?? "solana-mainnet";
   if (network2 !== "solana-mainnet") {
     throw new VaultError("VAULT_INDEX_INVALID", `Legacy entry ${entry2.address} names network ${String(network2)}; only solana-mainnet migrates.`);
   }
   const meta = { network: network2, lifecycle };
-  carryOptional(meta, source, [
+  carryOptional(meta, source2, [
     "vaultDestination",
     "boundKeyPrefix",
     "remoteAuthority",
@@ -113186,11 +115253,11 @@ function buildTeeMeta(entry2, lifecycle, grant) {
   }
   return meta;
 }
-function carryOptional(target, source, fields2) {
-  if (source === undefined)
+function carryOptional(target, source2, fields2) {
+  if (source2 === undefined)
     return;
   for (const field of fields2) {
-    const value = source[field];
+    const value = source2[field];
     if (value !== undefined)
       target[field] = value;
   }
@@ -113355,11 +115422,11 @@ async function recordMigrationSidecar(vaultPath, vault, fromPath, digest, now) {
   })).catch(() => {});
 }
 async function verifyMigratedOnDisk(path, reopen, entries3, _ctx) {
-  const raw = await readVaultRaw(path);
-  if (raw === null) {
+  const raw2 = await readVaultRaw(path);
+  if (raw2 === null) {
     throw new VaultError("VAULT_WRITE_FAILED", `The vault at ${path} could not be read back after the migration.`);
   }
-  const reopened = await reopen(path, raw);
+  const reopened = await reopen(path, raw2);
   try {
     for (const entry2 of entries3) {
       const secret = await decryptKey(reopened, entry2.id);
@@ -113546,10 +115613,10 @@ async function vaultList(args, ctx) {
   const evmRpcUrl = "url" in evmRpc ? evmRpc.url : DEFAULT_HOOD_RPC_URL;
   const promptCtx = refusePromptsWithoutTerminal(ctx, "vault list");
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await readVaultRaw(path);
-    if (raw === null)
+    const raw2 = await readVaultRaw(path);
+    if (raw2 === null)
       throw missingVault(ctx, resolvedVault);
-    const vault = hold((await unlockInteractively(promptCtx, path, raw, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
+    const vault = hold((await unlockInteractively(promptCtx, path, raw2, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
     const all = vault.index.entries;
     const filtered = filter === undefined ? all : all.filter((entry2) => matches2(entry2, filter));
     const showRetired = parsed.booleans.has("--all");
@@ -113849,16 +115916,16 @@ init_promote_support();
 init_store();
 init_vault_support();
 function hoodClientFor(ctx, parsed) {
-  const client2 = resolveHoodClient(ctx, parsed.values["--rpc-url"]);
-  if ("error" in client2)
-    return { exit: usage2(ctx, client2.error) };
-  return client2;
+  const client3 = resolveHoodClient(ctx, parsed.values["--rpc-url"]);
+  if ("error" in client3)
+    return { exit: usage2(ctx, client3.error) };
+  return client3;
 }
-async function promoteHeight(ctx, client2) {
-  notice(ctx.deps, "stderr", "note", `${hoodHostLine(client2, "the chain id and the current Hood height")}
+async function promoteHeight(ctx, client3) {
+  notice(ctx.deps, "stderr", "note", `${hoodHostLine(client3, "the chain id and the current Hood height")}
 `.trim());
-  await assertHoodChain(client2);
-  return client2.rpc.blockNumber();
+  await assertHoodChain(client3);
+  return client3.rpc.blockNumber();
 }
 function importKeyHex(secret) {
   return bytesToHex2(secret);
@@ -113877,11 +115944,11 @@ async function promoteEvmFresh(input, fromLabel) {
     acceptUnknownExposure: acceptUnknown,
     chain: "evm"
   });
-  const client2 = hoodClientFor(ctx, parsed);
-  if ("exit" in client2)
-    return client2.exit;
+  const client3 = hoodClientFor(ctx, parsed);
+  if ("exit" in client3)
+    return client3.exit;
   await refuseWithoutRoom(ctx);
-  const height = await promoteHeight(ctx, client2);
+  const height = await promoteHeight(ctx, client3);
   const teeIndex = nextAllocatableIndex(nextIndexOf(vault.index.hd, "evmTee"), exposedIndexesOf(vault.index.hd, "evmTee"));
   const derivationPath = evmTeePath(teeIndex);
   const root = await decryptRoot(vault);
@@ -114014,9 +116081,9 @@ async function promoteEvmInPlace(input, subjectLabel, sweepTo) {
   const { ctx, parsed, opened, hold, resolvedVault, toKey } = input;
   let vault = hold(opened.vault);
   const acceptUnknown = parsed.booleans.has("--accept-unknown-exposure");
-  const client2 = hoodClientFor(ctx, parsed);
-  if ("exit" in client2)
-    return client2.exit;
+  const client3 = hoodClientFor(ctx, parsed);
+  if ("exit" in client3)
+    return client3.exit;
   const first = assertEvmInPlacePreconditions(vault.index, subjectLabel, sweepTo, {
     acceptUnknownExposure: acceptUnknown
   });
@@ -114030,8 +116097,8 @@ async function promoteEvmInPlace(input, subjectLabel, sweepTo) {
     warnings: [...signerStaysLines(toKey), ...targetWarnings(toKey.target, "evm")],
     ...toKey.keySigner !== undefined ? { signer: toKey.keySigner.fingerprint } : {}
   });
-  const height = await promoteHeight(ctx, client2);
-  const holdings2 = await readEvmHoldings(client2.rpc, first.subject.address);
+  const height = await promoteHeight(ctx, client3);
+  const holdings2 = await readEvmHoldings(client3.rpc, first.subject.address);
   for (const line of holdingsLines(first.subject.address, holdings2, new Date(ctx.deps.now()).toISOString())) {
     notice(ctx.deps, "stdout", "note", `${line}
 `.trim());
@@ -114248,8 +116315,8 @@ async function promoteFresh(ctx, parsed, fromLabel, toKey) {
   const path = resolvedVault.path;
   const acceptUnknown = parsed.booleans.has("--accept-unknown-exposure");
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     let vault = hold(opened.vault);
@@ -114388,18 +116455,18 @@ async function refuseWithoutRoom(ctx) {
     notice(ctx.deps, "stderr", "note", unreadableRoomLine(read3.reason).trim());
     return;
   }
-  const refusal4 = singleRoomRefusal(read3.room);
-  if (refusal4 !== null)
-    throw refusal4;
+  const refusal5 = singleRoomRefusal(read3.room);
+  if (refusal5 !== null)
+    throw refusal5;
 }
 async function reopenFromDisk(path, reopen, previous) {
   closeVault(previous);
-  const raw = await readVaultRaw(path);
-  if (raw === null)
+  const raw2 = await readVaultRaw(path);
+  if (raw2 === null)
     throw new VaultError("VAULT_MISSING", `No vault at ${path}.`, {
       suggestion: "The vault was there when this run started. Check nothing moved or removed it, then: candle vault status"
     });
-  return reopen(path, raw, "re-opening the vault to verify its current contents");
+  return reopen(path, raw2, "re-opening the vault to verify its current contents");
 }
 async function promoteInPlace(ctx, parsed, subjectLabel, toKey) {
   if ("error" in parsed)
@@ -114411,8 +116478,8 @@ async function promoteInPlace(ctx, parsed, subjectLabel, toKey) {
   const sweepTo = parsed.values["--sweep-to"];
   const acceptUnknown = parsed.booleans.has("--accept-unknown-exposure");
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     let vault = hold(opened.vault);
@@ -114803,8 +116870,8 @@ async function runTeeImport(ctx, opts) {
   const name2 = ctx.profile ?? config.activeProfile;
   const account = name2 !== undefined ? config.profiles?.[name2]?.account ?? "" : "";
   const importedAt = new Date(ctx.deps.now()).toISOString();
-  const raw = await requireVaultRaw(ctx, opts.resolvedVault);
-  const vault = await opts.reopenForWrite(opts.resolvedVault.path, raw, "re-opening the vault to save the import result");
+  const raw2 = await requireVaultRaw(ctx, opts.resolvedVault);
+  const vault = await opts.reopenForWrite(opts.resolvedVault.path, raw2, "re-opening the vault to save the import result");
   let committed;
   try {
     committed = await commitVault(vault, {
@@ -114884,10 +116951,10 @@ function parsePairsFile(contents, opts) {
   const findings = [];
   const lines = contents.split(/\r?\n/);
   const meaningful = [];
-  for (const [at3, raw] of lines.entries()) {
-    if (raw.trim().length === 0 || COMMENT.test(raw))
+  for (const [at3, raw2] of lines.entries()) {
+    if (raw2.trim().length === 0 || COMMENT.test(raw2))
       continue;
-    meaningful.push({ line: at3 + 1, text: raw });
+    meaningful.push({ line: at3 + 1, text: raw2 });
   }
   const first = meaningful[0];
   if (first === undefined) {
@@ -114907,8 +116974,8 @@ function parsePairsFile(contents, opts) {
     const orderAt = at3("order");
     const valueAt = at3("value_usd");
     hasValueUsd = valueAt !== -1;
-    for (const { line, text: text4 } of meaningful.slice(1)) {
-      const cells = text4.split(",").map((cell) => cell.trim());
+    for (const { line, text: text5 } of meaningful.slice(1)) {
+      const cells = text5.split(",").map((cell) => cell.trim());
       if (cells.length !== headerCells.length) {
         findings.push({
           line,
@@ -114941,8 +117008,8 @@ function parsePairsFile(contents, opts) {
       ]
     };
   } else {
-    for (const { line, text: text4 } of meaningful) {
-      const fields2 = text4.trim().split(/\s+/);
+    for (const { line, text: text5 } of meaningful) {
+      const fields2 = text5.trim().split(/\s+/);
       if (fields2.length !== 2) {
         findings.push({
           line,
@@ -115055,7 +117122,7 @@ async function preflightBatch(index, rows, opts) {
   const failures = [];
   const pinnedBy = new Map;
   const promotedBy = new Map;
-  const refuse3 = (row2, failure4) => {
+  const refuse4 = (row2, failure4) => {
     failures.push({
       line: row2.line,
       label: row2.label,
@@ -115068,7 +117135,7 @@ async function preflightBatch(index, rows, opts) {
   };
   const refuseWith = (row2, error, why) => {
     if (isVaultError(error)) {
-      refuse3(row2, {
+      refuse4(row2, {
         code: error.code,
         message: error.message,
         ...error.suggestion !== undefined ? { suggestion: error.suggestion } : {},
@@ -115076,7 +117143,7 @@ async function preflightBatch(index, rows, opts) {
       });
       return;
     }
-    refuse3(row2, { code: "VAULT_UNREADABLE", message: error instanceof Error ? error.message : String(error) });
+    refuse4(row2, { code: "VAULT_UNREADABLE", message: error instanceof Error ? error.message : String(error) });
   };
   for (const row2 of rows) {
     const classified = classifyRow(index, row2);
@@ -115100,7 +117167,7 @@ async function preflightBatch(index, rows, opts) {
     if (classified.state === "conflict") {
       const subject = classified.subject;
       const lifecycle = subject.tee?.lifecycle ?? "unknown";
-      refuse3(row2, {
+      refuse4(row2, {
         code: "PROMOTE_ALREADY_TEE_WALLET",
         message: `${subject.label ?? subject.address} is already a TEE wallet (${lifecycle}).`,
         why: classified.onDisk !== undefined ? `On disk it sweeps to ${classified.onDisk}; this file says ${row2.destination} (${classified.destinationAddress}).` : `Its lifecycle is ${lifecycle}, which is not resumable; this file says ${row2.destination}.`
@@ -115114,7 +117181,7 @@ async function preflightBatch(index, rows, opts) {
         destinationAddress: classified.destinationAddress
       });
       if (!reconciled.ok) {
-        refuse3(row2, reconciled.failure);
+        refuse4(row2, reconciled.failure);
         continue;
       }
       planned.push({
@@ -115127,12 +117194,12 @@ async function preflightBatch(index, rows, opts) {
       continue;
     }
     try {
-      const check = opts.chain === "evm" ? assertEvmInPlacePreconditions : assertInPlacePreconditions;
-      const { subject, destination, resume } = check(projection, row2.label, row2.destination, {
+      const check2 = opts.chain === "evm" ? assertEvmInPlacePreconditions : assertInPlacePreconditions;
+      const { subject, destination, resume } = check2(projection, row2.label, row2.destination, {
         acceptUnknownExposure: opts.acceptUnknownExposure
       });
       if (resume) {
-        refuse3(row2, {
+        refuse4(row2, {
           code: "PROMOTE_ALREADY_TEE_WALLET",
           message: `${subject.label ?? subject.address} is already a TEE wallet (${subject.tee?.lifecycle ?? "unknown"}).`
         });
@@ -115172,15 +117239,15 @@ function annotate(error, row2, classified, pinnedBy, promotedBy) {
 var CONTINUATION_SENTENCE = (total) => `Each row was checked against the vault as it will be when the rows above it have run, so this is
 ` + `every row that fails on that basis. Fix these rows and run again; the next run re-checks all ${total}
 ` + `from scratch.`;
-function writeBatchRefusal(deps, json, refusal4) {
-  const n = refusal4.rows.length;
+function writeBatchRefusal(deps, json, refusal5) {
+  const n = refusal5.rows.length;
   if (json) {
     deps.stdout.write(`${JSON.stringify({
       ok: false,
       code: "PROMOTE_BATCH_REFUSED",
-      message: `${n} of ${refusal4.total} rows cannot run; nothing was written.`,
+      message: `${n} of ${refusal5.total} rows cannot run; nothing was written.`,
       suggestion: "Fix the rows below and run again; the next run re-checks every row from scratch.",
-      rows: refusal4.rows.map((row2) => ({
+      rows: refusal5.rows.map((row2) => ({
         line: row2.line,
         label: row2.label,
         destination: row2.destination,
@@ -115192,22 +117259,22 @@ function writeBatchRefusal(deps, json, refusal4) {
 `);
     return;
   }
-  const table = renderTable(["line", "label", "destination", "code", "why"], refusal4.rows.map((row2) => [
+  const table = renderTable(["line", "label", "destination", "code", "why"], refusal5.rows.map((row2) => [
     String(row2.line),
     row2.label,
     row2.destination,
     row2.code,
     row2.why !== undefined ? `${row2.message} ${row2.why}` : row2.message
   ]));
-  deps.stderr.write(`This batch was refused and NOTHING was written. ${n} of ${refusal4.total} rows cannot run:
+  deps.stderr.write(`This batch was refused and NOTHING was written. ${n} of ${refusal5.total} rows cannot run:
 
 ${table}
 
-${CONTINUATION_SENTENCE(refusal4.total)}
+${CONTINUATION_SENTENCE(refusal5.total)}
 `);
 }
-function parseValueUsdCell(raw) {
-  const cleaned = raw.trim().replace(/^\$/, "").replace(/,/g, "");
+function parseValueUsdCell(raw2) {
+  const cleaned = raw2.trim().replace(/^\$/, "").replace(/,/g, "");
   if (cleaned.length === 0)
     return;
   const value = Number(cleaned);
@@ -115329,8 +117396,8 @@ async function vaultPromoteBatch(args, ctx) {
     };
   }
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
     });
     let current = hold(opened.vault);
@@ -115802,10 +117869,10 @@ async function verifySubjectSecret(vault, subject) {
 }
 async function reconcileForPreflight(ctx, row2, subject, resolved) {
   const { onDisk } = resolved;
-  const refuse3 = (failure4) => ({ ok: false, failure: failure4 });
+  const refuse4 = (failure4) => ({ ok: false, failure: failure4 });
   const apiKey = await resolveApiKey(ctx.deps, ctx.profile);
   if (!apiKey) {
-    return refuse3({
+    return refuse4({
       code: "PROMOTE_RECONCILE_INCOMPLETE",
       message: "No API key is available; reconciliation cannot run.",
       suggestion: "Run: candle keys create"
@@ -115817,7 +117884,7 @@ async function reconcileForPreflight(ctx, row2, subject, resolved) {
     const name2 = ctx.profile ?? config.activeProfile;
     const cached = name2 !== undefined ? config.profiles?.[name2]?.account : undefined;
     if (cached === undefined || cached === "") {
-      return refuse3({
+      return refuse4({
         code: "PROMOTE_RECONCILE_INCOMPLETE",
         message: "This entry has no grant identity, and this profile has no cached account to assert."
       });
@@ -115829,7 +117896,7 @@ async function reconcileForPreflight(ctx, row2, subject, resolved) {
     verdict = await reconcileGrant(ctx, subject, { assertedAccount });
   } catch (error) {
     if (isVaultError(error)) {
-      return refuse3({
+      return refuse4({
         code: error.code,
         message: error.message,
         ...error.suggestion !== undefined ? { suggestion: error.suggestion } : {}
@@ -115838,17 +117905,17 @@ async function reconcileForPreflight(ctx, row2, subject, resolved) {
     throw error;
   }
   if (verdict.kind === "unreadable") {
-    return refuse3({ code: "PROMOTE_RECONCILE_INCOMPLETE", message: verdict.reason });
+    return refuse4({ code: "PROMOTE_RECONCILE_INCOMPLETE", message: verdict.reason });
   }
   if (verdict.kind === "unresolved") {
-    return refuse3({
+    return refuse4({
       code: "PROMOTE_OUTCOME_UNRESOLVED",
       message: `No authoritative grant or stranding record for ${subject.address}; the outcome is not established.`,
       suggestion: "Nothing was written. Demote under --emergency if funds must move, then promote a fresh key."
     });
   }
   if (verdict.kind === "strand-final") {
-    return refuse3({
+    return refuse4({
       code: "PROMOTE_ALREADY_TEE_WALLET",
       message: `${subject.address} is stranded; it is never re-promotable.`,
       suggestion: `Run: candle vault promote --in-place ${row2.label} (which records the stranding), then remove this row from the file.`
@@ -115858,7 +117925,7 @@ async function reconcileForPreflight(ctx, row2, subject, resolved) {
   const account = assertedAccount ?? subject.tee?.grantIdentity?.account ?? verdict.account;
   if (onDisk !== undefined) {
     if (server !== undefined && server !== onDisk) {
-      return refuse3({
+      return refuse4({
         code: "GRANT_BINDING_MISMATCH",
         message: `The recorded vault destination ${onDisk} does not match the server's ${server}.`
       });
@@ -115866,7 +117933,7 @@ async function reconcileForPreflight(ctx, row2, subject, resolved) {
     return { ok: true, destinationAddress: onDisk, ...assertedAccount !== undefined ? { account } : {} };
   }
   if (server === undefined) {
-    return refuse3({
+    return refuse4({
       code: "GRANT_DESTINATION_UNRESOLVED",
       message: `The server lists ${subject.address} but carries no vault destination to adopt.`,
       suggestion: "Choose a vault key with `vault demote --sweep-to`, or wait until the grant records a destination."
@@ -115874,7 +117941,7 @@ async function reconcileForPreflight(ctx, row2, subject, resolved) {
   }
   const fileDestination = resolved.destinationAddress;
   if (server !== fileDestination) {
-    return refuse3({
+    return refuse4({
       code: "GRANT_BINDING_MISMATCH",
       message: `The server-reported vault destination ${server} does not match this file's ${row2.destination} (${fileDestination}).`,
       why: `Row ${row2.line} names a different destination from the grant the server holds; the file and the server describe different migrations.`
@@ -116188,10 +118255,10 @@ async function discardIncompleteRestore(ctx, path, sidecarExisted) {
 }
 var RESTORED_BRANCHES = ["solanaVault", "solanaTee", "solanaExternal"];
 function parseCounts(count3, teeCount, externalCount, rpcUrl, evmCount, evmTeeCount) {
-  const parse = (raw, flag) => {
-    if (raw === undefined)
+  const parse = (raw2, flag) => {
+    if (raw2 === undefined)
       return;
-    const value = Number(raw);
+    const value = Number(raw2);
     if (!Number.isInteger(value) || value < 0)
       return { error: `${flag} must be a whole number, zero or greater.` };
     return value;
@@ -116595,8 +118662,8 @@ async function vaultReconcileExposure(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const vault = hold((await unlockInteractively(ctx, path, raw, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const vault = hold((await unlockInteractively(ctx, path, raw2, { acceptOlderCopy: parsed.booleans.has("--accept-older-copy") })).vault);
     const apiKey = await resolveApiKey(deps, ctx.profile);
     if (apiKey === undefined) {
       throw new VaultError("VAULT_UNREADABLE", "No API key is stored for this profile, so there is no account to reconcile against.", {
@@ -116854,10 +118921,10 @@ async function vaultStatus(args, ctx) {
   const unlock = parsed.booleans.has("--unlock");
   const unlockCtx = refusePromptsWithoutTerminal(ctx, "vault status --unlock");
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await readVaultRaw(path);
-    if (raw === null)
+    const raw2 = await readVaultRaw(path);
+    if (raw2 === null)
       throw missingVault(ctx, resolvedVault);
-    const file = parseVaultFile(raw);
+    const file = parseVaultFile(raw2);
     if (unlock)
       assertVaultHelperIdentities(deps, file.envelopes);
     const facts = await currentPlatformFacts(deps);
@@ -116869,7 +118936,7 @@ async function vaultStatus(args, ctx) {
     const backup = sidecar ? describeLastBackup(sidecar, file.envelopes) : undefined;
     let unlocked;
     if (unlock) {
-      const vault = hold((await unlockInteractively(unlockCtx, path, raw, {
+      const vault = hold((await unlockInteractively(unlockCtx, path, raw2, {
         acceptOlderCopy: parsed.booleans.has("--accept-older-copy")
       })).vault);
       unlocked = {
@@ -117136,8 +119203,8 @@ async function vaultTransfer(args, ctx) {
     return usage2(ctx, resolvedVault.error);
   const path = resolvedVault.path;
   return runVaultCommand(ctx, async ({ hold }) => {
-    const raw = await requireVaultRaw(ctx, resolvedVault);
-    const opened = await unlockInteractively(ctx, path, raw, {
+    const raw2 = await requireVaultRaw(ctx, resolvedVault);
+    const opened = await unlockInteractively(ctx, path, raw2, {
       acceptOlderCopy: parsed.booleans.has("--accept-older-copy"),
       promptText: "Vault passphrase (input hidden): ",
       reason: describeSend(amount, asset, to)
@@ -117480,7 +119547,7 @@ function writeFailure2(ctx, result2) {
 }
 async function setAllowLaunch(args, ctx, enabled) {
   const { deps, apiUrl, json } = ctx;
-  const usage13 = enabled ? USAGE_ALLOW : USAGE_DISALLOW;
+  const usage14 = enabled ? USAGE_ALLOW : USAGE_DISALLOW;
   const command = enabled ? "wallets allow-launch" : "wallets disallow-launch";
   const parsed = parseArgs(args, enabled ? {} : { booleanFlags: ["--yes"] });
   if ("error" in parsed) {
@@ -117488,7 +119555,7 @@ async function setAllowLaunch(args, ctx, enabled) {
     return 2;
   }
   if (parsed.positionals.length === 0) {
-    writeScreenUsageFailure(deps, `Name at least one wallet. ${usage13}`, json);
+    writeScreenUsageFailure(deps, `Name at least one wallet. ${usage14}`, json);
     return 2;
   }
   const skipConfirm = !enabled && parsed.booleans.has("--yes");
@@ -117546,9 +119613,9 @@ async function setAllowLaunch(args, ctx, enabled) {
   else {
     deps.stderr.write(`${screen[0]}
 `);
-    for (const text4 of screen.slice(1))
-      if (text4)
-        notice(deps, "stderr", "warning", text4);
+    for (const text5 of screen.slice(1))
+      if (text5)
+        notice(deps, "stderr", "warning", text5);
   }
   if (!skipConfirm) {
     const typed = await deps.promptLine(`Type ${CONFIRM_WORD} to ${enabled ? "allow" : "stop"} launches from ${n === 1 ? "this wallet" : `these ${n} wallets`}: `);
@@ -117848,7 +119915,7 @@ init_solana_alt();
 init_solana_lite();
 init_trading();
 init_swap();
-import { randomUUID as randomUUID17 } from "node:crypto";
+import { randomUUID as randomUUID18 } from "node:crypto";
 var USAGE20 = "Usage: candle wallet close-empty [--wallet embedded|<tee address|label>] [--keep <mint>]... [--client-trade-id <id>] [--preview] [--yes] [--json]";
 var BASE58_ADDRESS2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 var LISTED_ROWS = 50;
@@ -118027,30 +120094,30 @@ function closeProblem(transaction, wallet3, accounts) {
   return null;
 }
 function checkedBuild(build, wallet3, previewed) {
-  const refuse3 = (why) => new TradingError("INVALID_RESPONSE", `The close Candle built ${why}; nothing was signed.`);
+  const refuse4 = (why) => new TradingError("INVALID_RESPONSE", `The close Candle built ${why}; nothing was signed.`);
   if (build.status !== "built" || build.wallet !== wallet3)
-    throw refuse3(`does not name the TEE wallet ${wallet3}`);
+    throw refuse4(`does not name the TEE wallet ${wallet3}`);
   const list = build.transactions;
   if (!Array.isArray(list) || list.length === 0)
-    throw refuse3("has no transactions");
+    throw refuse4("has no transactions");
   const indexes2 = new Set;
   const closing2 = new Set;
   const out = [];
   for (const entry2 of list) {
     const { index, unsignedTransaction, accounts } = entry2 ?? {};
     if (typeof index !== "number" || !Number.isInteger(index) || indexes2.has(index) || typeof unsignedTransaction !== "string" || !Array.isArray(accounts) || !accounts.every((a) => typeof a === "string"))
-      throw refuse3("is not a list of indexed transactions");
+      throw refuse4("is not a list of indexed transactions");
     indexes2.add(index);
     for (const account of accounts) {
       if (!previewed.has(account))
-        throw refuse3(`closes ${safeText(account)}, which the preview did not list`);
+        throw refuse4(`closes ${safeText(account)}, which the preview did not list`);
       if (closing2.has(account))
-        throw refuse3(`closes ${safeText(account)} twice`);
+        throw refuse4(`closes ${safeText(account)} twice`);
       closing2.add(account);
     }
     const problem = closeProblem(unsignedTransaction, wallet3, new Set(accounts));
     if (problem)
-      throw refuse3(`transaction ${index} ${safeText(problem)}`);
+      throw refuse4(`transaction ${index} ${safeText(problem)}`);
     out.push({ index, unsignedTransaction, accounts });
   }
   return out.sort((a, b) => a.index - b.index);
@@ -118136,7 +120203,7 @@ async function walletsCloseEmpty(args, ctx) {
     return 2;
   }
   const named = parsed.values["--client-trade-id"];
-  const id = named ?? `close-${randomUUID17()}`;
+  const id = named ?? `close-${randomUUID18()}`;
   if (parsed.positionals.length !== 0 || !validClientId(id) || !lifted.keep.every((m) => BASE58_ADDRESS2.test(m))) {
     writeUsageFailure(ctx.deps, USAGE20, ctx.json);
     return 2;
@@ -118245,7 +120312,7 @@ function trustTable(rows, style) {
 }
 async function setTrust(args, ctx, trusted) {
   const { deps, apiUrl, json } = ctx;
-  const usage13 = trusted ? USAGE_TRUST : USAGE_UNTRUST;
+  const usage14 = trusted ? USAGE_TRUST : USAGE_UNTRUST;
   const command = trusted ? "wallets trust" : "wallets untrust";
   const parsed = parseArgs(args, trusted ? {} : { booleanFlags: ["--yes"] });
   if ("error" in parsed) {
@@ -118253,7 +120320,7 @@ async function setTrust(args, ctx, trusted) {
     return 2;
   }
   if (parsed.positionals.length === 0) {
-    writeScreenUsageFailure(deps, `Name at least one wallet. ${usage13}`, json);
+    writeScreenUsageFailure(deps, `Name at least one wallet. ${usage14}`, json);
     return 2;
   }
   const skipConfirm = !trusted && parsed.booleans.has("--yes");
@@ -118312,9 +120379,9 @@ async function setTrust(args, ctx, trusted) {
   else {
     deps.stderr.write(`${screen[0]}
 `);
-    for (const text4 of screen.slice(1))
-      if (text4)
-        notice(deps, "stderr", "warning", text4);
+    for (const text5 of screen.slice(1))
+      if (text5)
+        notice(deps, "stderr", "warning", text5);
   }
   if (!skipConfirm) {
     const typed = await deps.promptLine(`Type ${CONFIRM_WORD} to ${trusted ? "trust" : "untrust"} ${n === 1 ? "this wallet" : `these ${n} wallets`}: `);
@@ -118362,8 +120429,8 @@ function configFilePath() {
 }
 async function readConfig() {
   try {
-    const raw = await readFile20(configFilePath(), "utf8");
-    return JSON.parse(raw);
+    const raw2 = await readFile20(configFilePath(), "utf8");
+    return JSON.parse(raw2);
   } catch (err) {
     if (err.code === "ENOENT")
       return {};
@@ -118572,7 +120639,10 @@ function extractGlobalFlags(argv) {
 }
 var COMMANDS = {
   stake: { bare: stake, subcommands: { add: stakeAdd, remove: stakeRemove, finish: stakeFinish, claim: stakeClaim } },
-  swap: { bare: swap2, subcommands: { status: swapStatus, recover: swapRecover, receipt: swapReceipt } },
+  swap: {
+    bare: swap2,
+    subcommands: { status: swapStatus, recover: swapRecover, receipt: swapReceipt, cancel: swapCancel }
+  },
   transfer: { bare: transfer },
   launch: { bare: launch, subcommands: { status: launchStatus } },
   image: { subcommands: { upload: imageUpload } },
@@ -118611,10 +120681,20 @@ var COMMANDS = {
   },
   quant: { subcommands: { ask: quantAsk, terms: quantTerms } },
   lab: { subcommands: { status: labStatus, replay: labReplay, runners: labRunners, edges: labEdges } },
+  signals: { subcommands: { scorecard: signalsScorecard, records: signalsRecords, record: signalsRecord } },
   plan: {
     subcommands: { buy: planBuy, status: planStatus, renew: planRenew, "auto-renew": planAutoRenew }
   },
-  lp: { subcommands: { pools: lpPools, add: lpAdd, positions: lpPositions, remove: lpRemove, claim: lpClaim } },
+  lp: {
+    subcommands: {
+      pools: lpPools,
+      add: lpAdd,
+      positions: lpPositions,
+      remove: lpRemove,
+      claim: lpClaim,
+      status: lpStatus
+    }
+  },
   perps: {
     subcommands: {
       markets: perpsMarkets,

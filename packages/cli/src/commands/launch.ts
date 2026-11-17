@@ -34,6 +34,7 @@ import { writeFields } from "../human-output"
 import { BundleReadError, readLaunchBundle } from "../launch-bundle"
 import { launchCheck } from "../launch-check"
 import { LAUNCH_DEFINITION } from "../launch-definition"
+import { checkLaunchSignature } from "../launch-landed"
 import { LAUNCH_IMAGE_FLAG, LAUNCH_USAGE, launchFieldProblem, launchFlagFields } from "../launch-options"
 import {
   type LaunchRulesBody,
@@ -56,6 +57,7 @@ import {
   HOOD_BASES,
   type Json,
   launchBuildSchema,
+  mayHaveLanded,
   payerSignature,
   type QuoteDisplay,
   rawAmount,
@@ -97,6 +99,7 @@ export const LAUNCH_ARG_SPEC: ArgSpec = {
   valueFlags: [
     ...launchFlagFields.filter((field) => field.type !== "boolean").map((field) => field.cli.flag),
     LAUNCH_IMAGE_FLAG,
+    "--quote",
     "--rpc-url",
   ],
   booleanFlags: [
@@ -227,6 +230,10 @@ function flagChain(flags: Record<string, string>): TradeChain | undefined {
   const quote = flags["--quote-asset"]
   const quoteChain = quote === undefined ? undefined : QUOTE_CHAIN[quote.toLowerCase()]
   if (quoteChain) said.push([`--quote-asset ${quote}`, quoteChain])
+  const selected = flags["--quote"]
+  // chain-lint-allowed: this launch surface supports only Solana and Hood's audited launch stack, as the shared launch definition declares.
+  if (selected && /^0x[0-9a-fA-F]{40}$/.test(selected)) said.push(["--quote address", "hood"])
+  else if (selected && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(selected)) said.push(["--quote mint", "solana"])
   if (flags["--dex-version"] !== undefined) said.push(["--dex-version", "hood"])
   const [first, ...rest] = said
   const other = rest.find(([, chain]) => chain !== first?.[1])
@@ -248,6 +255,27 @@ export async function launch(args: string[], ctx: CommandContext): Promise<numbe
     return 2
   }
   const flags = parsed.values
+  if (flags["--quote"] !== undefined && flags["--quote-asset"] !== undefined) {
+    writeUsageFailure(ctx.deps, "Pass --quote or --quote-asset, not both.", ctx.json)
+    return 2
+  }
+  const selectedQuote = flags["--quote"]?.trim()
+  if (selectedQuote !== undefined) flags["--quote"] = selectedQuote
+  if (selectedQuote !== undefined) {
+    if (!selectedQuote.trim() || selectedQuote.length > 120) {
+      writeUsageFailure(ctx.deps, "--quote takes a symbol or token address (at most 120 characters).", ctx.json)
+      return 2
+    }
+    // Map fixed addresses to the existing pair id; Solana addresses remain case sensitive.
+    const pair = LAUNCH_DEFINITION.quoteSelection.fixedPairs.find(
+      (p) =>
+        p.id === selectedQuote.toLowerCase() ||
+        p.address === selectedQuote ||
+        // chain-lint-allowed: case folding is only for the Hood addresses in the fixed launch matrix.
+        (p.chain === "hood" && p.address.toLowerCase() === selectedQuote.toLowerCase()),
+    )
+    if (pair) flags["--quote-asset"] = pair.id
+  }
   if (flags["--quote-asset"]) flags["--quote-asset"] = flags["--quote-asset"].toLowerCase()
   const id = flags["--client-trade-id"] ?? `launch-${randomUUID()}`
   const embedded = EMBEDDED_WALLET_NAMES.has(flags["--wallet"] ?? "")
@@ -334,6 +362,14 @@ export async function launch(args: string[], ctx: CommandContext): Promise<numbe
     // Before any request, as `candle swap` checks `--amount`; the quote asset's decimals come later.
     if (flags["--buy"]?.trim() && !/^0+(\.0+)?$/.test(flags["--buy"])) launchBuyRaw(flags["--buy"], 18)
     const hinted = flagChain(flags)
+    if (selectedQuote !== undefined && !check && !flags["--quote-asset"])
+      return tradingFailure(
+        ctx,
+        new TradingError(
+          "QUOTE_LAUNCH_UNAVAILABLE",
+          "New-quote launch execution is not enabled. Run candle launch --quote <symbol|address> --check to inspect admission and economics; nothing was uploaded or built.",
+        ),
+      )
     // BE-2519: the fee wallet is Solana only, as the API's parseFeeWallet refuses it on Hood.
     if (hinted === "hood" && feeWalletGiven(flags)) {
       writeUsageFailure(ctx.deps, `--fee-wallet is Solana only; a Hood launch cannot take it. ${USAGE}`, ctx.json)
@@ -375,7 +411,13 @@ export async function launch(args: string[], ctx: CommandContext): Promise<numbe
     }
     const key = await tradingKey(ctx)
     // BE-2139 (surfaces item B): the one preflight call, before any upload, build or id claim.
-    if (check) return await launchCheck(ctx, key, flags["--wallet"], hinted, feeWallet)
+    if (check)
+      return await launchCheck(ctx, key, flags["--wallet"], hinted, feeWallet, {
+        quote: selectedQuote,
+        mode: flags["--mode"],
+        stakerAllocationBps: flags["--staker-allocation-bps"],
+        dexVersion: flags["--dex-version"],
+      })
     // A dry run reads no operation and resumes none: it records nothing under the id.
     const prior = dryRun ? null : await lookupOperation(ctx, key, id, "launch")
     /** BE-1721 (R4): a same-id re-run of an atomic launch whose bundle did not land, and the image it was built with. */
@@ -1373,6 +1415,13 @@ async function embeddedLaunch(
   })
   if (!result.ok) {
     const raw = result.raw as Json | undefined
+    const refusal = raw?.error !== null && typeof raw?.error === "object" ? (raw.error as Json) : undefined
+    // BE-3575: a refusal that names a stage where the launch may be on chain is not a failed launch.
+    if (mayHaveLanded(refusal?.stage))
+      return await settleUnconfirmedLaunch(ctx, flags, id, chain, refusal as Json, result.code, result.message, {
+        quote,
+        used,
+      })
     const unresolved = result.status === 0 || raw?.status === "timeout"
     throw new TradingError(result.code ?? (unresolved ? "BUNDLE_UNRESOLVED" : "REQUEST_FAILED"), result.message, {
       ...(unresolved ? { exitCode: 3 as const } : {}),
@@ -1387,6 +1436,94 @@ async function embeddedLaunch(
     quote,
     ...used,
   })
+}
+
+/**
+ * BE-3575: the headless route answered `stage: "unconfirmed"` (its confirmation wait ran out) or
+ * `"executed"` (the launch landed and recording did not finish). Either way the launch may be on
+ * chain, and the server holds this clientLaunchId, so this is never `LAUNCH_FAILED` exit 1: a
+ * caller that retried that under a new id would launch, and spend, twice.
+ *
+ * A Solana `unconfirmed` refusal that carries the launch signature is read on chain first, over
+ * the same RPC `--rpc-url` names. Finalized without an error is a launch that landed: exit 0 with
+ * `status: "landed"`. Finalized with an error is a launch that can never land: `LAUNCH_FAILED`,
+ * exit 1. Everything else, and every refusal this cannot read on chain (Hood, no signature,
+ * `executed`), is `LAUNCH_UNCONFIRMED`, exit 3: re-run the same id or read `candle launch status`.
+ */
+async function settleUnconfirmedLaunch(
+  ctx: CommandContext,
+  flags: Record<string, string>,
+  id: string,
+  chain: TradeChain,
+  refusal: Json,
+  serverCode: string | undefined,
+  serverMessage: string,
+  shown: { quote: QuoteDisplay & Json; used: Json },
+): Promise<number> {
+  const stage = String(refusal.stage)
+  const signature = typeof refusal.signature === "string" && refusal.signature ? refusal.signature : undefined
+  const mint = typeof refusal.mint === "string" && refusal.mint ? refusal.mint : undefined
+  const details: Json = {
+    stage,
+    ...(serverCode ? { serverCode } : {}),
+    ...(signature ? { signature } : {}),
+    ...(mint ? { mint } : {}),
+  }
+  const statusHint = `candle launch status ${id}`
+  let unread = "Candle did not return the launch signature, so it was not read on chain"
+  if (chain === "solana" && stage === "unconfirmed" && signature) {
+    notice(
+      ctx.deps,
+      "stderr",
+      "note",
+      `Candle could not confirm launch ${safeText(signature)} in time. Reading it on chain before reporting anything.`,
+    )
+    const solana = await tradingSolanaClient(ctx, flags["--rpc-url"])
+    const check = await checkLaunchSignature(
+      (sig) => solana.rpc.getSignatureStatus(sig),
+      (ms) => ctx.deps.sleep(ms),
+      signature,
+    )
+    if (check.kind === "landed") {
+      notice(
+        ctx.deps,
+        "stderr",
+        "note",
+        `Launch ${safeText(signature)} is finalized on chain without an error: it landed. Candle is still recording it; read it with ${statusHint}. Do not launch again under a new id.`,
+      )
+      return printTradingResult(ctx, {
+        success: true,
+        status: "landed",
+        chain,
+        clientLaunchId: id,
+        signature,
+        ...(mint ? { mint } : {}),
+        ...(check.slot !== undefined ? { slot: check.slot } : {}),
+        confirmation: "finalized",
+        recorded: false,
+        clientTradeId: id,
+        kind: "launch",
+        quote: shown.quote,
+        ...shown.used,
+      })
+    }
+    if (check.kind === "reverted")
+      throw new TradingError(
+        "LAUNCH_FAILED",
+        `Launch ${safeText(signature)} is finalized on chain with an error, so no token was created. Candle still holds launch id ${id} for it; a new --client-trade-id starts a clean launch.`,
+        { details: { ...details, onChain: "failed" } },
+      )
+    unread = `On chain, ${check.detail}`
+  }
+  throw new TradingError(
+    "LAUNCH_UNCONFIRMED",
+    `${safeText(serverMessage)} ${unread}. The launch may be on chain: do not launch again under a new id.`,
+    {
+      exitCode: 3,
+      suggestion: `Re-run with the same --client-trade-id ${id}, or read ${statusHint}; nothing is re-sent.`,
+      details,
+    },
+  )
 }
 
 // ── Phase 4b-2: a launch from a Hood TEE wallet (D9) ──────────────────────────────────────────

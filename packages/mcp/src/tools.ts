@@ -64,7 +64,10 @@ import {
   UPLOADED_IMAGE_NOTE,
 } from "./image"
 import { executeLabTool, LAB_DESCRIPTIONS, type LabToolName, labShapes } from "./lab-tools"
+import { launchCheck, launchControlError, launchExecutionArgs } from "./launch-check"
+import { LaunchCheckError } from "./launch-preflight"
 import {
+  checkableLaunchShape,
   LAUNCH_SHARED_SENTENCES,
   launchAndSeedShape,
   launchSchemaField,
@@ -90,6 +93,15 @@ import {
 } from "./perps-markets"
 import { perpsRiskShapes, withPortfolioSection } from "./perps-risk"
 import { PLAN_CAPABILITY_NOTE, type PlanTable, planPromotionLine, planTableMarkdown } from "./plans"
+import {
+  executeSignalRecordTool,
+  SIGNAL_RECORD_ANNOTATIONS,
+  SIGNAL_RECORD_DESCRIPTIONS,
+  SIGNAL_RECORD_TITLES,
+  type SignalRecordToolName,
+  signalRecordShapes,
+  signalRecordValidationErrorMap,
+} from "./signal-record-tools"
 import {
   readSwapReceipt,
   SWAP_RECEIPT_MAX_HASH_CHARS,
@@ -265,6 +277,11 @@ export const TOOL_NAMES = [
   "candle_lab_replay_result",
   "candle_lab_runners",
   "candle_lab_edges",
+  // BE-3411 (hacc north-star CL1): hacc's public scorecard and signal records over a production
+  // agent key, read-only, stdio only. Never registered on the hosted server (apps/api/src/mcp/hosted.ts).
+  "candle_signal_scorecard",
+  "candle_signal_records",
+  "candle_signal_record",
 ] as const
 
 export type ToolName = (typeof TOOL_NAMES)[number]
@@ -277,6 +294,15 @@ export const LAB_TOOL_NAMES = [
   "candle_lab_runners",
   "candle_lab_edges",
 ] as const satisfies readonly (ToolName & LabToolName)[]
+
+/** hacc's scorecard and signal records (BE-3411). Local only: the hosted test asserts none is offered. */
+export const SIGNAL_RECORD_TOOL_NAMES = [
+  "candle_signal_scorecard",
+  "candle_signal_records",
+  "candle_signal_record",
+] as const satisfies readonly (ToolName & SignalRecordToolName)[]
+const isSignalRecordTool = (name: ToolName): name is SignalRecordToolName =>
+  (SIGNAL_RECORD_TOOL_NAMES as readonly ToolName[]).includes(name)
 
 /**
  * The tools that write the agent's own public page. Never registered up front: a server offers
@@ -334,6 +360,7 @@ type RestToolName = Exclude<
   | PerpsMarketToolName
   | "candle_perps_deposit"
   | LabToolName
+  | SignalRecordToolName
 >
 
 /**
@@ -1779,9 +1806,12 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     if (!allowed.has(name)) return
     // Owner-only or unknown fields must be refused rather than stripped from a mixed patch or post.
     const inputSchema =
-      isProfileEditTool(name) || isTokenPageTool(name)
-        ? z.object(definition.inputSchema).strict()
-        : definition.inputSchema
+      // BE-3411: preserve the strict catalog schema, including measured errors before the handler.
+      isSignalRecordTool(name)
+        ? z.object(definition.inputSchema, { errorMap: signalRecordValidationErrorMap }).strict()
+        : isProfileEditTool(name) || isTokenPageTool(name)
+          ? z.object(definition.inputSchema).strict()
+          : definition.inputSchema
     const registered = (server.registerTool as (...a: unknown[]) => RegisteredTool)(
       name,
       { ...definition, inputSchema, ...options.metadata?.[name] },
@@ -1989,9 +2019,24 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
         "Launch a new token via the Candle headless launch API, from the account's embedded wallet. Works on every plan, Free included. Set dryRun: true to validate without spending anything. " +
         LAUNCH_SHARED_SENTENCES +
         (imageDir ? IMAGE_PATH_DISCLOSURE : ""),
-      inputSchema: (imageDir ? localLaunchTokenShape : launchTokenShape) as typeof localLaunchTokenShape,
+      inputSchema: checkableLaunchShape(
+        imageDir ? localLaunchTokenShape : launchTokenShape,
+      ) as typeof localLaunchTokenShape,
     },
     async (args) => {
+      if ("check" in args && args.check === true) return launchCheck(args, getConfig(), doFetch)
+      try {
+        args = launchExecutionArgs(args)
+        if (!imageDir && args.imageUrl === undefined && !("imagePath" in args))
+          return launchControlError(new LaunchCheckError("VALIDATION_FAILED", "imageUrl is required for a launch."))
+        const parsed = z
+          .object(imageDir ? localLaunchTokenShape : launchTokenShape)
+          .omit({ imageUrl: true })
+          .safeParse(args)
+        if (!parsed.success) return launchControlError(new LaunchCheckError("VALIDATION_FAILED", parsed.error.message))
+      } catch (error) {
+        return launchControlError(error)
+      }
       const socialsProblem = socialsRefusal("socials" in args ? (args as { socials?: unknown }).socials : undefined)
       if (socialsProblem) {
         return { content: [{ type: "text", text: imageRefusalBody(socialsProblem) }], isError: true }
@@ -2955,9 +3000,24 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
         "and top up with candle_trade. " +
         LAUNCH_SHARED_SENTENCES +
         (imageDir ? IMAGE_PATH_DISCLOSURE : ""),
-      inputSchema: (imageDir ? localLaunchAndSeedShape : launchAndSeedShape) as typeof localLaunchAndSeedShape,
+      inputSchema: checkableLaunchShape(
+        imageDir ? localLaunchAndSeedShape : launchAndSeedShape,
+      ) as typeof localLaunchAndSeedShape,
     },
     async (args) => {
+      if ("check" in args && args.check === true) return launchCheck(args, getConfig(), doFetch)
+      try {
+        args = launchExecutionArgs(args)
+        if (!imageDir && args.imageUrl === undefined && !("imagePath" in args))
+          return launchControlError(new LaunchCheckError("VALIDATION_FAILED", "imageUrl is required for a launch."))
+        const parsed = z
+          .object(imageDir ? localLaunchAndSeedShape : launchAndSeedShape)
+          .omit({ imageUrl: true })
+          .safeParse(args)
+        if (!parsed.success) return launchControlError(new LaunchCheckError("VALIDATION_FAILED", parsed.error.message))
+      } catch (error) {
+        return launchControlError(error)
+      }
       const result = await executeLaunchAndSeed(args as never, getConfig(), doFetch, imageDir, undefined, {
         headlessSeed: options.headlessSeed === true,
       })
@@ -2983,7 +3043,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     )
   }
 
-  // Hyperliquid perps B (BE-646): perpetuals from the key's EVM TEE wallet. Every write is built by
+  // Hyperliquid perps B (BE-646): perpetuals from the key's EVM TEE or embedded wallet. Every write is built by
   // Candle, checked here before signing (hash, action type, builder), relay-signed, and submitted
   // to Hyperliquid by this server. Writes need CANDLE_KEY_SIGNER_PEM_FILE.
   const perpsTool = (tool: PerpsToolName) => async (args: Record<string, unknown>) => {
@@ -2994,7 +3054,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     " MOVES REAL FUNDS on Hyperliquid unless submit is false. Candle builds the action within this key's limits " +
     "(USD window, maximum leverage, maximum position, slippage and price bands, main-exchange markets only); this " +
     "server recomputes its hash and checks the action type and Candle's builder before signing, then submits it to " +
-    "Hyperliquid itself. Needs perps:write on the key and CANDLE_KEY_SIGNER_PEM_FILE. A refusal names the limit " +
+    "Hyperliquid itself. Needs perps:write on the key and CANDLE_KEY_SIGNER_PEM_FILE for TEE signing. wallet=embedded uses the recorded server signature and requires no PEM; the embedded switch ships off. Embedded open/close generate client ids; repeat only the same id after an uncertain result. A refusal names the limit " +
     "that refused it (error.limit)."
 
   register(
@@ -3002,7 +3062,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     {
       title: "Set up Hyperliquid perps",
       description:
-        "Approve Candle's Hyperliquid builder fee (0.1%) once for the key's EVM TEE wallet, and report the " +
+        "Approve Candle's Hyperliquid builder fee (0.1%) once for the key's EVM TEE or embedded wallet, and report the " +
         "account's mode and balance. Idempotent: nothing is signed when the approval is already on Hyperliquid. " +
         "Refused (PERPS_ACCOUNT_MODE) unless Hyperliquid itself shows the account in standard mode." +
         perpsWrite,
@@ -3055,7 +3115,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     {
       title: "Perps orders",
       description:
-        "Open orders on Hyperliquid for the key's EVM TEE wallet, and every action Candle built for it with what " +
+        "Open orders on Hyperliquid for the key's EVM TEE or embedded wallet, and every action Candle built for it with what " +
         "the venue shows. Reads only; moves nothing.",
       inputSchema: perpsShapes.candle_perps_orders,
     },
@@ -3067,7 +3127,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     {
       title: "Perps positions",
       description:
-        "Positions, account value and withdrawable balance on Hyperliquid for the key's EVM TEE wallet, read " +
+        "Positions, account value and withdrawable balance on Hyperliquid for the key's EVM TEE or embedded wallet, read " +
         "live by its address. Also `rows` (per position: side, size, entry, mark, unrealized P&L, ROE, leverage, " +
         "liquidation price, liquidation distance, funding since open with Hyperliquid's sign where positive is paid, " +
         "margin, value, level), `accountLine` and `risk` (the candle_perps_risk report without positions), read by " +
@@ -3087,7 +3147,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     {
       title: "Perps account line",
       description:
-        "The Hyperliquid account line for the key's EVM TEE wallet: account value and margin used (totals, " +
+        "The Hyperliquid account line for the key's EVM TEE or embedded wallet: account value and margin used (totals, " +
         "isolated included), cross account value, free margin (an estimate), withdrawable (what can leave), " +
         "cross maintenance margin and the cross margin ratio (liquidation at 1), unrealized P&L, and over a recent " +
         "window (`since`, default 24h) realized P&L, fees and funding (positive received), with the risk level." +
@@ -3101,7 +3161,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     {
       title: "Perps liquidation risk",
       description:
-        "The risk level now for the key's EVM TEE wallet: `level` ok, warn or critical, the `drivers` that put it " +
+        "The risk level now for the key's EVM TEE or embedded wallet: `level` ok, warn or critical, the `drivers` that put it " +
         "there (a position closer to liquidation than the warn or critical distance, default 15% and 7%; the cross " +
         "margin ratio above 0.6 or 0.8; a position with no mark is at least warn), `closest` at ok, the thresholds " +
         "applied, the account line and every position. warn and critical are results, not errors. An account mode " +
@@ -3140,7 +3200,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
   )
 
   const historyNote =
-    " Read directly from Hyperliquid's public /info for the key's EVM TEE wallet (Candle only resolves which wallet; " +
+    " Read directly from Hyperliquid's public /info for the key's EVM TEE or embedded wallet (Candle only resolves which wallet; " +
     "the API key never goes to Hyperliquid), so any key that can list its wallets can read it and no signer is needed. " +
     "Wallet-level live venue data, not Candle's ledger and not an all-time total. Default window: the last 7 days, " +
     "fixed on the first page; pass nextCursor back as cursor for the next. truncated means coverage stopped short " +
@@ -3280,7 +3340,7 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
       title: "Deposit to Hyperliquid",
       description:
         "MOVES REAL FUNDS unless submit is false. Deposit onto the key's Hyperliquid account through Relay: SOL or " +
-        "USDC from its Solana TEE wallet, or ETH or USDG from its Hood TEE wallet, credited as Hyperliquid perps " +
+        "USDC from its Solana wallet, or ETH or USDG from its Hood wallet (TEE or wallet=embedded), credited as Hyperliquid perps " +
         "USDC at the key's EVM TEE wallet's own address (Candle resolves it; no recipient is taken). Refused below a " +
         "floor that covers Hyperliquid's 1 USDC first-deposit charge. No Candle fee. Needs swap:write (any cap on " +
         "the asset still applies), and CANDLE_KEY_SIGNER_PEM_FILE to sign. There is no withdrawal from Hyperliquid yet.",
@@ -3359,6 +3419,46 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
       annotations: labRead,
     },
     labTool("candle_lab_edges"),
+  )
+
+  // BE-3411 (hacc north-star CL1): hacc's scorecard and signal records, called from this machine
+  // with the configured key (signal-record-tools.ts). Three GETs; each result carries the fixed line.
+  const signalRecordTool = (tool: SignalRecordToolName) => async (args: Record<string, unknown>) => {
+    const result = await executeSignalRecordTool(tool, args, getConfig(), env, doFetch)
+    return { content: [{ type: "text" as const, text: result.text }], ...(result.isError ? { isError: true } : {}) }
+  }
+
+  register(
+    "candle_signal_scorecard",
+    {
+      title: SIGNAL_RECORD_TITLES.candle_signal_scorecard,
+      description: SIGNAL_RECORD_DESCRIPTIONS.candle_signal_scorecard,
+      inputSchema: signalRecordShapes.candle_signal_scorecard,
+      annotations: { ...SIGNAL_RECORD_ANNOTATIONS },
+    },
+    signalRecordTool("candle_signal_scorecard"),
+  )
+
+  register(
+    "candle_signal_records",
+    {
+      title: SIGNAL_RECORD_TITLES.candle_signal_records,
+      description: SIGNAL_RECORD_DESCRIPTIONS.candle_signal_records,
+      inputSchema: signalRecordShapes.candle_signal_records,
+      annotations: { ...SIGNAL_RECORD_ANNOTATIONS },
+    },
+    signalRecordTool("candle_signal_records"),
+  )
+
+  register(
+    "candle_signal_record",
+    {
+      title: SIGNAL_RECORD_TITLES.candle_signal_record,
+      description: SIGNAL_RECORD_DESCRIPTIONS.candle_signal_record,
+      inputSchema: signalRecordShapes.candle_signal_record,
+      annotations: { ...SIGNAL_RECORD_ANNOTATIONS },
+    },
+    signalRecordTool("candle_signal_record"),
   )
 }
 
