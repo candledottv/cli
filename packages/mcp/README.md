@@ -60,6 +60,8 @@ yet: let an unwanted build expire. `deferExecution` cannot be combined with `pap
 back to the paper book is refused rather than built. One execution per build: a repeat call returns the stored
 result, or `IDEMPOTENCY_CONFLICT` while the first is unconfirmed (read `candle_get_operation`).
 
+`candle_trade`, `candle_swap` and `candle_launch_and_seed` take `hide: true` to keep the order out of the public activity stream (no agent mark, no handle); `candle_launch_token` takes it too, from the shared launch definition. It is sent only when true. The API must confirm it with a `hide: true` echo: without that, the tool answers an error (`HIDE_NOT_CONFIRMED`) and, where this server signs, nothing is signed or submitted first. `hide` cannot be combined with `paper`, and it is rejected while the API has it switched off. A hidden launch's creator wallet is still public on chain.
+
 Both take decimal amounts, never raw base units, and resolve the scale themselves:
 
 - A `candle_trade` **buy** is denominated in the token's OWN quote asset, whatever it was launched
@@ -179,7 +181,7 @@ before installed-package support can be claimed.
 | Tool | Description | REST call | Auth |
 | --- | --- | --- | --- |
 | `candle_launch_token` | Launch a token on Candle | `POST /api/v1/launch/headless` (or `/dry-run` when `dryRun: true`); with `imagePath`, `POST /api/v1/uploads/agent-image` first | `CANDLE_AGENT_API_KEY` |
-| `candle_get_market` | Get market state | `GET /api/v1/markets/:chain/:mint` | none |
+| `candle_get_market` | Get market state. From 0.10.33 it carries `quoteState` when the quote watcher covers the quote token: `paused`, `split` (with `multiplier` and any pending one), `launchBlocked` and `refusal`; omitted when the watcher does not cover it | `GET /api/v1/markets/:chain/:mint` | none |
 | `candle_get_price_history` | One Solana token's OHLC bars in USD per token, oldest first (interval 1m-1d, limit 1-500, `to` unix seconds); `source` and `volumeUnit` say whose bars. Hood is refused with its REST route | `GET /api/v1/markets/solana/:mint/candles` | none |
 | `candle_quote` | Price a buy or sell before making it; moves nothing. Returns `amountOut` in base units, `venue`, `quoteAsset`, `quoteDecimals`, `quotedAt`; `route` appears only on some answers. `amountRaw` is in base units. Limit 600 a minute per key | `POST /api/v1/trade/agent/quote` | `CANDLE_AGENT_API_KEY` with `swap:write` (a read-only key cannot quote) |
 | `candle_get_feed` | Get a token feed (`finalstretch`: at most the 200 most complete; `where` on `progress` narrows it) | `GET /api/v1/markets/feed?bucket=...` | none |
@@ -274,6 +276,8 @@ before installed-package support can be claimed.
 | `candle_signal_scorecard` | hacc's daily scorecard: signal lift against the matched baseline, and per source, rule and horizon counts, coverage, conservative and priced mean net returns, tails and delay. Read-only; every result, errors included, carries `measure: "Measured record, not a forecast."` | hacc `GET /v1/public/scorecard[/:date]` | `CANDLE_AGENT_API_KEY` (production) |
 | `candle_signal_records` | A page of per-signal measured records, newest first (`source`, `before` = the previous page's `next_before`, `limit` 1–100). Read-only; every result carries the fixed line | hacc `GET /v1/public/signal-records` | `CANDLE_AGENT_API_KEY` (production) |
 | `candle_signal_record` | One signal's measured record: per-horizon statuses, conservative and priced net returns, the 24 h path and the matched baseline. Read-only; every result, a 404 included, carries the fixed line | hacc `GET /v1/public/signal-records/:source/:sourceId` | `CANDLE_AGENT_API_KEY` (production) |
+
+Hidden orders (`@candledottv/mcp` 0.10.34). `candle_trade`, `candle_swap` and `candle_launch_and_seed` take `hide: true` (also accepted as `"true"` or `1`), and `candle_launch_token` takes it from the shared launch definition. It keeps that one order out of the public activity stream, with no agent mark and no handle, and is sent only when true. The API must confirm it with `hide: true` in its answer; a result without that confirmation comes back as an error `HIDE_NOT_CONFIRMED`, because a server that predates `hide` would have placed the order publicly (for an embedded-wallet `candle_trade`, which executes inside the build call, the error says the order may already have been public, so read it back before sending another). A hidden `candle_launch_token` is gated on a dry run's confirmation first and nothing is sent if it lacks one. `hide` with `paper` is refused. The API rejects `hide` while its `AGENT_HIDE_ENABLED` switch is off, and refuses it on swaps until the API supports hide there, so `candle_swap` with `hide` fails with nothing placed. A hidden launch removes Candle's identity layer, but the creator wallet is public on chain.
 
 ### Launching with an image file
 
