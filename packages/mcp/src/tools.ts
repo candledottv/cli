@@ -1,3 +1,4 @@
+import { executePerpsTransfer, perpsTransferShape } from "./perps-transfer"
 /**
  * The agent-rail tools this MCP server exposes, and their mapping onto the Candle REST surface
  * (apps/api/src/routes/{launch-headless,markets,activity,users,trade}.ts).
@@ -278,6 +279,7 @@ export const TOOL_NAMES = [
   "candle_perps_reduce_only",
   // Hyperliquid perps C (BE-647): the Relay deposit (perps.ts).
   "candle_perps_deposit",
+  "candle_perps_transfer",
   // BE-1582 (spec A-12): read-only risk and visibility, read from Hyperliquid by this server.
   "candle_perps_account",
   "candle_perps_risk",
@@ -372,6 +374,7 @@ type RestToolName = Exclude<
   | PerpsToolName
   | PerpsMarketToolName
   | "candle_perps_deposit"
+  | "candle_perps_transfer"
   | LabToolName
   | SignalRecordToolName
 >
@@ -2493,7 +2496,10 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
         "unrealized, never idle USDC; null with perpsUnavailable means the perps have no certified snapshot " +
         "yet. publishedBuildId is the board generation (the same id on the record, rank and chart); seq is the " +
         "push resume cursor, not that generation. A retained bundle keeps perpsSnapshotId and changes " +
-        "publishedBuildId. perpsAsOfMs is the oldest wallet cutoff, about an hour behind; perpsPartial or " +
+        "publishedBuildId. perpsAsOfMs is the oldest wallet cutoff: with perpsProvisional true it is a " +
+        "provisional read refreshed every board build (about 10 minutes) and perpsCertifiedAsOfMs is the hourly " +
+        "certified cutoff under it, which corrects the provisional figures; without it the figures are certified, " +
+        "about an hour behind. perpsPartial or " +
         "portfolioPartial means a figure is incomplete, never zero. No wallet address or balance. An agent that " +
         "is not published " +
         "answers RECORD_NOT_FOUND; a server that does not serve positions yet answers 503 positions_unavailable. " +
@@ -3490,6 +3496,20 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
       inputSchema: perpsShapes.candle_perps_reduce_only,
     },
     perpsTool("candle_perps_reduce_only"),
+  )
+
+  register(
+    "candle_perps_transfer",
+    {
+      title: "Transfer own Hyperliquid USDC",
+      description:
+        "Move USDC between this wallet's own main perps and builder dex balances (toDex, fromDex). Needs perps:write. No destination address accepted. clientTransferId is required for safe retries; submit=false checks without signing.",
+      inputSchema: perpsTransferShape,
+    },
+    async (args) => {
+      const result = await executePerpsTransfer(args as Record<string, unknown>, getConfig(), env, doFetch)
+      return { content: [{ type: "text" as const, text: result.text }], ...(result.isError ? { isError: true } : {}) }
+    },
   )
 
   register(
