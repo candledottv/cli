@@ -29,6 +29,7 @@ import { browserUrl, resolveApiUrl, setOwnerConfirmHooks } from "./client"
 import { agentPositions } from "./commands/agent-positions"
 import { agentPost } from "./commands/agent-post"
 import { agentProfile } from "./commands/agent-profile"
+import { agentRound } from "./commands/agent-round"
 import { authLogin, authLogout, authStatus } from "./commands/auth"
 import { completion, completionBash, completionFish, completionZsh } from "./commands/completion"
 import { coreServe } from "./commands/core"
@@ -74,6 +75,7 @@ import {
 } from "./commands/perps-manage"
 import { perpsBook, perpsCandles, perpsMarket, perpsMarkets } from "./commands/perps-markets"
 import { perpsAccount, perpsRisk, perpsThresholds, perpsWatch } from "./commands/perps-risk"
+import { perpsSpot } from "./commands/perps-spot"
 import { perpsWithdraw } from "./commands/perps-withdraw"
 import { maybeAutoRenew, planAutoRenew, planBuy, planRenew, planStatus } from "./commands/plan"
 import { plans } from "./commands/plans"
@@ -278,7 +280,7 @@ const COMMANDS: Record<string, CommandRoute> = {
   // FE-438: the creator fees this account's launched tokens can pay, and the claim to the wallet
   // fixed at launch. Candle signs; this machine sends a mint and a dry-run flag.
   // BE-1990: `agent positions` is the public positions read; it reads and sends no credential.
-  agent: { subcommands: { profile: agentProfile, post: agentPost, positions: agentPositions } },
+  agent: { subcommands: { profile: agentProfile, post: agentPost, positions: agentPositions, round: agentRound } },
   fees: { bare: feesList, subcommands: { claim: feesClaim } },
   // BE-723 (Plans v2 P6): the served plan table. Public, so it reads and sends no credential.
   plans: { bare: plans },
@@ -376,6 +378,8 @@ const COMMANDS: Record<string, CommandRoute> = {
       // BE-1573 (withdrawals W1): HyperCore to the key's own Solana or Hood TEE wallet, under the
       // bound key's opt-in `perps:withdraw`. One unlock and one typed confirm; no --yes.
       withdraw: perpsWithdraw,
+      // BE-3771 (HM2): Hyperliquid spot from the same TEE wallet: markets, balances, buy, sell, cancel.
+      spot: perpsSpot,
     },
   },
   auth: { subcommands: { login: authLogin, status: authStatus, logout: authLogout } },

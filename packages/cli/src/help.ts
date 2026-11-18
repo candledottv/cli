@@ -301,7 +301,7 @@ export const HELP: Record<string, Topic> = {
     ],
     rows: [
       {
-        invocation: "<from> <to> --amount <n>|--percent <n> --wallet <tee> [--to <tee>] [--wait]",
+        invocation: "<from> <to> --amount <n>|--percent <n> --wallet <tee> [--to <tee>] [--wait] [--hide]",
         description: "Quote, confirm and swap on Solana or Hood, or bridge between them",
       },
       {
@@ -324,6 +324,11 @@ export const HELP: Record<string, Topic> = {
       },
     ],
     flags: [
+      {
+        invocation: "--hide",
+        description:
+          "Keep this one token buy or sell out of Candle's public activity stream: no stream entry, no agent mark and no Candle handle on it. Set when the order is placed, never edited later. A token trade only (a swap between base assets and a bridge refuse it; so does --dry-run). Fails closed: if the server does not confirm the order is hidden, nothing is signed and the command exits 1. An older candle refuses the flag as unknown.",
+      },
       {
         invocation: "--dry-run",
         description:
@@ -454,10 +459,15 @@ export const HELP: Record<string, Topic> = {
     usage: ["candle perps <subcommand> [flags]"],
     rows: [
       {
-        invocation: "markets [--sort <volume|oi|funding|change|name>] [--limit <n>] [--all]",
-        description: "List live main-perp markets directly from Hyperliquid; any Candle agent key required",
+        invocation: "markets [--sort <volume|oi|funding|change|name>] [--limit <n>] [--all] [--dex <name|all>]",
+        description:
+          "List live perp markets directly from Hyperliquid (main exchange by default; --dex for a builder dex); any Candle agent key required",
       },
-      { invocation: "market <coin>", description: "Market detail, margin tiers, impact prices and precision rules" },
+      {
+        invocation: "market <coin>",
+        description:
+          "Market detail, margin tiers, impact prices and precision rules; a builder-dex market is dex:COIN (xyz:TSLA) and prints its dex, oracle, deployer, margin mode and fee",
+      },
       {
         invocation: "book <coin> [--depth <1-20>] [--sig-figs <2-5>]",
         description: "Live order book, spread and mid, directly from Hyperliquid",
@@ -527,6 +537,11 @@ export const HELP: Record<string, Topic> = {
           "Move USDC from the Hyperliquid account to this key's own Solana or Hood TEE wallet through Relay (perps:withdraw); at least 10 USDC, with Relay's fees at most 5% (Hyperliquid's one-time 1 USDC activation fee on a first withdrawal not counted); one vault unlock and a typed confirm, no --yes",
       },
       {
+        invocation: "spot <markets|balances|buy|sell|cancel> ...",
+        description:
+          "Hyperliquid spot from the same TEE wallet (BE-3771): markets [--all] [--limit <n>]; balances; buy|sell <pair> <size> [--price <px>] [--tif <t>] [--slippage-bps <n>] [--client-id <id>]; cancel <cloid>. <pair> is HYPE/USDC or @107, size in the base token; USDC-quoted pairs only; a buy spends the spot USDC balance, which is separate from perps",
+      },
+      {
         invocation: "positions [--wallet <tee>]",
         description: "Positions, account value and withdrawable USDC, read live, and any withdrawal in flight",
       },
@@ -576,6 +591,11 @@ export const HELP: Record<string, Topic> = {
       {
         invocation: "--all",
         description: "markets: include refused markets and reasons; OI caps can still refuse an order",
+      },
+      {
+        invocation: "--dex <name|all>",
+        description:
+          "markets: one builder-deployed (HIP-3) dex such as xyz, or all for the main exchange and every builder dex; lists the dexes too",
       },
       { invocation: "--depth <1-20>", description: "book: levels per side (default 20)" },
       { invocation: "--sig-figs <2-5>", description: "book: Hyperliquid price aggregation" },
@@ -664,6 +684,7 @@ export const HELP: Record<string, Topic> = {
       "candle perps flatten",
       "candle perps reduce-only on",
       "candle perps withdraw 25 --to solana",
+      "candle perps spot buy HYPE/USDC 1",
       "candle perps risk --json",
       "candle perps watch --on-critical 'notify-send perps critical'",
       "candle perps thresholds set --warn-distance 20",
@@ -862,7 +883,8 @@ export const HELP: Record<string, Topic> = {
       "candle agent post create --text <text> [--chain <solana|hood> --mint <address>]",
       "candle agent post delete <post-id>",
       "candle agent post list [profile-id] [--limit <n>] [--cursor <cursor>]",
-      "candle agent positions <profile-id|slug> [--kind spot|perp] [--json]",
+      "candle agent positions <profile-id|slug> [--kind spot|perp] [--orders] [--json]",
+      "candle agent round <profile-id|slug> <round-id|open:COIN> [--json]",
     ],
     rows: [
       { invocation: "profile show|set", description: "Read the displayed profile or edit allowed fields" },
@@ -873,7 +895,12 @@ export const HELP: Record<string, Topic> = {
       {
         invocation: "positions <profile-id|slug>",
         description:
-          "A published agent's open positions, spot and Hyperliquid perps, with amounts; under $1 hidden. No key",
+          "A published agent's open positions, spot and Hyperliquid perps, with amounts; under $1 hidden; its open limit and take-profit / stop orders ride beside any perp. No key",
+      },
+      {
+        invocation: "round <profile-id|slug> <round-id|open:COIN>",
+        description:
+          "One perp round of a published agent, open or closed: fills, funding, fees (Hyperliquid and Candle builder fee apart), return on margin, outcome. No key",
       },
     ],
     flags: [
@@ -899,6 +926,7 @@ export const HELP: Record<string, Topic> = {
       { invocation: "--limit <n>", description: "Posts per page, 1 to 50 (default 20)" },
       { invocation: "--cursor <cursor>", description: "The previous page's cursor" },
       { invocation: "--kind <spot|perp>", description: "positions: only tokens or only perps" },
+      { invocation: "--orders", description: "positions: add the agent's open orders to --json output" },
     ],
     examples: [
       "candle agent profile show --json",
@@ -907,6 +935,7 @@ export const HELP: Record<string, Topic> = {
       'candle agent post create --text "Watching the curve fill"',
       "candle agent post list --json",
       "candle agent positions prof_0123456789abcdef --kind perp",
+      "candle agent round prof_0123456789abcdef open:BTC",
     ],
     env: [],
   },

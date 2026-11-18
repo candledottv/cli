@@ -21,6 +21,7 @@
  * on purpose: its only import is keccak.
  */
 import { keccak_256 } from "@noble/hashes/sha3"
+import { parsePerpDexs, parsePerpsCoin, perpsAssetId } from "./hyperliquid-markets"
 
 export type HyperliquidNetwork = "mainnet" | "testnet"
 
@@ -496,6 +497,60 @@ function actionShapeProblem(action: Record<string, unknown>): string | null {
   return null
 }
 
+// ── Builder-deployed (HIP-3) dexes (BE-3755) ─────────────────────────────────────────────
+
+/**
+ * A Hyperliquid perp asset id: the main exchange's `0..9999`, or a builder dex's
+ * `100000 + perp_dex_index * 10000 + index_in_meta` with a dex index of at least 1. Spot ids
+ * (`10000..99999`), the unused `100000..109999` and outcome ids (from `100000000`) are not perps.
+ */
+export function hyperliquidPerpAsset(a: unknown): boolean {
+  return typeof a === "number" && Number.isSafeInteger(a) && a >= 0 && (a < 10_000 || (a >= 110_000 && a < 100_000_000))
+}
+
+/** The dex a market name names: "" for `BTC`, `xyz` for `xyz:TSLA`, null when it is no market name. */
+export function hyperliquidCoinDex(coin: unknown): string | null {
+  return parsePerpsCoin(coin)?.dex ?? null
+}
+
+type VenueRead = (body: Record<string, unknown>) => Promise<unknown>
+
+/** One dex's universe, read from the venue: its rows, their contexts when asked, and its asset-id base. */
+interface VenueUniverse {
+  dex: string
+  /** The asset id of index 0: 0 on the main exchange, `100000 + perp_dex_index * 10000` on a builder dex. */
+  base: number
+  universe: { name: string; szDecimals?: number; maxLeverage?: number; onlyIsolated?: boolean; marginMode?: string }[]
+  ctxs: { midPx?: string | null; markPx?: string | null }[] | null
+}
+
+/**
+ * Read the universe a coin's dex lists, directly from the venue. The main exchange reads exactly
+ * what it always read (`meta`, or `metaAndAssetCtxs` with contexts). A builder dex reads `perpDexs`
+ * for its index, which numbers its assets, then its own `meta` or `metaAndAssetCtxs`.
+ */
+async function venueUniverse(read: VenueRead, dex: string, withCtxs: boolean): Promise<VenueUniverse> {
+  let base = 0
+  if (dex !== "") {
+    const found = parsePerpDexs(await read({ type: "perpDexs" })).find((d) => d.name === dex)
+    if (!found) throw new Error(`Hyperliquid has no builder dex ${dex}`)
+    base = perpsAssetId(found.index, 0)
+  }
+  const body = withCtxs ? { type: "metaAndAssetCtxs" } : { type: "meta" }
+  const answer = await read(dex === "" ? body : { ...body, dex })
+  const meta = (withCtxs && Array.isArray(answer) ? answer[0] : answer) as { universe?: unknown } | null
+  if (!meta || !Array.isArray(meta.universe)) throw new Error("Hyperliquid returned an unreadable market list")
+  const ctxs =
+    withCtxs && Array.isArray(answer) && Array.isArray(answer[1]) ? (answer[1] as VenueUniverse["ctxs"]) : null
+  return { dex, base, universe: meta.universe as VenueUniverse["universe"], ctxs }
+}
+
+/** The index of `coin` in a venue universe (case-insensitive, as before), or -1. */
+function venueIndex(venue: VenueUniverse, coin: string): number {
+  const upper = coin.toUpperCase()
+  return venue.universe.findIndex((m) => typeof m?.name === "string" && m.name.toUpperCase() === upper)
+}
+
 /** Whether `px` is no worse than `reference` moved by `bps` against an order on side `isBuy`. */
 function withinBps(px: bigint, reference: bigint, isBuy: boolean, bps: number): boolean {
   const bound = BigInt(bps)
@@ -504,13 +559,13 @@ function withinBps(px: bigint, reference: bigint, isBuy: boolean, bps: number): 
 
 function checkActionIntent(action: Record<string, unknown>, opts: VerifyPerpsBuildOptions): string | null {
   const intent = opts.intent
-  const mainAsset = (a: unknown) => typeof a === "number" && Number.isInteger(a) && a >= 0 && a < 10000
+  const perpAsset = hyperliquidPerpAsset
   const orderList = action.type === "order" ? action.orders : action.type === "modify" ? [action.order] : []
   if (!Array.isArray(orderList)) return "invalid orders"
   for (const raw of orderList) {
     if (!raw || typeof raw !== "object") return "invalid order"
     const o = raw as Record<string, unknown>
-    if (!mainAsset(o.a)) return "order asset is outside the main perp universe"
+    if (!perpAsset(o.a)) return "order asset is not a Hyperliquid perp market (spot and outcome markets are refused)"
     if (
       typeof o.b !== "boolean" ||
       typeof o.r !== "boolean" ||
@@ -522,10 +577,10 @@ function checkActionIntent(action: Record<string, unknown>, opts: VerifyPerpsBui
     if (opts.keyReduceOnly === true && o.r !== true) return "this key is reduce-only and the build is not reducing"
   }
   if (action.type === "cancel") {
-    if (!Array.isArray(action.cancels) || action.cancels.length !== 1 || !mainAsset(action.cancels[0]?.a))
+    if (!Array.isArray(action.cancels) || action.cancels.length !== 1 || !perpAsset(action.cancels[0]?.a))
       return "invalid cancel asset"
   }
-  if ((action.type === "updateLeverage" || action.type === "updateIsolatedMargin") && !mainAsset(action.asset))
+  if ((action.type === "updateLeverage" || action.type === "updateIsolatedMargin") && !perpAsset(action.asset))
     return "invalid action asset"
   if (!intent) return null
   const { method, params: p } = intent
@@ -772,22 +827,31 @@ export async function hyperliquidCloseOrder(
     if (!res.ok) throw new Error("Cannot read the close position from Hyperliquid")
     return JSON.parse(await res.text())
   }
-  const [meta, state] = await Promise.all([read({ type: "meta" }), read({ type: "clearinghouseState", user: address })])
+  // BE-3755: a builder-dex coin (`xyz:TSLA`) reads that dex's universe and that dex's position.
+  const dex = hyperliquidCoinDex(params.coin)
+  if (dex === null) throw new Error("coin must be a market name such as BTC, or xyz:TSLA on a builder dex")
+  const [venue, state] = await Promise.all([
+    venueUniverse(read, dex, false),
+    read(
+      dex === "" ? { type: "clearinghouseState", user: address } : { type: "clearinghouseState", user: address, dex },
+    ),
+  ])
   const coin = String(params.coin).toUpperCase()
-  const universe = meta.universe as { name: string; szDecimals?: number }[]
-  const asset = universe.findIndex((m) => m.name.toUpperCase() === coin)
+  const universe = venue.universe
+  const index = venueIndex(venue, coin)
   const szi = (state.assetPositions as { position: { coin: string; szi: string } }[]).find(
     (p) => p.position.coin.toUpperCase() === coin,
   )?.position.szi
   const signed = decimal(szi)
-  if (asset < 0 || asset >= 10000 || signed === null || signed === 0n)
-    throw new Error("No main-universe position to close")
+  if (index < 0 || index >= 10000 || signed === null || signed === 0n)
+    throw new Error(dex === "" ? "No main-universe position to close" : `No position to close on builder dex ${dex}`)
+  const asset = venue.base + index
   const held = signed < 0n ? -signed : signed
   const heldSz = String(szi).replace(/^-/, "")
   if (params.pct != null) {
     if (params.size != null) throw new Error("A close takes a size or a percentage, not both")
     const pct = hyperliquidClosePct(params.pct)
-    const szDecimals = universe[asset]?.szDecimals
+    const szDecimals = universe[index]?.szDecimals
     if (pct === null) throw new Error("pct must be above 0 and at most 100, with at most 4 decimals")
     if (!Number.isInteger(szDecimals)) throw new Error("Hyperliquid did not report this market's size precision")
     const size = hyperliquidPctSize(heldSz, pct, szDecimals as number)
@@ -826,7 +890,7 @@ export const HYPERLIQUID_TPSL_SLIPPAGE_BPS = 500
 
 /** What Hyperliquid's own `/info` says about the market an open or modify names. */
 export interface HyperliquidOrderMarket {
-  /** The coin's index in Hyperliquid's main perp universe. */
+  /** The coin's asset id: its main-universe index, or its builder-dex id (BE-3755). */
   asset: number
   /** Hyperliquid's mid for the coin (its mark price when the book has no mid). */
   midPx: string
@@ -889,16 +953,20 @@ export async function hyperliquidOrderMarket(
       ...(Number.isSafeInteger(resting.oid) ? { oid: resting.oid as number } : {}),
     }
   }
-  const [meta, contexts] = (await read({ type: "metaAndAssetCtxs" })) as [
-    { universe: { name: string }[] },
-    { midPx?: string | null; markPx?: string | null }[],
-  ]
-  const asset = meta.universe.findIndex((m) => m.name.toUpperCase() === coin)
-  if (asset < 0 || asset >= 10000) throw new Error("No main-universe market for this coin on Hyperliquid")
-  const context = contexts[asset]
+  // BE-3755: the coin's own dex (a modify takes the resting order's coin, as the venue names it).
+  const dex = hyperliquidCoinDex(coin)
+  if (dex === null)
+    throw new Error("No perp market for this coin on Hyperliquid (spot and outcome markets are refused)")
+  const venue = await venueUniverse(read, dex, true)
+  const index = venueIndex(venue, coin)
+  if (index < 0 || index >= 10000)
+    throw new Error(
+      dex === "" ? "No main-universe market for this coin on Hyperliquid" : `No ${coin} market on builder dex ${dex}`,
+    )
+  const context = venue.ctxs?.[index]
   const midPx = context?.midPx ?? context?.markPx
   if ((decimal(midPx) ?? 0n) <= 0n) throw new Error("No Hyperliquid price for this coin")
-  return { asset, midPx: String(midPx), ...(order ? { order } : {}) }
+  return { asset: venue.base + index, midPx: String(midPx), ...(order ? { order } : {}) }
 }
 
 /** An open or modify checked against the venue's market (`opts.market`). */
@@ -1101,8 +1169,12 @@ export interface HyperliquidSnapshotPosition {
  */
 export interface HyperliquidWalletSnapshot {
   readAt: number
+  /** BE-3755: the dex this snapshot read ("" for the main exchange). */
+  dex?: string
+  /** BE-3755: the asset id of `universe[0]`: 0 on the main exchange, `100000 + dex * 10000` on a builder dex. */
+  assetBase?: number
   universe: { name: string; szDecimals: number; maxLeverage: number; onlyIsolated: boolean }[]
-  /** Mark price per asset index, null when the venue gave none. */
+  /** Mark price per universe index (asset id minus `assetBase`), null when the venue gave none. */
   marks: (string | null)[]
   positions: HyperliquidSnapshotPosition[]
   orders: HyperliquidSnapshotOrder[]
@@ -1114,12 +1186,21 @@ export async function hyperliquidWalletSnapshot(
   network: HyperliquidNetwork,
   address: string,
   now: () => number = Date.now,
+  /** BE-3755: a builder dex (`xyz`) reads that dex's universe, positions and orders; "" is the main exchange. */
+  dex = "",
 ): Promise<HyperliquidWalletSnapshot> {
   const user = address.toLowerCase()
+  const withDex = (body: Record<string, unknown>) => (dex === "" ? body : { ...body, dex })
+  let assetBase = 0
+  if (dex !== "") {
+    const found = parsePerpDexs(await infoRead(fetcher, network, { type: "perpDexs" })).find((d) => d.name === dex)
+    if (!found) throw new Error(`Hyperliquid has no builder dex ${dex}`)
+    assetBase = perpsAssetId(found.index, 0)
+  }
   const [metaAndCtxs, state, open] = await Promise.all([
-    infoRead(fetcher, network, { type: "metaAndAssetCtxs" }),
-    infoRead(fetcher, network, { type: "clearinghouseState", user }),
-    infoRead(fetcher, network, { type: "frontendOpenOrders", user }),
+    infoRead(fetcher, network, withDex({ type: "metaAndAssetCtxs" })),
+    infoRead(fetcher, network, withDex({ type: "clearinghouseState", user })),
+    infoRead(fetcher, network, withDex({ type: "frontendOpenOrders", user })),
   ])
   const readAt = now()
   if (!Array.isArray(metaAndCtxs) || metaAndCtxs.length < 2 || !Array.isArray(metaAndCtxs[1]))
@@ -1142,7 +1223,11 @@ export async function hyperliquidWalletSnapshot(
     const mark = ctxs[i]?.markPx
     return typeof mark === "string" && (decimal(mark) ?? 0n) > 0n ? mark : null
   })
-  const assetOf = (coin: string) => universe.findIndex((m) => m.name === coin)
+  const indexOf = (coin: string) => universe.findIndex((m) => m.name === coin)
+  const assetOf = (coin: string) => {
+    const index = indexOf(coin)
+    return index < 0 || index >= 10000 ? -1 : assetBase + index
+  }
   const unsupported: string[] = []
   const positionsRaw = (state as { assetPositions?: unknown })?.assetPositions
   if (!Array.isArray(positionsRaw)) throw new Error("Hyperliquid returned an unreadable account state")
@@ -1157,12 +1242,7 @@ export async function hyperliquidWalletSnapshot(
       continue
     }
     const asset = assetOf(coin)
-    if (
-      asset < 0 ||
-      asset >= 10000 ||
-      (lev?.type !== "cross" && lev?.type !== "isolated") ||
-      !Number.isInteger(lev.value)
-    ) {
+    if (asset < 0 || (lev?.type !== "cross" && lev?.type !== "isolated") || !Number.isInteger(lev.value)) {
       unsupported.push(`position ${coin}`)
       continue
     }
@@ -1182,7 +1262,6 @@ export async function hyperliquidWalletSnapshot(
     const oid = o.oid
     if (
       asset < 0 ||
-      asset >= 10000 ||
       !Number.isSafeInteger(oid) ||
       (o.side !== "A" && o.side !== "B") ||
       decimal(o.sz) === null ||
@@ -1221,7 +1300,15 @@ export async function hyperliquidWalletSnapshot(
   // Deterministic order (spec D, section 8): asset, then oid.
   orders.sort((a, b) => a.asset - b.asset || a.oid - b.oid)
   positions.sort((a, b) => a.asset - b.asset)
-  return { readAt, universe, marks, positions, orders, unsupported }
+  return {
+    readAt,
+    ...(dex === "" ? {} : { dex, assetBase }),
+    universe,
+    marks,
+    positions,
+    orders,
+    unsupported,
+  }
 }
 
 /** The snapshot's position in `coin` (case-insensitive), or null. */
@@ -1240,8 +1327,9 @@ export function hyperliquidTpslTarget(
 ): NonNullable<VerifyPerpsBuildOptions["tpslTarget"]> {
   const position = snapshotPosition(snapshot, coin)
   if (!position) throw new Error(`No ${coin} position on Hyperliquid to protect`)
-  const mark = snapshot.marks[position.asset]
-  const szDecimals = snapshot.universe[position.asset]?.szDecimals
+  const index = position.asset - (snapshot.assetBase ?? 0)
+  const mark = snapshot.marks[index]
+  const szDecimals = snapshot.universe[index]?.szDecimals
   if (!mark || szDecimals === undefined) throw new Error(`No Hyperliquid mark for ${position.coin}`)
   const held = position.szi.replace(/^-/, "")
   // Rounded down to the market's size step (spec D, section 6); 100% keeps the held string itself.
@@ -1262,6 +1350,9 @@ async function venueEvidence(
   now: () => number,
 ): Promise<Partial<VerifyPerpsBuildOptions>> {
   const p = intent.params
+  // BE-3755: the dex the request's coin names; account reads below read that dex's state.
+  const coinDex = p.coin === undefined ? "" : hyperliquidCoinDex(p.coin)
+  if (coinDex === null) throw new Error("coin must be a market name such as BTC, or xyz:TSLA on a builder dex")
   switch (intent.method) {
     case "open":
     case "modify":
@@ -1271,7 +1362,7 @@ async function venueEvidence(
     case "cancel": {
       if (p.oid !== undefined) {
         // A targeted cancel (flatten, a TP/SL leg): the order must be open on this wallet now.
-        const snapshot = await hyperliquidWalletSnapshot(fetcher, network, address, now)
+        const snapshot = await hyperliquidWalletSnapshot(fetcher, network, address, now, coinDex)
         const order = snapshot.orders.find(
           (o) => o.oid === p.oid && (p.coin === undefined || o.coin.toUpperCase() === String(p.coin).toUpperCase()),
         )
@@ -1288,17 +1379,21 @@ async function venueEvidence(
       const resting = status?.order?.order
       if (!resting || typeof resting.coin !== "string" || !Number.isSafeInteger(resting.oid))
         throw new Error("Hyperliquid shows no order with this cloid on this wallet")
-      const meta = (await infoRead(fetcher, network, { type: "meta" })) as { universe?: { name: string }[] }
-      const asset = (meta.universe ?? []).findIndex((m) => m.name === resting.coin)
-      if (asset < 0 || asset >= 10000) throw new Error("The order is not on Hyperliquid's main perp exchange")
-      return { cancelTarget: { asset, oid: resting.oid as number } }
+      // The resting order's own coin names its dex (BE-3755); spot and outcome orders are refused.
+      const restingDex = hyperliquidCoinDex(resting.coin)
+      if (restingDex === null) throw new Error("The order is not on a Hyperliquid perp exchange")
+      const venue = await venueUniverse((body) => infoRead(fetcher, network, body), restingDex, false)
+      const index = venue.universe.findIndex((m) => m.name === resting.coin)
+      if (index < 0 || index >= 10000) throw new Error("The order is not on a Hyperliquid perp exchange")
+      return { cancelTarget: { asset: venue.base + index, oid: resting.oid as number } }
     }
     case "leverage": {
-      const snapshot = await hyperliquidWalletSnapshot(fetcher, network, address, now)
+      const snapshot = await hyperliquidWalletSnapshot(fetcher, network, address, now, coinDex)
       const coin = String(p.coin ?? "").toUpperCase()
-      const asset = snapshot.universe.findIndex((m) => m.name.toUpperCase() === coin)
-      if (asset < 0) throw new Error("No main-universe market for this coin on Hyperliquid")
-      const name = snapshot.universe[asset]?.name as string
+      const index = snapshot.universe.findIndex((m) => m.name.toUpperCase() === coin)
+      if (index < 0 || index >= 10000) throw new Error("No perp market for this coin on Hyperliquid")
+      const asset = (snapshot.assetBase ?? 0) + index
+      const name = snapshot.universe[index]?.name as string
       const data = (await infoRead(fetcher, network, {
         type: "activeAssetData",
         user: address.toLowerCase(),
@@ -1311,14 +1406,14 @@ async function venueEvidence(
       return { leverageTarget: { asset, leverage: lev.value as number, mode: lev.type, flat } }
     }
     case "margin": {
-      const snapshot = await hyperliquidWalletSnapshot(fetcher, network, address, now)
+      const snapshot = await hyperliquidWalletSnapshot(fetcher, network, address, now, coinDex)
       const position = snapshotPosition(snapshot, String(p.coin ?? ""))
       if (!position || position.leverage.type !== "isolated")
         throw new Error("Hyperliquid shows no isolated position in this coin")
       return { marginTarget: { asset: position.asset } }
     }
     case "tpsl": {
-      const snapshot = await hyperliquidWalletSnapshot(fetcher, network, address, now)
+      const snapshot = await hyperliquidWalletSnapshot(fetcher, network, address, now, coinDex)
       return { tpslTarget: hyperliquidTpslTarget(snapshot, String(p.coin ?? "")) }
     }
     case "scheduleCancel":
@@ -1359,6 +1454,192 @@ export async function verifyPerpsBuildAgainstVenue(
     }
   }
   return verifyPerpsBuild(build, { ...verify, ...evidence })
+}
+
+// ── Hyperliquid spot (BE-3771, HM2): the pre-sign check for a spot order or cancel ────────────
+//
+// A spot build is checked on its own path so no perps rule widens: `checkActionIntent` still
+// refuses every spot asset for the perps methods. What this checks, all fail-closed:
+// - the action is one `order` (grouping `na`, not reduce-only) or one `cancel`, on a spot asset
+//   (`10000 + spot index`), and no vault;
+// - the order is the request: side, size, price, time in force and client order id;
+// - the asset is the requested pair's on this machine's own read of `spotMetaAndAssetCtxs`, the pair
+//   is quoted in USDC, and a market order's price sits within its slippage (plus the drift margin)
+//   of the venue's own mid;
+// - a buy carries no builder field (Hyperliquid charges none on spot buys); a sell may carry only
+//   Candle's builder at no more than 0.1%;
+// - a reduce-only key signs only sells and cancels;
+// - a cancel names the asset and oid Hyperliquid shows for that cloid on this wallet;
+// - the typed data commits to this exact action and nonce.
+
+export const HYPERLIQUID_SPOT_ASSET_OFFSET = 10_000
+
+export type SpotIntentMethod = "spotOrder" | "spotCancel"
+
+/** Whether `a` is a Hyperliquid spot asset id (`10000 + spot index`, below the builder-dex range). */
+export function hyperliquidSpotAsset(a: unknown): boolean {
+  return typeof a === "number" && Number.isSafeInteger(a) && a >= 10_000 && a < 100_000
+}
+
+interface SpotPairRead {
+  name: string
+  index: number
+  base: string
+  quote: string
+  quoteToken: number
+  midPx: string | null
+}
+
+/** Resolve `HYPE/USDC`, `PURR/USDC` or `@107` against a raw `spotMetaAndAssetCtxs` answer. */
+export function hyperliquidSpotPair(answer: unknown, market: string): SpotPairRead | null {
+  if (!Array.isArray(answer) || !answer[0] || typeof answer[0] !== "object" || !Array.isArray(answer[1])) return null
+  const meta = answer[0] as { universe?: unknown; tokens?: unknown }
+  if (!Array.isArray(meta.universe) || !Array.isArray(meta.tokens)) return null
+  const tokens = new Map<number, string>()
+  for (const t of meta.tokens as { name?: unknown; index?: unknown }[])
+    if (typeof t?.name === "string" && Number.isSafeInteger(t.index)) tokens.set(t.index as number, t.name)
+  const pairs: SpotPairRead[] = []
+  for (const p of meta.universe as { name?: unknown; index?: unknown; tokens?: unknown }[]) {
+    if (typeof p?.name !== "string" || !Number.isSafeInteger(p.index) || !Array.isArray(p.tokens)) continue
+    const [b, q] = p.tokens as unknown[]
+    const base = tokens.get(b as number)
+    const quote = tokens.get(q as number)
+    if (base === undefined || quote === undefined) continue
+    const ctx = (answer[1] as { coin?: unknown; midPx?: unknown }[]).find((c) => c?.coin === p.name)
+    pairs.push({
+      name: p.name,
+      index: p.index as number,
+      base,
+      quote,
+      quoteToken: q as number,
+      midPx: typeof ctx?.midPx === "string" ? ctx.midPx : null,
+    })
+  }
+  if (/^@(0|[1-9][0-9]{0,5})$/.test(market)) return pairs.find((p) => p.index === Number(market.slice(1))) ?? null
+  const venue = pairs.find((p) => p.name === market)
+  if (venue) return venue
+  const exact = pairs.filter((p) => `${p.base}/${p.quote}` === market)
+  if (exact.length === 1) return exact[0] ?? null
+  if (exact.length > 1) return null
+  const folded = pairs.filter((p) => `${p.base}/${p.quote}`.toLowerCase() === market.toLowerCase())
+  return folded.length === 1 ? (folded[0] ?? null) : null
+}
+
+export interface VerifySpotBuildOptions {
+  builder: string
+  network?: HyperliquidNetwork
+  address: string
+  intent: { method: SpotIntentMethod; params: Record<string, unknown> }
+  keyReduceOnly?: boolean
+  fetcher: InfoFetcher
+}
+
+export async function verifySpotBuildAgainstVenue(
+  build: PerpsBuildToVerify,
+  opts: VerifySpotBuildOptions,
+): Promise<PerpsBuildCheck> {
+  try {
+    const network = opts.network ?? "mainnet"
+    const p = opts.intent.params
+    if (!EVM_ADDRESS_RE.test(opts.builder) || opts.builder.toLowerCase() === ZERO_ADDRESS)
+      return { ok: false, reason: "no valid Candle builder address to check against" }
+    if (build.network !== undefined && build.network !== network)
+      return { ok: false, reason: `the build is for ${build.network}, this client trades ${network}` }
+    if (build.address && build.address.toLowerCase() !== opts.address.toLowerCase())
+      return { ok: false, reason: "the build is for a different wallet" }
+    if (!Number.isSafeInteger(build.nonce) || build.nonce <= 0) return { ok: false, reason: "invalid nonce" }
+    const action = build.action
+    const typed = build.typedData
+    if (!action || typeof action !== "object") return { ok: false, reason: "no action" }
+    if (!typed || typeof typed !== "object" || typed.primary_type !== "Agent")
+      return { ok: false, reason: "a spot build must be an L1 Agent signature" }
+    if ("vaultAddress" in action) return { ok: false, reason: "the action names a vault" }
+    // The same complete-key-set check as perps: no hidden field rides along with the order.
+    const shape = actionShapeProblem(action)
+    if (shape) return { ok: false, reason: shape }
+
+    if (opts.intent.method === "spotOrder") {
+      if (action.type !== "order") return { ok: false, reason: "action type does not match the requested method" }
+      const orders = action.orders
+      if (!Array.isArray(orders) || orders.length !== 1 || action.grouping !== "na")
+        return { ok: false, reason: "a spot order is exactly one order with no grouping" }
+      const o = orders[0] as Record<string, unknown>
+      if (!o || typeof o !== "object" || !hyperliquidSpotAsset(o.a))
+        return { ok: false, reason: "order asset is not a Hyperliquid spot market" }
+      const isBuy = p.side === "buy"
+      if (p.side !== "buy" && p.side !== "sell") return { ok: false, reason: "side must be buy or sell" }
+      if (opts.keyReduceOnly === true && isBuy)
+        return { ok: false, reason: "this key is reduce-only and a buy is not reducing" }
+      if (o.b !== isBuy || o.r !== false || decimal(o.s) === null || decimal(o.s) !== decimal(p.size))
+        return { ok: false, reason: "order side, size or reduce-only flag does not match the request" }
+      const tif = (o.t as { limit?: { tif?: unknown } } | undefined)?.limit?.tif
+      const marketOrder = (p.type ?? (p.price === undefined ? "market" : "limit")) === "market"
+      if (tif !== (marketOrder ? "Ioc" : (p.tif ?? "Gtc")))
+        return { ok: false, reason: "order time in force does not match the request" }
+      if (p.price != null && decimal(o.p) !== decimal(p.price))
+        return { ok: false, reason: "order price does not match the request" }
+      if ((decimal(o.p) ?? 0n) <= 0n) return { ok: false, reason: "invalid order price" }
+      if (p.clientId != null) {
+        const clientId = typeof p.clientId === "string" ? p.clientId.toLowerCase() : null
+        if (clientId === null || !HYPERLIQUID_CLOID_RE.test(clientId) || o.c !== clientId)
+          return { ok: false, reason: "the order does not carry the requested client order id" }
+      }
+      if (o.c !== undefined && (typeof o.c !== "string" || !HYPERLIQUID_CLOID_RE.test(o.c)))
+        return { ok: false, reason: "invalid client order id" }
+      if (isBuy && "builder" in action && action.builder !== undefined)
+        return { ok: false, reason: "a spot buy carries no builder fee on Hyperliquid, so no builder field" }
+      const builderRefusal = checkBuilderField(action, opts.builder)
+      if (builderRefusal) return { ok: false, reason: builderRefusal }
+      // This machine's own read of the pair.
+      if (typeof p.market !== "string") return { ok: false, reason: "no market in the request" }
+      const pair = hyperliquidSpotPair(
+        await infoRead(opts.fetcher, network, { type: "spotMetaAndAssetCtxs" }),
+        p.market,
+      )
+      if (!pair) return { ok: false, reason: "Hyperliquid lists no such spot pair" }
+      if (pair.quoteToken !== 0) return { ok: false, reason: "the pair is not quoted in USDC" }
+      if (o.a !== HYPERLIQUID_SPOT_ASSET_OFFSET + pair.index)
+        return { ok: false, reason: "order asset is not the requested pair's on Hyperliquid" }
+      if (marketOrder) {
+        const mid = decimal(pair.midPx)
+        const slippage = typeof p.slippageBps === "number" ? p.slippageBps : 100
+        if (mid === null || mid <= 0n) return { ok: false, reason: "Hyperliquid shows no mid price for the pair" }
+        if (!withinBps(decimal(o.p) ?? 0n, mid, isBuy, slippage + HYPERLIQUID_MID_DRIFT_BPS))
+          return { ok: false, reason: "order price is outside its slippage of Hyperliquid's mid" }
+      }
+    } else {
+      if (action.type !== "cancel") return { ok: false, reason: "action type does not match the requested method" }
+      const cancels = action.cancels as { a?: unknown; o?: unknown }[] | undefined
+      if (!Array.isArray(cancels) || cancels.length !== 1 || !hyperliquidSpotAsset(cancels[0]?.a))
+        return { ok: false, reason: "invalid spot cancel asset" }
+      if ("builder" in action) return { ok: false, reason: "a cancel action carries no builder" }
+      const status = (await infoRead(opts.fetcher, network, {
+        type: "orderStatus",
+        user: opts.address.toLowerCase(),
+        oid: p.cloid,
+      })) as { order?: { order?: { coin?: unknown; oid?: unknown } } }
+      const resting = status?.order?.order
+      if (!resting || typeof resting.coin !== "string" || !Number.isSafeInteger(resting.oid))
+        return { ok: false, reason: "Hyperliquid shows no order with this cloid on this wallet" }
+      const pair = hyperliquidSpotPair(
+        await infoRead(opts.fetcher, network, { type: "spotMetaAndAssetCtxs" }),
+        resting.coin,
+      )
+      if (!pair || pair.name !== resting.coin)
+        return { ok: false, reason: "the order is not on a Hyperliquid spot pair" }
+      if (cancels[0]?.a !== HYPERLIQUID_SPOT_ASSET_OFFSET + pair.index || cancels[0]?.o !== resting.oid)
+        return { ok: false, reason: "the cancel does not name the order Hyperliquid shows for this request" }
+    }
+    const expected = hyperliquidL1TypedData(hyperliquidActionHash(action, build.nonce), network)
+    if (!sameValue(typed, expected))
+      return { ok: false, reason: "the typed data does not commit to this action and nonce" }
+    return { ok: true, kind: "l1" }
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `could not check it against Hyperliquid: ${err instanceof Error ? err.message : "read failed"}`,
+    }
+  }
 }
 
 /**

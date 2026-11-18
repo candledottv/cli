@@ -54,8 +54,10 @@ import {
   type PerpsIntentMethod,
   perpsSetupStatusProblem,
   resolveHyperliquidBuilder,
+  type SpotIntentMethod,
   verifyPerpsBuild,
   verifyPerpsBuildAgainstVenue,
+  verifySpotBuildAgainstVenue,
 } from "../hyperliquid"
 import {
   PERPS_HISTORY_MAX_LIMIT,
@@ -207,6 +209,44 @@ export function typedDataAuthorization(wallet: TradingWallet, typedData: Hyperli
   return { body, authorizationSignature: sign("sha256", Buffer.from(payload), wallet.signer).toString("base64") }
 }
 
+/**
+ * BE-3755 (scope 4): the market's terms, shown before every order is signed or sent: its dex,
+ * oracle and deployer, margin mode and collateral, and the venue's own fee, kept apart from Candle's
+ * builder fee. They come from Candle's build preview (Candle's read of Hyperliquid); none of them
+ * is bound to the signed action, so they inform the confirmation and never widen what is signed.
+ */
+export function termsLines(build: Json): { lines: string[]; warning: string | null } {
+  const preview = (build.preview ?? {}) as Record<string, unknown>
+  const t = preview.terms as Record<string, unknown> | undefined
+  if (!t || typeof t !== "object") return { lines: [], warning: null }
+  // BE-3771: a Hyperliquid spot pair: no margin, no oracle; the venue's spot fee and, on a sell only,
+  // Candle's builder fee (Hyperliquid charges none on spot buys).
+  if (t.venue === "hyperliquid-spot") {
+    return {
+      lines: [
+        `Market ${safeText(preview.market ?? preview.coin ?? "this pair")} (${safeText(preview.coin ?? "?")}): Hyperliquid spot, ${safeText(t.base ?? "?")} priced in ${safeText(t.quote ?? "?")}; no leverage.`,
+        `Hyperliquid spot fee: taker ${safeText(t.takerFeePct ?? "?")}%, maker ${safeText(t.makerFeePct ?? "?")}% at the base tier, paid to Hyperliquid. Candle's builder fee is separate and charged on sells only.`,
+      ],
+      warning: null,
+    }
+  }
+  const coin = safeText(preview.coin ?? "this market")
+  const text = (value: unknown) => safeText(value ?? "unknown")
+  const setters = Array.isArray(t.oracleSetters) ? t.oracleSetters.map((a) => safeText(a)).join(", ") : ""
+  const venue =
+    typeof t.dex === "string" && t.dex !== ""
+      ? `builder dex ${text(t.dex)}${t.dexName ? ` (${text(t.dexName)})` : ""}, deployed by ${text(t.deployer)}; its deployer sets the oracle price${setters ? ` (${setters})` : ""}`
+      : "Hyperliquid's main perp exchange; validators set the oracle price"
+  const margin = t.marginMode === "isolated" ? "isolated margin only" : "cross or isolated margin"
+  return {
+    lines: [
+      `Market ${coin}: ${venue}; ${margin}; collateral ${text(t.collateral)}.`,
+      `Hyperliquid venue fee: ${text(t.feeMultiplier)}x the main exchange's (taker ${text(t.takerFeePct)}%, maker ${text(t.makerFeePct)}% at the base tier), paid to Hyperliquid and the dex. Candle's builder fee is separate.`,
+    ],
+    warning: typeof t.feeWarning === "string" && t.feeWarning !== "" ? safeText(t.feeWarning) : null,
+  }
+}
+
 function previewLines(build: Json): string[] {
   // Only action fields were bound to the typed data and checked against the request.
   const action = build.action as Record<string, unknown>
@@ -244,8 +284,13 @@ function previewLines(build: Json): string[] {
     return `${action.type === "modify" ? "Modify to" : o.r ? "Close" : "Open"} ${o.b ? "buy" : "sell"} ${safeText(o.s)} asset ${safeText(o.a)} at ${safeText(o.p)}${type.limit ? ` (${safeText(type.limit.tif)})` : ` (${safeText(type.trigger?.tpsl)} trigger ${safeText(type.trigger?.triggerPx)})`}${o.r ? ", reduce-only" : ""}.`
   })
   const builder = action.builder as { b: string; f: number } | undefined
+  const spotBuy = preview.venue === "hyperliquid-spot" && orders[0]?.b === true
   lines.push(
-    builder ? `Candle builder ${safeText(builder.b)} fee: ${builder.f / 10} bps.` : "Candle builder fee: none.",
+    builder
+      ? `Candle builder ${safeText(builder.b)} fee: ${builder.f / 10} bps.`
+      : spotBuy
+        ? "Candle builder fee: none (Hyperliquid charges no builder fee on spot buys)."
+        : "Candle builder fee: none.",
   )
   return [...lines, ...notes]
 }
@@ -262,6 +307,10 @@ async function confirm(ctx: CommandContext, build: Json, address: string, yes: b
       "warning",
       `Builder trust override: ${builderPin(ctx)} (replaces this release's pin).\n`.trim(),
     )
+  // BE-3755: the market's terms come first, so they are on screen before any confirm, --yes included.
+  const terms = termsLines(build)
+  for (const line of terms.lines) notice(ctx.deps, ctx.json ? "stderr" : "stdout", "note", line)
+  if (terms.warning) notice(ctx.deps, ctx.json ? "stderr" : "stdout", "warning", terms.warning)
   for (const line of previewLines(build)) notice(ctx.deps, ctx.json ? "stderr" : "stdout", "note", `${line}\n`.trim())
   if (yes) return true
   if (!ctx.deps.isTTY.stdin)
@@ -300,7 +349,7 @@ export async function runPerpsWrite(
     submit: boolean
     signOnly: boolean
     /** The intent the build is bound to; by default the route's last segment. */
-    method?: PerpsIntentMethod
+    method?: PerpsIntentMethod | SpotIntentMethod
   },
 ): Promise<number> {
   const key = await tradingKey(ctx)
@@ -308,6 +357,13 @@ export async function runPerpsWrite(
   const builder = builderPin(ctx)
   const net = perpsNetwork(ctx)
   const method = opts.method ?? (opts.path.split("/").at(-1) as PerpsIntentMethod)
+  // BE-3771: spot signs only from the key's TEE wallet; the embedded wallet is refused before any request.
+  const spot = method === "spotOrder" || method === "spotCancel"
+  if (spot && wallet.id === "embedded")
+    throw new TradingError(
+      "SPOT_WALLET_REFUSED",
+      "Hyperliquid spot orders sign only from the key's EVM TEE wallet. Nothing was requested.",
+    )
   // Setup (spec 2026-10-17 C, section 5): the mode comes from Hyperliquid itself, before Candle is
   // asked, and an unsupported one stops here with nothing requested, reserved or signed.
   let mode: string | undefined
@@ -390,17 +446,26 @@ export async function runPerpsWrite(
     builder,
     network: net,
     address: wallet.address,
-    intent: { method, params: opts.body },
     keyReduceOnly: build.perpsReduceOnly === true,
   }
   const check =
-    method === "setup"
-      ? verifyPerpsBuild(build as never, verifyOpts)
-      : await verifyPerpsBuildAgainstVenue(build as never, {
-          ...verifyOpts,
+    method === "spotOrder" || method === "spotCancel"
+      ? await verifySpotBuildAgainstVenue(build as never, {
+          builder,
+          network: net,
+          address: wallet.address,
+          intent: { method, params: opts.body },
+          keyReduceOnly: build.perpsReduceOnly === true,
           fetcher: ctx.deps.fetch,
-          now: ctx.deps.now,
         })
+      : method === "setup"
+        ? verifyPerpsBuild(build as never, { ...verifyOpts, intent: { method, params: opts.body } })
+        : await verifyPerpsBuildAgainstVenue(build as never, {
+            ...verifyOpts,
+            intent: { method, params: opts.body },
+            fetcher: ctx.deps.fetch,
+            now: ctx.deps.now,
+          })
   if (!check.ok)
     throw new TradingError("PERPS_BUILD_REFUSED", `Refused to sign this build: ${check.reason}. Nothing was signed.`)
   if (!opts.submit) return printTradingResult(ctx, { ...build, signed: wallet.id === "embedded", submitted: false })
@@ -541,7 +606,7 @@ async function afterConfirmed(
   net: HyperliquidNetwork,
   wallet: Pick<TradingWallet, "id" | "address">,
   build: Json,
-  method: PerpsIntentMethod,
+  method: PerpsIntentMethod | SpotIntentMethod,
   body: Json,
   exchange: unknown,
 ): Promise<Json> {
