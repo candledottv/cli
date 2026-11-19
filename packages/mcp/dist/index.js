@@ -100,6 +100,9 @@ function readApiKeyFile(path, io = apiKeyFileIo) {
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
+// src/version.ts
+var SERVER_VERSION = "0.10.37";
+
 // src/client.ts
 var DEFAULT_API_URL = "https://api.alpha.candle.tv";
 function isLoopbackHost(hostname) {
@@ -158,6 +161,39 @@ class CrossOriginRedirectError extends Error {
     this.to = to;
     this.name = "CrossOriginRedirectError";
   }
+}
+var CLIENT_SURFACE_HEADER = "x-candle-client";
+var MCP_CLIENT_SURFACE = `mcp/${SERVER_VERSION}`;
+function withClientHeader(headers) {
+  if (headers === undefined || headers === null)
+    return { [CLIENT_SURFACE_HEADER]: MCP_CLIENT_SURFACE };
+  if (headers instanceof Headers) {
+    const copy = new Headers(headers);
+    if (!copy.has(CLIENT_SURFACE_HEADER))
+      copy.set(CLIENT_SURFACE_HEADER, MCP_CLIENT_SURFACE);
+    return copy;
+  }
+  if (Array.isArray(headers)) {
+    if (headers.some(([key]) => key.toLowerCase() === CLIENT_SURFACE_HEADER))
+      return headers;
+    return [...headers, [CLIENT_SURFACE_HEADER, MCP_CLIENT_SURFACE]];
+  }
+  const record = headers;
+  if (Object.keys(record).some((key) => key.toLowerCase() === CLIENT_SURFACE_HEADER))
+    return record;
+  return { ...record, [CLIENT_SURFACE_HEADER]: MCP_CLIENT_SURFACE };
+}
+function withClientSurface(doFetch, apiUrl) {
+  return (url, init) => {
+    let labelled = false;
+    try {
+      const api = apiUrl();
+      labelled = api !== undefined && new URL(url).origin === new URL(api).origin;
+    } catch {
+      labelled = false;
+    }
+    return labelled ? doFetch(url, { ...init, headers: withClientHeader(init?.headers) }) : doFetch(url, init);
+  };
 }
 function keyedRedirectGuard(doFetch) {
   return async (url, init) => {
@@ -3557,6 +3593,7 @@ var PERPS_TOOL_NAMES = [
   "candle_perps_cancel",
   "candle_perps_orders",
   "candle_perps_positions",
+  "candle_perps_activity",
   "candle_perps_fills",
   "candle_perps_funding",
   "candle_perps_leverage",
@@ -3612,6 +3649,9 @@ var perpsShapes = {
   },
   candle_perps_orders: { wallet: wallet2, limit: z2.number().int().min(1).max(200).optional() },
   candle_perps_positions: { wallet: wallet2 },
+  candle_perps_activity: {
+    wallet: wallet2.describe("The EVM TEE wallet by id, address or label. Its resting orders across the default and every builder perp dex, and withdrawals in flight.")
+  },
   candle_perps_fills: history(PERPS_HISTORY_MAX_LIMIT.fills),
   candle_perps_funding: history(PERPS_HISTORY_MAX_LIMIT.funding),
   candle_perps_leverage: {
@@ -3666,6 +3706,7 @@ var PATHS = {
   candle_perps_cancel: "/api/v1/agent/perps/cancel",
   candle_perps_orders: "/api/v1/agent/perps/orders",
   candle_perps_positions: "/api/v1/agent/perps/positions",
+  candle_perps_activity: "/api/v1/agent/perps/overview/activity",
   candle_perps_fills: "",
   candle_perps_funding: "",
   candle_perps_leverage: "/api/v1/agent/perps/leverage",
@@ -3757,6 +3798,11 @@ async function executePerps(tool, args, cfg, env, fetch2) {
       const result = await call(cfg, fetch2, "GET", `${PATHS[tool]}?${query}`);
       if (tool === "candle_perps_positions")
         return { text: JSON.stringify({ ...result, ...await positionsAdditions(cfg, fetch2, env, row2) }) };
+      return { text: JSON.stringify(result) };
+    }
+    if (tool === "candle_perps_activity") {
+      const { row: row2 } = await walletFor(cfg, fetch2, name);
+      const result = await call(cfg, fetch2, "GET", `/api/v1/agent/perps/overview/activity?walletId=${encodeURIComponent(row2.id)}`);
       return { text: JSON.stringify(result) };
     }
     if (tool === "candle_perps_fills" || tool === "candle_perps_funding") {
@@ -4729,9 +4775,6 @@ function readClusterResult(value, mint) {
     }
   };
 }
-
-// src/version.ts
-var SERVER_VERSION = "0.10.36";
 
 // src/update-notice.ts
 var PLAIN_VERSION = /^\d+\.\d+\.\d+$/;
@@ -8220,6 +8263,7 @@ var TOOL_NAMES = [
   "candle_perps_cancel",
   "candle_perps_orders",
   "candle_perps_positions",
+  "candle_perps_activity",
   "candle_perps_fills",
   "candle_perps_funding",
   "candle_perps_leverage",
@@ -9141,7 +9185,7 @@ function registerToolSubset(server, options) {
   const allowed = new Set(options.tools);
   const getConfig = options.getConfig;
   const env = options.env ?? {};
-  const doFetch = keyedRedirectGuard(options.fetch ?? ((url, init) => fetch(url, init)));
+  const doFetch = keyedRedirectGuard(withClientSurface(options.fetch ?? ((url, init) => fetch(url, init)), () => getConfig().apiUrl));
   const register = (name, definition, handler) => {
     if (!allowed.has(name))
       return;
@@ -9750,6 +9794,11 @@ function registerToolSubset(server, options) {
     description: "Positions, account value and withdrawable balance on Hyperliquid for the key's EVM TEE or embedded wallet, read " + "live by its address. Also `rows` (per position: side, size, entry, mark, unrealized P&L, ROE, leverage, " + "liquidation price, liquidation distance, funding since open with Hyperliquid's sign where positive is paid, " + "margin, value, level), `accountLine` and `risk` (the candle_perps_risk report without positions), read by " + "this server from Hyperliquid directly. Reads only; moves nothing.",
     inputSchema: perpsShapes.candle_perps_positions
   }, perpsTool("candle_perps_positions"));
+  register("candle_perps_activity", {
+    title: "Perps wallet activity",
+    description: "BE-3758: one of the account's EVM TEE wallets and its Hyperliquid activity: resting open orders across " + "the default perp dex and every builder-deployed dex (each row's dex names it; a builder coin keeps its " + "dex:COIN form) and the bound key's withdrawals still in flight. Either list is null when its read failed, " + "never an empty list. Needs account:read. Reads only; moves nothing.",
+    inputSchema: perpsShapes.candle_perps_activity
+  }, perpsTool("candle_perps_activity"));
   const riskRead = " Read by this server from Hyperliquid's public API; Candle is asked only for the wallet and the key's " + "thresholds. Reads only; moves nothing. Phase 1 has no server-side monitor: nothing warns you unless you " + "poll candle_perps_risk.";
   register("candle_perps_account", {
     title: "Perps account line",
@@ -9903,7 +9952,7 @@ async function registerEligibleProfileTool(server, env = process.env, doFetch = 
   let eligible = false;
   if (cfg.apiKey && wanted.length > 0) {
     try {
-      const res = await keyedRedirectGuard(doFetch)(`${cfg.apiUrl}/api/v1/agent/keys/self/public-profile`, {
+      const res = await keyedRedirectGuard(withClientSurface(doFetch, () => cfg.apiUrl))(`${cfg.apiUrl}/api/v1/agent/keys/self/public-profile`, {
         method: "GET",
         headers: { "x-api-key": cfg.apiKey },
         signal: AbortSignal.timeout(15000)

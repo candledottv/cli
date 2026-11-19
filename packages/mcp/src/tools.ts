@@ -54,7 +54,7 @@ import type { McpServer, RegisteredTool } from "@modelcontextprotocol/sdk/server
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js"
 import { z } from "zod"
 import { chainSchema } from "./chain-registry"
-import { keyedRedirectGuard, type RequestConfig, resolveConfig } from "./client"
+import { keyedRedirectGuard, type RequestConfig, resolveConfig, withClientSurface } from "./client"
 import { CLUSTER_READ_DESCRIPTION, readTokenClusters, tokenClustersShape } from "./cluster-read"
 import { decimalToRaw, QUOTE_DECIMALS } from "./convert"
 import {
@@ -266,6 +266,7 @@ export const TOOL_NAMES = [
   "candle_perps_cancel",
   "candle_perps_orders",
   "candle_perps_positions",
+  "candle_perps_activity",
   // BE-1583: history read directly from Hyperliquid (perps.ts, perps-history.ts).
   "candle_perps_fills",
   "candle_perps_funding",
@@ -1864,7 +1865,10 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
   const env = options.env ?? {}
   // Preserve stdio's late-bound global fetch (including a host's test seam).
   // Keyed requests never follow a redirect to another origin (keyedRedirectGuard).
-  const doFetch: FetchLike = keyedRedirectGuard(options.fetch ?? ((url, init) => fetch(url, init)))
+  // BE-3919: and every request to the API names this client (withClientSurface).
+  const doFetch: FetchLike = keyedRedirectGuard(
+    withClientSurface(options.fetch ?? ((url, init) => fetch(url, init)), () => getConfig().apiUrl),
+  )
   // Every registration goes through this guard, so the subset cannot drift past it.
   // Our schemas are Zod 3 raw shapes. Keeping this wrapper specific avoids expanding the
   // SDK's Zod 3/4 and output-schema overloads at every registration.
@@ -3299,6 +3303,20 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
     perpsTool("candle_perps_positions"),
   )
 
+  register(
+    "candle_perps_activity",
+    {
+      title: "Perps wallet activity",
+      description:
+        "BE-3758: one of the account's EVM TEE wallets and its Hyperliquid activity: resting open orders across " +
+        "the default perp dex and every builder-deployed dex (each row's dex names it; a builder coin keeps its " +
+        "dex:COIN form) and the bound key's withdrawals still in flight. Either list is null when its read failed, " +
+        "never an empty list. Needs account:read. Reads only; moves nothing.",
+      inputSchema: perpsShapes.candle_perps_activity,
+    },
+    perpsTool("candle_perps_activity"),
+  )
+
   // BE-1582 (spec A-12): read-only risk and visibility. Nothing signs, so no signer PEM is needed.
   const riskRead =
     " Read by this server from Hyperliquid's public API; Candle is asked only for the wallet and the key's " +
@@ -3656,11 +3674,14 @@ export async function registerEligibleProfileTool(
   let eligible = false
   if (cfg.apiKey && wanted.length > 0) {
     try {
-      const res = await keyedRedirectGuard(doFetch)(`${cfg.apiUrl}/api/v1/agent/keys/self/public-profile`, {
-        method: "GET",
-        headers: { "x-api-key": cfg.apiKey },
-        signal: AbortSignal.timeout(15000),
-      })
+      const res = await keyedRedirectGuard(withClientSurface(doFetch, () => cfg.apiUrl))(
+        `${cfg.apiUrl}/api/v1/agent/keys/self/public-profile`,
+        {
+          method: "GET",
+          headers: { "x-api-key": cfg.apiKey },
+          signal: AbortSignal.timeout(15000),
+        },
+      )
       const body = JSON.parse(await res.text()) as { canEdit?: boolean }
       eligible = res.ok && body.canEdit === true
     } catch {
