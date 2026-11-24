@@ -36,6 +36,7 @@ test("all registered tools are listed", () => {
     "candle_get_account_pnl",
     "candle_get_agent_open_orders",
     "candle_get_agent_perp_round",
+    "candle_get_agent_perps_summary",
     "candle_get_agent_positions",
     "candle_get_agent_profile",
     "candle_get_agent_record",
@@ -91,6 +92,10 @@ test("all registered tools are listed", () => {
     "candle_perps_schedule_cancel",
     "candle_perps_set_thresholds",
     "candle_perps_setup",
+    "candle_perps_spot_balances",
+    "candle_perps_spot_cancel",
+    "candle_perps_spot_markets",
+    "candle_perps_spot_order",
     "candle_perps_thresholds",
     "candle_perps_tpsl",
     "candle_perps_transfer",
@@ -1256,16 +1261,16 @@ describe("pool choices on both launch tools", () => {
   const BASE = { clientLaunchId: "c1", name: "T", symbol: "T", imageUrl: "https://x/y.png" }
   const FALL = { startBps: 2500, endBps: 25, minutes: 30 }
 
-  test.each([
-    "candle_launch_token",
-    "candle_launch_and_seed",
-  ])("%s describes the conditional pool opening default", (name) => {
-    const description = tools[name]?.inputSchema.poolOpen?.description
-    expect(description).toBe(launchFieldHelp("poolOpen"))
-    expect(description).toContain("graduation.maxStakerCarveBps")
-    expect(description).toContain("otherwise legacy")
-    expect(tools[name]?.inputSchema.expPoolShape?.description).toBe(launchFieldHelp("expPoolShape"))
-  })
+  test.each(["candle_launch_token", "candle_launch_and_seed"])(
+    "%s describes the conditional pool opening default",
+    (name) => {
+      const description = tools[name]?.inputSchema.poolOpen?.description
+      expect(description).toBe(launchFieldHelp("poolOpen"))
+      expect(description).toContain("graduation.maxStakerCarveBps")
+      expect(description).toContain("otherwise legacy")
+      expect(tools[name]?.inputSchema.expPoolShape?.description).toBe(launchFieldHelp("expPoolShape"))
+    },
+  )
 
   test.each(["candle_launch_token", "candle_launch_and_seed"])("%s parses a tier, a fall and each shape", (name) => {
     const schema = z.object(tools[name]?.inputSchema ?? {})

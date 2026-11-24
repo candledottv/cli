@@ -215,6 +215,8 @@ export const TOOL_NAMES = [
   // BE-1990 (agent page perps P2-5): a published agent's open positions, keyless.
   "candle_get_agent_positions",
   "candle_get_agent_record",
+  // BE-3775 (Hyperliquid design 4.1 P1): a published agent's perps summary for a window, keyless.
+  "candle_get_agent_perps_summary",
   // BE-3756 (perp position pages): one perp round, an agent's open orders and public perp candles, keyless.
   "candle_get_agent_perp_round",
   "candle_get_agent_open_orders",
@@ -284,6 +286,11 @@ export const TOOL_NAMES = [
   "candle_perps_schedule_cancel",
   "candle_perps_flatten",
   "candle_perps_reduce_only",
+  // BE-4217 (BE-3771 HM2): Hyperliquid spot from the EVM TEE wallet (perps.ts). Local only.
+  "candle_perps_spot_markets",
+  "candle_perps_spot_balances",
+  "candle_perps_spot_order",
+  "candle_perps_spot_cancel",
   // Hyperliquid perps C (BE-647): the Relay deposit (perps.ts).
   "candle_perps_deposit",
   "candle_perps_transfer",
@@ -724,6 +731,16 @@ export function buildRequest(name: RestToolName, args: Record<string, unknown>, 
       const params = new URLSearchParams(kind ? { kind } : {})
       return {
         url: `${base}/api/v1/agent/records/${encodeURIComponent(profileId)}/positions${params.size ? `?${params}` : ""}`,
+        init: { method: "GET", headers: jsonHeaders() },
+      }
+    }
+
+    case "candle_get_agent_perps_summary": {
+      // Public: no key is sent, as for positions.
+      const { profileId, window } = args as { profileId: string; window?: string }
+      const params = new URLSearchParams(window ? { window } : {})
+      return {
+        url: `${base}/api/v1/agent/records/${encodeURIComponent(profileId)}/perps${params.size ? `?${params}` : ""}`,
         init: { method: "GET", headers: jsonHeaders() },
       }
     }
@@ -1512,6 +1529,11 @@ const listAgentPostsShape = {
 const getAgentPositionsShape = {
   profileId: z.string().describe("The agent's stable public id: prof_ and 16 lowercase hex"),
   kind: z.enum(["spot", "perp"]).optional().describe("Only spot tokens or only Hyperliquid perps; omit for both"),
+}
+
+const getAgentPerpsSummaryShape = {
+  profileId: z.string().describe("The agent's stable public id: prof_ and 16 lowercase hex"),
+  window: z.enum(["all", "24h", "7d", "30d"]).optional().describe("The window; omit for all time"),
 }
 
 const getAgentPerpRoundShape = {
@@ -2589,11 +2611,39 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
         "No key needed. Round fields: dex:COIN, side, recorded leverage (null when unknown), largest size, entry and exit " +
         "averages, net P&L, funding (positive earned), fees, duration, liquidation and closing fill hash. " +
         "returnPct is net P&L / initial margin at the largest size, times 100. perpsAsOfMs stamps the certified figures; " +
-        "perpsCoverageFromMs is the coverage start. A missing field is unknown, never zero. Pass rowsCursor as cursor " +
+        "perpsCoverageFromMs is the coverage start. The Spot P&L (totals.realizedNetUsd, unrealizedUsd, totalPnlUsd) " +
+        "includes Hyperliquid spot; hyperliquidSpot (on the record and in totals) shows that part on its own: " +
+        "realizedUsd (net of sell fees), unrealizedUsd, feesUsd, volumeUsd, trades, unpriced, untrackedSoldCoins and " +
+        "partial (a floor, with partialReasons). It is absent for an agent with no Hyperliquid spot activity and is " +
+        "never inside the perps figures. A missing field is unknown, never zero. Pass rowsCursor as cursor " +
         "to page; restart if the cursor expires. Private and hidden agents answer RECORD_NOT_FOUND. Measured record, not a forecast.",
       inputSchema: { profileId: z.string(), cursor: z.string().optional() },
     },
     async (args) => callAndRelay("candle_get_agent_record", args, getConfig(), doFetch),
+  )
+
+  register(
+    "candle_get_agent_perps_summary",
+    {
+      title: "Get an agent's perps summary",
+      description:
+        "One published agent's Hyperliquid perps summary for a window (all, 24h, 7d or 30d; default all) " +
+        "(GET /api/v1/agent/records/{profileId}/perps). No key needed. Reads only. summary: netUsd (realized + " +
+        "funding - fees + unrealized change), realizedUsd, unrealizedUsd, fundingUsd (positive when received), " +
+        "feesUsd (Hyperliquid fees, Candle's builder fee included), volumeUsd (sum of px x sz of the agent's fills, " +
+        "builder-dex fills included; builderDexVolumeUsd is their part), feesToVolumePct (fees over main-exchange " +
+        "volume), roundsClosed, wins, losses, winRatePct, largestWinUsd, largestLossUsd, highestLeverage and " +
+        "averageLeverage (rounds with leverage not recorded are left out and counted in " +
+        "leverageNotRecordedRounds), liquidations and maxDrawdownUsd (peak to trough of the cumulative perps P&L, " +
+        "dollars). hyperliquidSpot, when present, is the agent's Hyperliquid spot part of the same window, beside " +
+        "the perps figures and never inside netUsd (it belongs to the record's Spot bucket). " +
+        "null means not known, never zero. summary is null for an agent with no perps history; " +
+        "available false means the perps are delayed (asOfMs). asOfMs is when the figures were true. The same " +
+        "figures as the agent page. An agent that is not published answers RECORD_NOT_FOUND. No wallet address " +
+        "or balance. A measured record, not a forecast.",
+      inputSchema: getAgentPerpsSummaryShape,
+    },
+    async (args) => callAndRelay("candle_get_agent_perps_summary", args, getConfig(), doFetch),
   )
 
   register(
@@ -2671,7 +2721,9 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
       description:
         "Every open position of one published agent, spot tokens and Hyperliquid perps, largest value first " +
         "(GET /api/v1/agent/records/{profileId}/positions). No key needed. Reads only. Spot rows: mint, chain, " +
-        "symbol, quantity (whole tokens), valueUsd and, with origin, unrealizedUsd since entry. Perp rows: coin, " +
+        "symbol, quantity (whole tokens), valueUsd and, with origin, unrealizedUsd since entry. A spot row may carry " +
+        'venue: "hyperliquid": a Hyperliquid spot holding with symbol, quantity and valueUsd only (no mint, chain or ' +
+        "unrealized), valued in USDC at the hourly perps observation; Solana and Hood rows carry no venue. Perp rows: coin, " +
         "side, size, leverage, entryPx, markPx, positionValueUsd, marginUsedUsd, unrealizedPnlUsd, returnOnEquity, " +
         "liquidationPx, liquidationDistance (fraction of mark), fundingNetUsd (positive when earned) and level. " +
         "Positions under $1 are not listed (hiddenDust counts them); unpriced counts spot positions with no " +
@@ -3728,6 +3780,83 @@ export function registerToolSubset(server: McpServer, options: ToolSubsetOptions
       inputSchema: perpsShapes.candle_perps_reduce_only,
     },
     perpsTool("candle_perps_reduce_only"),
+  )
+
+  // BE-4217 (BE-4165 slice 03, BE-3771 HM2): Hyperliquid spot, the `candle perps spot` mirror. The
+  // order and cancel are built by Candle, checked here against this server's own read of the spot
+  // pair (verifySpotBuildAgainstVenue) before anything is signed, relay-signed and submitted by this
+  // server, exactly as the perps writes are. A failed check signs nothing.
+  const spotNote =
+    " Spot pairs quoted in USDC only, named HYPE/USDC or by Hyperliquid's index (@107). Spot and perps balances " +
+    "are separate on Hyperliquid: a buy spends the wallet's spot USDC, not its perps balance. Spot uses the key's " +
+    "EVM TEE wallet only, never the embedded wallet."
+  const spotWrite =
+    " MOVES REAL FUNDS on Hyperliquid unless submit is false. Candle builds the order within this key's limits " +
+    "(USD window, maximum position, slippage and price bands, the liquidity floor on buys); this server checks the " +
+    "build against its own read of the pair (asset, side, size, price, time in force, client id, no grouping, the " +
+    "builder) before signing, then submits it to Hyperliquid itself. A build that fails the check is refused with " +
+    "its reason and nothing signed. Needs perps:write on the key and CANDLE_KEY_SIGNER_PEM_FILE."
+  register(
+    "candle_perps_spot_markets",
+    {
+      title: "Hyperliquid spot markets",
+      description:
+        "The Hyperliquid spot pairs Candle trades (GET /api/v1/agent/perps/spot/markets), highest 24 h volume " +
+        "first: market, coin, asset, base, quote, midPx, markPx, dayVolumeUsd, szDecimals and terms (Hyperliquid's " +
+        "taker and maker fee; Candle's builder fee is charged on sells only, never on buys). all: true adds the pairs " +
+        "Candle refuses (tradable false, with refusal). minDayVolumeUsd is the liquidity floor a buy is held to." +
+        spotNote +
+        " Needs a Candle agent key of any scope. Reads only; moves nothing.",
+      inputSchema: perpsShapes.candle_perps_spot_markets,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    perpsTool("candle_perps_spot_markets"),
+  )
+  register(
+    "candle_perps_spot_balances",
+    {
+      title: "Hyperliquid spot balances",
+      description:
+        "The EVM TEE wallet's Hyperliquid spot balances (GET /api/v1/agent/perps/spot/balances): per token coin, " +
+        "total and hold (the part resting in open orders). Separate from the perps balance candle_perps_positions " +
+        "reads; spot USDC here is what a buy spends." +
+        spotNote +
+        " Reads only; moves nothing.",
+      inputSchema: perpsShapes.candle_perps_spot_balances,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    perpsTool("candle_perps_spot_balances"),
+  )
+  register(
+    "candle_perps_spot_order",
+    {
+      title: "Buy or sell Hyperliquid spot",
+      description:
+        "Buy or sell a Hyperliquid spot pair: a market order (IOC within slippageBps of the mid) without price, a " +
+        "limit order with it. size is in the base token (HYPE for HYPE/USDC), price in USDC. The build's preview " +
+        "shows the fee before the order: terms (Hyperliquid's taker and maker fee) and builderFee (Candle's builder " +
+        "fee: none on a buy, on a sell the plan's rate, 0.1% today, none on Max). A buy is refused beyond the " +
+        "wallet's free spot USDC, a sell beyond its free base token. Pass clientId to make a retry return the original " +
+        "order instead of placing another. hide: true keeps the fills out of the public activity stream, and a build " +
+        "without the API's hide confirmation is refused before signing." +
+        spotNote +
+        spotWrite,
+      inputSchema: perpsShapes.candle_perps_spot_order,
+    },
+    perpsTool("candle_perps_spot_order"),
+  )
+  register(
+    "candle_perps_spot_cancel",
+    {
+      title: "Cancel a Hyperliquid spot order",
+      description:
+        "Cancel a resting spot order Candle built for this wallet, by its cloid (from candle_perps_spot_order). This " +
+        "server checks that the cancel names the order Hyperliquid shows for that cloid on this wallet, on a spot " +
+        "pair, before signing." +
+        spotWrite,
+      inputSchema: perpsShapes.candle_perps_spot_cancel,
+    },
+    perpsTool("candle_perps_spot_cancel"),
   )
 
   register(

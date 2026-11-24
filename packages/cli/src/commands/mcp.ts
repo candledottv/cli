@@ -86,6 +86,7 @@ export const MCP_TOOL_NAMES = [
   "candle_delete_post",
   "candle_get_agent_positions",
   "candle_get_agent_record",
+  "candle_get_agent_perps_summary",
   "candle_get_agent_perp_round",
   "candle_get_agent_open_orders",
   "candle_get_perp_candles",
@@ -140,6 +141,11 @@ export const MCP_TOOL_NAMES = [
   "candle_perps_schedule_cancel",
   "candle_perps_flatten",
   "candle_perps_reduce_only",
+  // BE-4217: Hyperliquid spot from the EVM TEE wallet. They need the API key, so --read-only leaves them out.
+  "candle_perps_spot_markets",
+  "candle_perps_spot_balances",
+  "candle_perps_spot_order",
+  "candle_perps_spot_cancel",
   "candle_perps_deposit",
   "candle_perps_transfer",
   // BE-1582: read-only Hyperliquid risk tools. They need the API key, so --read-only leaves them out.
@@ -198,6 +204,7 @@ export const READ_ONLY_TOOL_NAMES = [
   "candle_list_agent_posts",
   "candle_get_agent_positions",
   "candle_get_agent_record",
+  "candle_get_agent_perps_summary",
   "candle_get_agent_perp_round",
   "candle_get_agent_open_orders",
   "candle_get_perp_candles",
